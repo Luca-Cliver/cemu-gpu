@@ -142,6 +142,7 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             mrs->mr[i].nsid = nsid;
             mrs->mr[i].len = len;
             mrs->mr[i].sb = sb;
+            mrs->mr[i].backend = mns->backend;
             mrs->mr_addr[i] = mrs->mr[i].addr;
             mrs->mr_len[i] = mrs->mr[i].len;
         }
@@ -580,6 +581,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     // get all memory range
     void **mr_addr = NULL;
     long long *mr_len = NULL;
+    SsdBackend **mr_backend = NULL;
     if (program->is_indirect || numr == 0) {
         // memory range set is in rsid
         if (rsid == 0 || rsid > MAX_RSID) {
@@ -589,6 +591,10 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         MemoryRangeSet *mrs = memory_range_set_get(ns, rsid);
         mr_addr = mrs->mr_addr;
         mr_len = mrs->mr_len;
+        mr_backend = g_malloc0(sizeof(SsdBackend *) * mrs->numr);
+        for (uint32_t i = 0; i < mrs->numr; i++) {
+            mr_backend[i] = mrs->mr[i].backend;
+        }
 
         if (program->is_indirect) {
             req->mem_ctrl = n;
@@ -739,6 +745,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         NvmeMemoryRange *mrs = (NvmeMemoryRange *)data_buffer;
         mr_addr = malloc(sizeof(void *) * numr);
         mr_len = malloc(sizeof(long long) * numr);
+        mr_backend = malloc(sizeof(SsdBackend *) * numr);
         for (int i = 0; i < numr; i++) {
             uint32_t nsid = le32_to_cpu(mrs[i].nsid);
             uint32_t len = le32_to_cpu(mrs[i].len);
@@ -747,9 +754,15 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             void *addr = backend_addr(mns->backend, sb);
             mr_addr[i] = addr;
             mr_len[i] = len;
+            mr_backend[i] = mns->backend;
         }
         data_buffer += sizeof(NvmeMemoryRange) * numr;
         dlen -= sizeof(NvmeMemoryRange) * numr;
+    }
+
+    for(uint32_t i = 0; i < numr; i++)
+    {
+        backend_cuda_sync_ptr(mr_backend[i], mr_addr[i], mr_len[i], true);
     }
 
     sched_alloc_job(compute_ns(req->ns), req);
@@ -759,6 +772,19 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.numr = numr;
     job->args.mr_addr = mr_addr;
     job->args.mr_len = mr_len;
+    job->mr_backend = mr_backend;
+
+    femu_log("1:program_execute: numr %u\n", numr);
+    job->args.mr_dev_addr = malloc(sizeof(uint64_t) * numr);
+    femu_log("2:program_execute: mr_addr[0] %p, mr_len[0] %lld\n", mr_addr[0], mr_len[0]);
+    if (job->args.mr_dev_addr) {
+        for (uint32_t i = 0; i < numr; i++) {
+            job->args.mr_dev_addr[i] = backend_host_to_device(mr_backend[i], mr_addr[i], mr_len[i]);
+            femu_log("program_execute: mr_dev_addr[%u] = %p for host %p len %lld\n", i, job->args.mr_dev_addr[i], mr_addr[i], mr_len[i]);
+        }
+    } else {
+        femu_log("program_execute: mr_dev_addr allocation failed\n");
+    }
     job->args.cparam1 = cparam1;
     job->args.cparam2 = cparam2;
     job->args.data_buffer = dlen ? data_buffer : NULL;
@@ -775,6 +801,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         qatomic_inc(&program->jobs_running);
     }
 
+    femu_log("program_execute: completed\n");
     return NVME_SUCCESS;
 }
 
@@ -860,12 +887,22 @@ static uint64_t run_functional_modeling(ComputeJob *job)
     uint64_t realtime;
     uint64_t runtime = job->user_runtime;
 
-    femu_debug("run_functional_modeling: program %u, runtime %lu, size %llu\n", program->pind, runtime, job->args.mr_len[0]);
+    femu_log("run_functional_modeling: program %u, runtime %lu, size %llu\n", program->pind, runtime, job->args.mr_len[0]);
 
     // execute
     // if (!runtime) {
         struct timespec ts,te;
         struct timespec cs,ce;
+
+        if(job->mr_backend)
+        {
+            for(uint32_t i = 0; i < job->args.numr; i++)
+            {
+                backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i], job->args.mr_len[i], true);
+            }
+        }
+        
+        femu_log("run_functional_modeling: after cuda_sync_ptr\n");
         clock_gettime(CLOCK_MONOTONIC, &cs);
         enter_compute_section();
         clock_gettime(CLOCK_MONOTONIC, &ce);

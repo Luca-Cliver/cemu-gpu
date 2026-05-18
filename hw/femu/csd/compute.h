@@ -14,6 +14,7 @@ typedef struct MemoryRange {
     uint32_t len;       // length
     uint64_t sb;        // starting bytes
     void *addr;
+    SsdBackend *backend;
 } MemoryRange;
 
 typedef struct MemoryRangeSet {

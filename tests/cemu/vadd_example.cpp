@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-
+#include <errno.h>
 #include "iouring.h"
 #include "util.h"
 
@@ -21,6 +21,8 @@ int main(int argc, char *argv[])
     download.name = "vadd";
     int ret;
     bool use_ebpf = false;
+    bool use_cuda = false;
+    bool use_cuda_devptr = false;
     bool use_jit = false;
     bool exec_use_iou = false;
     bool src_in_file = false;
@@ -29,6 +31,10 @@ int main(int argc, char *argv[])
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ebpf") == 0) {
             use_ebpf = true;
+        }else if (strcmp(argv[i], "--cuda") == 0) {
+            use_cuda = true;
+        } else if (strcmp(argv[i], "--cuda-devptr") == 0) {
+            use_cuda_devptr = true;
         } else if (strcmp(argv[i], "--jit") == 0) {
             use_jit = true;
         } else if (strcmp(argv[i], "--src-in-file") == 0) {
@@ -39,11 +45,16 @@ int main(int argc, char *argv[])
     }
 
     printf("use_ebpf: %d, use_jit: %d\n", use_ebpf, use_jit);
+    printf("use_cuda: %d, use_cuda_devptr: %d\n", use_cuda, use_cuda_devptr);
     printf("exec_use_iou: %d\n", exec_use_iou);
     printf("src_in_file: %d, dst_in_file: %d\n", src_in_file, dst_in_file);
 
     if (use_ebpf) {
         prep_ebpf("./build/vadd.bpf.o", "vadd", use_jit, &download);
+    } else if (use_cuda_devptr) {
+        prep_shared_library("./build/vadd_cuda_devptr.so", "vadd", &download);
+    } else if (use_cuda) {
+        prep_shared_library("./build/vadd_cuda.so", "vadd", &download);
     } else {
         prep_shared_library("./build/vadd.so", "vadd", &download);
     }
@@ -54,16 +65,31 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    // load program
+   // load program
     ret = ioctl(ctl_fd, IOCTL_CEMU_DOWNLOAD, &download);
-    if (ret <= 0)
-        perror("ioctl");
+    if (ret <= 0 && errno == EEXIST) {
+        // Stale program metadata may exist in guest kernel driver; try reset once.
+        fprintf(stderr, "program '%s' already exists (pind=%d), retry after cleanup\n",
+                download.name, download.pind);
+        ioctl(ctl_fd, IOCTL_CEMU_DEACTIVATE, &download);
+        ioctl(ctl_fd, IOCTL_CEMU_UNLOAD, &download);
+        ret = ioctl(ctl_fd, IOCTL_CEMU_DOWNLOAD, &download);
+    }
+    if (ret <= 0) {
+        perror("ioctl DOWNLOAD");
+        close(ctl_fd);
+        return 1;
+    }
     printf("download ret: %d, pind : %d\n", ret, download.pind);
 
     // activate program
     ret = ioctl(ctl_fd, IOCTL_CEMU_ACTIVATE, &download);
-    if (ret)
-        perror("ioctl");
+    if (ret) {
+        perror("ioctl ACTIVATE");
+        ioctl(ctl_fd, IOCTL_CEMU_UNLOAD, &download);
+        close(ctl_fd);
+        return 1;
+    }
     printf("activation ret: %d, pind : %d\n", ret, download.pind);
 
     // create memory range set
@@ -78,6 +104,12 @@ int main(int argc, char *argv[])
             exit(1);
         }
     }
+    // Restrict each memory range to actual working-set bytes.
+    // size == 0 means "use the whole file range" in kernel/FEMU.
+    mrs.off[0] = 0;
+    mrs.size[0] = 4096;
+    mrs.off[1] = 0;
+    mrs.size[1] = 8192;
     ret = ioctl(ctl_fd, IOCTL_CEMU_CREATE_MRS, &mrs);
     if (ret)
         perror("ioctl CREATE_MRS");

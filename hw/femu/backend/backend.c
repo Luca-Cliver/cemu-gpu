@@ -1,5 +1,292 @@
 #include "./backend.h"
 #include "../nvme.h"
+#include <dlfcn.h>
+
+typedef int (*cuda_set_decive_fn)(int);
+typedef int (*cuda_malloc_fn)(void **, size_t);
+typedef int (*cuda_free_fn)(void *);
+typedef int (*cuda_memcpy_fn)(void *, const void *, size_t, int);
+typedef int (*cuda_synchronize_fn)(void);
+
+typedef struct CudaSyncApi
+{
+    bool loaded;
+    void *module;
+    cuda_set_decive_fn set_device;
+    cuda_malloc_fn malloc;
+    cuda_free_fn free;
+    cuda_memcpy_fn memcpy;
+    cuda_synchronize_fn synchronize;
+} CudaSyncApi;
+
+static CudaSyncApi cuda_api = {0};
+
+typedef struct CudaMirrorRange {
+    void *host_ptr;
+    uint64_t len;
+    void *device_ptr;
+    struct CudaMirrorRange *next;
+} CudaMirrorRange;
+
+static CudaMirrorRange *cuda_mirror_head(SsdBackend *b)
+{
+    return (CudaMirrorRange *)b->cuda_mirror;
+}
+
+static void cuda_mirror_set_head(SsdBackend *b, CudaMirrorRange *head)
+{
+    b->cuda_mirror = head;
+}
+
+static CudaMirrorRange *cuda_mirror_find(SsdBackend *b, void *host_ptr, uint64_t len)
+{
+    for (CudaMirrorRange *cur = cuda_mirror_head(b); cur; cur = cur->next) {
+        if (cur->host_ptr == host_ptr && cur->len == len) {
+            return cur;
+        }
+    }
+    return NULL;
+}
+
+static CudaMirrorRange *cuda_mirror_ensure(SsdBackend *b, void *host_ptr, uint64_t len)
+{
+    CudaMirrorRange *entry = cuda_mirror_find(b, host_ptr, len);
+    if (entry) {
+        if (entry->len != len) {
+            femu_err("CUDA mirror range size mismatch for host %p: have %lu, want %lu\n",
+                     host_ptr, entry->len, len);
+            return NULL;
+        }
+        return entry;
+    }
+
+    entry = g_malloc0(sizeof(*entry));
+    entry->host_ptr = host_ptr;
+    entry->len = len;
+    if (cuda_api.malloc(&entry->device_ptr, len) != 0) {
+        femu_err("Failed to allocate CUDA memory for host %p, len %lu.\n", host_ptr, len);
+        g_free(entry);
+        return NULL;
+    }
+
+    entry->next = cuda_mirror_head(b);
+    cuda_mirror_set_head(b, entry);
+    return entry;
+}
+
+static void *cuda_get_symbol(const char *name)
+{
+    return cuda_api.module ? dlsym(cuda_api.module, name) : NULL;
+}
+
+static void backend_cuda_close_module()
+{
+    if (!cuda_api.module) {
+        return;
+    }
+
+    dlclose(cuda_api.module);
+    cuda_api.module = NULL;
+}
+
+static int backend_cuda_load_module()
+{
+    const char *names[] = {"libcudart.so", "libcudart.so.11.0", "libcudart.so.12.0"};
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        cuda_api.module = dlopen(names[i], RTLD_NOW);
+        if (cuda_api.module) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int backend_cuda_init_api()
+{
+    if(cuda_api.loaded)
+    {
+        return true;
+    }
+
+    if (!backend_cuda_load_module()) {
+        return false;
+    }
+
+    cuda_api.set_device = (cuda_set_decive_fn)cuda_get_symbol("cudaSetDevice");
+    cuda_api.malloc = (cuda_malloc_fn)cuda_get_symbol("cudaMalloc");
+    cuda_api.free = (cuda_free_fn)cuda_get_symbol("cudaFree");
+    cuda_api.memcpy = (cuda_memcpy_fn)cuda_get_symbol("cudaMemcpy");
+    cuda_api.synchronize = (cuda_synchronize_fn)cuda_get_symbol("cudaDeviceSynchronize");
+
+    if (!cuda_api.set_device || !cuda_api.malloc || !cuda_api.free || !cuda_api.memcpy || !cuda_api.synchronize) {
+        backend_cuda_close_module();
+        return false;
+    }
+    cuda_api.loaded = true;
+    return true;
+}
+
+int backend_cuda_sync_init(SsdBackend *b)
+{
+    const char *enable = g_getenv("CEMU_CUDA_SYNC");
+    const char *decive_env = g_getenv("CEMU_CUDA_DEVICE");
+    int device_id = decive_env ? atoi(decive_env) : 0;
+    femu_log("backend_cuda_sync_init: enable %s, device_id %d\n", enable, device_id);
+
+    if(!enable || !enable[0] || !g_ascii_strcasecmp(enable, "0") || !g_ascii_strcasecmp(enable, "false"))
+    {
+        return 0;
+    }
+
+    if (!backend_cuda_init_api()) {
+        femu_err("Failed to load CUDA runtime library or resolve symbols.\n");
+        return -1;
+    }
+
+    if(cuda_api.set_device && cuda_api.set_device(device_id) != 0) {
+        femu_err("Failed to set CUDA device %d.\n", device_id);
+        return -1;
+    }
+
+    b->cuda_sync = true;
+    b->cuda_mirror_valid = false;
+    b->cuda_mirror = NULL;
+    return 0;
+}
+
+void backend_cuda_sync_fini(SsdBackend *b)
+{
+    if (b && b->cuda_sync && cuda_api.free) {
+        CudaMirrorRange *cur = cuda_mirror_head(b);
+        while (cur) {
+            CudaMirrorRange *next = cur->next;
+            if (cur->device_ptr) {
+                cuda_api.free(cur->device_ptr);
+            }
+            g_free(cur);
+            cur = next;
+        }
+        cuda_mirror_set_head(b, NULL);
+    }
+
+    if(b)
+    {
+        b->cuda_sync = false;
+        b->cuda_mirror_valid = false;
+    }
+}
+
+void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len, bool to_device)
+{
+    uint8_t *host;
+    uint8_t *mirror;
+    uint64_t offset;
+    femu_log("backend_cuda_sync_ptr: b %p, cuda_sync %d, ptr %p, len %lu, to_device %d\n",
+             b, b ? b->cuda_sync : -1, ptr, len, to_device);
+
+    if(!b || !b->cuda_sync || !ptr || len == 0 || !cuda_api.memcpy)
+    {
+        return;
+    }
+
+    host = (uint8_t *)b->logical_space;
+    if((uint8_t *)ptr < host)
+    {
+        femu_err("Pointer %p out of backend logical space range!\n", ptr);
+        return;
+    }
+
+    offset = (uint64_t)((uint8_t *)ptr - host);
+    if(offset >= (uint64_t)b->size || offset + len > (uint64_t)b->size)
+    {
+        femu_err("Pointer %p with len %lu out of backend logical space range!\n", ptr, len);
+        return;
+    }
+
+    CudaMirrorRange *entry = cuda_mirror_ensure(b, ptr, len);
+    if (!entry) {
+        return;
+    }
+
+    if(to_device)
+    {
+        int rc = cuda_api.memcpy(entry->device_ptr, ptr, len, 1 /* host to device */);
+        if (rc != 0) {
+            femu_err("cudaMemcpy host->device failed: rc=%d, ptr=%p, len=%lu\n", rc, ptr, len);
+            return;
+        }
+        /* mark mirror as containing up-to-date data for this range */
+        b->cuda_mirror_valid = true;
+    }
+    else
+    {
+        /* Only copy back from device if mirror has valid data. If the mirror
+         * hasn't been initialized from the host (no prior host->device copy),
+         * skip device->host copy to avoid overwriting valid host memory with
+         * uninitialized device contents.
+         */
+        if (!b->cuda_mirror_valid) {
+            femu_debug("backend_cuda_sync_ptr: skipping device->host copy because mirror not valid (ptr %p, len %lu)\n", ptr, len);
+        } else {
+            int rc = cuda_api.memcpy(ptr, entry->device_ptr, len, 2 /* device to host */);
+            if (rc != 0) {
+                femu_err("cudaMemcpy device->host failed: rc=%d, ptr=%p, len=%lu\n", rc, ptr, len);
+                return;
+            }
+        }
+    }
+
+    /* cudaMemcpy on the default stream is already synchronous.
+     * Keep an explicit device sync optional so normal file I/O is not
+     * serialized behind a full-device barrier.
+     */
+    if (cuda_api.synchronize && g_getenv("CEMU_CUDA_SYNC_WAIT"))
+    {
+        int rc = cuda_api.synchronize();
+        if (rc != 0) {
+            femu_err("cudaDeviceSynchronize failed: rc=%d, ptr=%p, len=%lu\n", rc, ptr, len);
+        }
+    }
+}
+
+void *backend_host_to_device(SsdBackend *b, void *host_ptr, uint64_t len)
+{
+    uint8_t *host;
+    uint64_t offset;
+    femu_log("backend_host_to_device: b %p, cuda_sync %d, host_ptr %p, len %lu\n",
+             b, b ? b->cuda_sync : -1, host_ptr, len);
+
+    if(!b || !b->cuda_sync || !host_ptr)
+    {
+        return NULL;
+    }
+
+    host = (uint8_t *)b->logical_space;
+    if((uint8_t *)host_ptr < host)
+    {
+        femu_err("Pointer %p out of backend logical space range!\n", host_ptr);
+        return NULL;
+    }
+
+    offset = (uint64_t)((uint8_t *)host_ptr - host);
+    if(offset >= (uint64_t)b->size)
+    {
+        femu_err("Pointer %p out of backend logical space range!\n", host_ptr);
+        return NULL;
+    }
+
+    CudaMirrorRange *entry = cuda_mirror_find(b, host_ptr, len);
+    if (!entry) {
+        entry = cuda_mirror_ensure(b, host_ptr, len);
+        if (!entry) {
+            femu_debug("backend_host_to_device: no CUDA mirror for host_ptr %p len %lu\n", host_ptr, len);
+            return NULL;
+        }
+    }
+
+    return entry->device_ptr;
+}
 
 int init_backend(SsdBackend **mbe, BackendType type, char *path, int64_t nbytes)
 {
@@ -90,6 +377,7 @@ void backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
         src = buf;
         dest = b->logical_space + data_offset;
     } else {
+        backend_cuda_sync_ptr(b, b->logical_space + data_offset, data_size, false);
         src = b->logical_space + data_offset;
         dest = buf;
     }
@@ -111,6 +399,10 @@ void backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
             dest += sz;
             src += sz;
         }
+    }
+
+    if(is_write) {
+        backend_cuda_sync_ptr(b, b->logical_space + data_offset, data_size, true);
     }
 }
 

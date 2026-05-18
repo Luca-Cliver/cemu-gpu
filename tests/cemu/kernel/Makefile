@@ -1,6 +1,8 @@
 BUILD_DIR := ../build
 TARGETS = \
 	$(BUILD_DIR)/vadd.so \
+	$(BUILD_DIR)/vadd_cuda.so \
+	$(BUILD_DIR)/vadd_cuda_devptr.so \
 	$(BUILD_DIR)/lz4.so \
 	$(BUILD_DIR)/grep.so \
 	$(BUILD_DIR)/sql.so \
@@ -21,6 +23,12 @@ CXXFLAGS = -Wall -Wextra -O2 -march=native -std=c++11
 
 $(BUILD_DIR)/vadd.so: vadd.c
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
+$(BUILD_DIR)/vadd_cuda.so: vadd_cuda.cu
+	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
+
+$(BUILD_DIR)/vadd_cuda_devptr.so: vadd_cuda_devptr.cu
+	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 
 $(BUILD_DIR)/lz4.so: lz4.cc
 	$(CXX) $(CXXFLAGS) -shared -fPIC -llz4 -o $@ $< /usr/lib/x86_64-linux-gnu/liblz4.a

@@ -14,13 +14,26 @@ typedef enum BackendType{
 /* SSD Backend */
 typedef struct SsdBackend {
     void        *logical_space;
+    void        *cuda_mirror;
     int64_t     size; /* in bytes */
     int         femu_mode;
     BackendType type;
+    bool        cuda_sync;
+    bool        cuda_mirror_valid;
 } SsdBackend;
 
 int init_dram_backend(SsdBackend *b);
 void free_dram_backend(SsdBackend *b);
+
+int backend_cuda_sync_init(SsdBackend *b);
+void backend_cuda_sync_fini(SsdBackend *b);
+void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len,
+                           bool to_device);
+
+/* Map a host pointer returned by backend_addr() to the corresponding
+ * device (GPU) pointer in the backend mirror, or NULL if not available.
+ */
+void *backend_host_to_device(SsdBackend *b, void *host_ptr, uint64_t len);
 
 int init_backend(SsdBackend **b, BackendType type, char *path, int64_t nbytes);
 void free_backend(SsdBackend *b);

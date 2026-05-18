@@ -33,6 +33,7 @@ static uint16_t memory_read(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         return ret;
     }
 
+    // backend_cuda_sync_ptr(ns->backend, backend_addr(ns->backend, sb), rl, false);
     if (dma_read_prp(n, backend_addr(ns->backend, sb), rl, prp1, prp2)) {
         femu_err("memory_read: dma_read_prp error\n");
         return NVME_DNR;
@@ -68,6 +69,8 @@ static uint16_t memory_write(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         return NVME_DNR;
     }
 
+    backend_cuda_sync_ptr(ns->backend, backend_addr(ns->backend, sb), wl, true);
+
     req->stat.pcie_lat = 0;
     req->stat.data_size = wl;
     req->stat.reqlat += wl / 2;
@@ -90,6 +93,7 @@ static uint16_t memory_fill(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     backend_fill(ns->backend, sb, fl);
+    backend_cuda_sync_ptr(ns->backend, backend_addr(ns->backend, sb), fl, true);
     req->stat.pcie_lat = 0;
     req->stat.data_size = fl;
     req->stat.reqlat += fl / 2;

@@ -12,7 +12,11 @@
 #
 # use ssh port 2222 to connect guest:
 #   ssh -p 2222 root@localhost
-sudo ./x86_64-softmmu/qemu-system-x86_64 \
+CEMU_CUDA_SYNC="${CEMU_CUDA_SYNC:-1}"
+CEMU_CUDA_DEVICE="${CEMU_CUDA_DEVICE:-0}"
+
+sudo CEMU_CUDA_SYNC="$CEMU_CUDA_SYNC" CEMU_CUDA_DEVICE="$CEMU_CUDA_DEVICE" \
+    ./x86_64-softmmu/qemu-system-x86_64 \
     -name "CEMU-DBIQ" \
     -smp 8 \
     -m 8G \

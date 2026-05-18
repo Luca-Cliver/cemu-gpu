@@ -28,6 +28,7 @@ typedef struct CsfScheduleInfo {
 struct NvmeRequest;
 struct JobGroup;
 struct csd;
+typedef struct SsdBackend SsdBackend;
 
 typedef QSIMPLEQ_HEAD(JobList, ComputeJob) JobList;
 
@@ -56,6 +57,7 @@ typedef struct ComputeJob {
 
     struct Program *program;
     struct ComputeEngine *ce;
+    SsdBackend **mr_backend;
 
     struct ubpf_jit_args args;
 } ComputeJob;

@@ -13,6 +13,11 @@ int init_dram_backend(SsdBackend *b)
         abort();
     }
 
+    b->cuda_mirror = NULL;
+    b->cuda_sync = false;
+    b->cuda_mirror_valid = false;
+    backend_cuda_sync_init(b);
+
     // if (mlock(b->logical_space, b->size) == -1) {
     //     femu_err("Failed to pin the memory backend to the host DRAM\n");
     // }
@@ -22,6 +27,7 @@ int init_dram_backend(SsdBackend *b)
 
 void free_dram_backend(SsdBackend *b)
 {
+    backend_cuda_sync_fini(b);
     if (b->logical_space) {
         // munmap(b->logical_space, b->size);
         free(b->logical_space);
