@@ -196,18 +196,18 @@ void sched_init(NvmeNamespace *ns)
     if (param->csf_sched_option.algo == NULL ||
         strcmp(param->csf_sched_option.algo, "fifo") == 0) {
         if (param->csf_sched_option.take_care_of_group) {
-            femu_log("use grouped fifo\n");
+            femu_debug("use grouped fifo\n");
             scheduler = &grouped_fifo_scheduler;
         } else {
-            femu_log("use fifo\n");
+            femu_debug("use fifo\n");
             scheduler = &fifo_scheduler;
         }
     } else if (strcmp(param->csf_sched_option.algo, "rr") == 0) {
         if (param->csf_sched_option.take_care_of_group) {
-            femu_log("use grouped rr\n");
+            femu_debug("use grouped rr\n");
             scheduler = &grouped_rr_scheduler;
         } else {
-            femu_log("use rr\n");
+            femu_debug("use rr\n");
             scheduler = &rr_scheduler;
         }
     } else {
@@ -215,7 +215,7 @@ void sched_init(NvmeNamespace *ns)
         assert(0);
     }
     if (param->csf_sched_option.take_care_of_group_prio) {
-        femu_log("sched will take care of group priority\n");
+        femu_debug("sched will take care of group priority\n");
     }
 
     assert(scheduler->pick_next_job != NULL);
@@ -549,7 +549,7 @@ void *sched_thread(void *arg)
         usleep(100000);
     }
 
-    femu_log("CSD scheduling thread started\n");
+    femu_debug("CSD scheduling thread started\n");
 
     uint64_t now = clock_ns();
     for (int i = 0; i < ce->nr_cu; i++) {

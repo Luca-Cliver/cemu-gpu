@@ -551,6 +551,8 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    auto start = std::chrono::steady_clock::now();
+    std::cout << "Benchmark start" << std::endl;
     // init task
     std::vector<MemoryRangeSet*> mrs;
     std::vector<Task*> tasks;
@@ -590,11 +592,14 @@ int main(int argc, char **argv) {
         tasks.push_back(task);
     }
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // auto start = std::chrono::high_resolution_clock::now();
+    // auto start = std::chrono::steady_clock::now();
     for (auto &thread : threads) {
         thread.join();
     }
-    auto end = std::chrono::high_resolution_clock::now();
+    // auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Benchmark end" << std::endl;
+    auto end = std::chrono::steady_clock::now();
 
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << "us" << std::endl;
 

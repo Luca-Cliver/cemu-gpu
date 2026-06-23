@@ -6,6 +6,8 @@ TARGETS = \
 	$(BUILD_DIR)/lz4.so \
 	$(BUILD_DIR)/grep.so \
 	$(BUILD_DIR)/sql.so \
+	$(BUILD_DIR)/kswitch_proxy.so \
+	$(BUILD_DIR)/kswitch_proxy_devptr.so \
 	$(BUILD_DIR)/knn.so \
 	$(BUILD_DIR)/vadd.bpf.o
 
@@ -41,6 +43,12 @@ $(BUILD_DIR)/sql.so: sql.cc
 
 $(BUILD_DIR)/knn.so: knn.cc
 	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $<
+
+$(BUILD_DIR)/kswitch_proxy.so: kswitch_proxy.cc
+	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $<
+
+$(BUILD_DIR)/kswitch_proxy_devptr.so: kswitch_proxy_devptr.cu
+	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 
 $(BUILD_DIR)/vadd.bpf.o: vadd.bpf.c
 	clang -target bpf -static -O2 -g -c -o $@ $<

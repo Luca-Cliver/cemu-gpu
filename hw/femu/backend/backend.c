@@ -132,7 +132,7 @@ int backend_cuda_sync_init(SsdBackend *b)
     const char *enable = g_getenv("CEMU_CUDA_SYNC");
     const char *decive_env = g_getenv("CEMU_CUDA_DEVICE");
     int device_id = decive_env ? atoi(decive_env) : 0;
-    femu_log("backend_cuda_sync_init: enable %s, device_id %d\n", enable, device_id);
+    femu_debug("backend_cuda_sync_init: enable %s, device_id %d\n", enable, device_id);
 
     if(!enable || !enable[0] || !g_ascii_strcasecmp(enable, "0") || !g_ascii_strcasecmp(enable, "false"))
     {
@@ -182,7 +182,7 @@ void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len, bool to_devic
     uint8_t *host;
     uint8_t *mirror;
     uint64_t offset;
-    femu_log("backend_cuda_sync_ptr: b %p, cuda_sync %d, ptr %p, len %lu, to_device %d\n",
+    femu_debug("backend_cuda_sync_ptr: b %p, cuda_sync %d, ptr %p, len %lu, to_device %d\n",
              b, b ? b->cuda_sync : -1, ptr, len, to_device);
 
     if(!b || !b->cuda_sync || !ptr || len == 0 || !cuda_api.memcpy)
@@ -204,9 +204,20 @@ void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len, bool to_devic
         return;
     }
 
-    CudaMirrorRange *entry = cuda_mirror_ensure(b, ptr, len);
-    if (!entry) {
-        return;
+    CudaMirrorRange *entry = NULL;
+    if (to_device) {
+        /* For host->device we need an allocation/mirror; ensure it exists */
+        entry = cuda_mirror_ensure(b, ptr, len);
+        if (!entry) {
+            return;
+        }
+    } else {
+        /* For device->host only use an existing mirror; don't allocate on read-path */
+        entry = cuda_mirror_find(b, ptr, len);
+        if (!entry) {
+            femu_debug("backend_cuda_sync_ptr: no mirror entry for ptr %p len %lu; skipping device->host copy\n", ptr, len);
+            return;
+        }
     }
 
     if(to_device)
@@ -254,7 +265,7 @@ void *backend_host_to_device(SsdBackend *b, void *host_ptr, uint64_t len)
 {
     uint8_t *host;
     uint64_t offset;
-    femu_log("backend_host_to_device: b %p, cuda_sync %d, host_ptr %p, len %lu\n",
+    femu_debug("backend_host_to_device: b %p, cuda_sync %d, host_ptr %p, len %lu\n",
              b, b ? b->cuda_sync : -1, host_ptr, len);
 
     if(!b || !b->cuda_sync || !host_ptr)

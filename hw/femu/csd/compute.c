@@ -4,6 +4,7 @@
 #include "compute.h"
 #include "memory.h"
 #include "qemu/atomic.h"
+#include <stdatomic.h>
 #include "hw/femu/backend/backend.h"
 #include "hw/femu/inc/slab.h"
 #include "hw/femu/nvme-def.h"
@@ -28,6 +29,12 @@ struct csd_thread_arg {
 };
 
 static void *compute_thread(void *arg);
+
+/* baseline counters for measuring compute fraction */
+static atomic_uint_fast64_t csd_total_compute_ns = 0;
+static atomic_uint_fast64_t csd_total_job_ns = 0;
+static atomic_uint_fast64_t csd_job_count = 0;
+static const int CSD_BASELINE_PRINT_FREQ = 100;
 
 struct ProgramInitArgs {
     uint32_t nsid;
@@ -147,7 +154,7 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             mrs->mr_len[i] = mrs->mr[i].len;
         }
 
-        femu_log("create mrs rsid %d, mrs %p, numr %d\n", mrs->rsid, mrs, mrs->numr);
+        femu_debug("create mrs rsid %d, mrs %p, numr %d\n", mrs->rsid, mrs, mrs->numr);
         cqe->n.result = mrs->rsid;
     } else if (sel == 1) {
         // remove memory range set
@@ -157,7 +164,7 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
         }
         pthread_spin_lock(&memory_range_set_slab(ns)->lock);
         MemoryRangeSet *mrs = memory_range_set_get(ns, rsid);
-        femu_log("free mrs rsid %d, mrs %p, numr %d\n", rsid, mrs, mrs->numr);
+        femu_debug("free mrs rsid %d, mrs %p, numr %d\n", rsid, mrs, mrs->numr);
         if (mrs == NULL || mrs->numr == 0) {
             pthread_spin_unlock(&memory_range_set_slab(ns)->lock);
             femu_err("memory_range_set_management: rsid %u not found!\n", rsid);
@@ -355,7 +362,7 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     uint64_t prp1 = le64_to_cpu(load->prp1);
     uint64_t prp2 = le64_to_cpu(load->prp2);
 
-    femu_log("load_program: sel %d, indirect %d, runtime %u, runtime_scale %f, ptype %d, pind %d, psize %d, numb %d, loff %d, pid %ld, prp1 %lx, prp2 %lx\n",
+    femu_debug("load_program: sel %d, indirect %d, runtime %u, runtime_scale %f, ptype %d, pind %d, psize %d, numb %d, loff %d, pid %ld, prp1 %lx, prp2 %lx\n",
                sel, indirect, runtime, runtime_scale / 10.0, ptype, pind, psize, numb, loff, pid, prp1, prp2);
 
     // get program
@@ -601,7 +608,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             req->nr_sres = 0;
             req->sres = NULL;
 
-            femu_log("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
+            femu_debug("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
             // parse indirect task from data buffer
             IndirectTask *task = &req->indirect_task;
             task->raw_data_buffer = data_buffer;
@@ -611,7 +618,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             task->nr_total_input_cf2 = raw_task[2];
             task->nr_total_output_cf2 = raw_task[3];
             task->chunk_nlb = chunk_nlb;
-            femu_log("program_execute: task->nr_concurrent_chunks %d, task->destination %d, task->chunk_nlb %d, task->nr_total_input_cf2 %d, task->nr_total_output_cf2 %d\n", task->nr_concurrent_chunks, task->destination, task->chunk_nlb, task->nr_total_input_cf2, task->nr_total_output_cf2);
+            femu_debug("program_execute: task->nr_concurrent_chunks %d, task->destination %d, task->chunk_nlb %d, task->nr_total_input_cf2 %d, task->nr_total_output_cf2 %d\n", task->nr_concurrent_chunks, task->destination, task->chunk_nlb, task->nr_total_input_cf2, task->nr_total_output_cf2);
 
             // check parameters
             if (task->nr_concurrent_chunks == 0) {
@@ -649,21 +656,21 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
 
             task->nr_input_cf2 = raw_task + 4;
             for (int i = 0; i < task->nr_concurrent_chunks; i++) {
-                femu_log("program_execute: task->nr_input_cf2[%d] %d\n", i, task->nr_input_cf2[i]);
+                femu_debug("program_execute: task->nr_input_cf2[%d] %d\n", i, task->nr_input_cf2[i]);
             }
             if (task->destination == 1) {
                 // output in NVM
                 task->nr_output_cf2 = task->nr_input_cf2 + task->nr_concurrent_chunks;
                 data_buffer = (void*)(task->nr_output_cf2 + task->nr_concurrent_chunks);
                 for (int i = 0; i < task->nr_concurrent_chunks; i++) {
-                    femu_log("program_execute: task->nr_output_cf2[%d] %d\n", i, task->nr_output_cf2[i]);
+                    femu_debug("program_execute: task->nr_output_cf2[%d] %d\n", i, task->nr_output_cf2[i]);
                 }
             } else {
                 // output in FDM
                 task->nr_output_cf2 = NULL;
                 data_buffer = (void*)(task->nr_input_cf2 + task->nr_concurrent_chunks);
             }
-            femu_log("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
+            femu_debug("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
             int total_input_cf2 = 0;
             int total_output_cf2 = 0;
             task->nr_total_nlb = 0;
@@ -715,7 +722,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
                     max_sres_per_chunk = MAX(max_sres_per_chunk, task->nr_output_cf2[i]);
                 }
             }
-            femu_log("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
+            femu_debug("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
             data_buffer += (task->nr_total_input_cf2 + task->nr_total_output_cf2) * sizeof(NvmeCopyFormat);
             dlen -= (data_buffer - task->raw_data_buffer);
             req->data_buffer = data_buffer;
@@ -774,16 +781,16 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.mr_len = mr_len;
     job->mr_backend = mr_backend;
 
-    femu_log("1:program_execute: numr %u\n", numr);
+    femu_debug("program_execute: numr %u\n", numr);
     job->args.mr_dev_addr = malloc(sizeof(uint64_t) * numr);
-    femu_log("2:program_execute: mr_addr[0] %p, mr_len[0] %lld\n", mr_addr[0], mr_len[0]);
+    femu_debug("program_execute: mr_addr[0] %p, mr_len[0] %lld\n", mr_addr[0], mr_len[0]);
     if (job->args.mr_dev_addr) {
         for (uint32_t i = 0; i < numr; i++) {
             job->args.mr_dev_addr[i] = backend_host_to_device(mr_backend[i], mr_addr[i], mr_len[i]);
-            femu_log("program_execute: mr_dev_addr[%u] = %p for host %p len %lld\n", i, job->args.mr_dev_addr[i], mr_addr[i], mr_len[i]);
+            femu_debug("program_execute: mr_dev_addr[%u] = %p for host %p len %lld\n", i, job->args.mr_dev_addr[i], mr_addr[i], mr_len[i]);
         }
     } else {
-        femu_log("program_execute: mr_dev_addr allocation failed\n");
+        femu_debug("program_execute: mr_dev_addr allocation failed\n");
     }
     job->args.cparam1 = cparam1;
     job->args.cparam2 = cparam2;
@@ -801,7 +808,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         qatomic_inc(&program->jobs_running);
     }
 
-    femu_log("program_execute: completed\n");
+    femu_debug("program_execute: completed\n");
     return NVME_SUCCESS;
 }
 
@@ -886,8 +893,12 @@ static uint64_t run_functional_modeling(ComputeJob *job)
     uint64_t res = 0;
     uint64_t realtime;
     uint64_t runtime = job->user_runtime;
+    struct timespec t0, t1;
 
-    femu_log("run_functional_modeling: program %u, runtime %lu, size %llu\n", program->pind, runtime, job->args.mr_len[0]);
+    /* job start timestamp for baseline measurement */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    femu_debug("run_functional_modeling: program %u, runtime %lu, size %llu\n", program->pind, runtime, job->args.mr_len[0]);
 
     // execute
     // if (!runtime) {
@@ -902,7 +913,7 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             }
         }
         
-        femu_log("run_functional_modeling: after cuda_sync_ptr\n");
+        femu_debug("run_functional_modeling: after cuda_sync_ptr\n");
         clock_gettime(CLOCK_MONOTONIC, &cs);
         enter_compute_section();
         clock_gettime(CLOCK_MONOTONIC, &ce);
@@ -940,9 +951,26 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         leave_compute_section();
     // }
 
-    femu_debug("run_on_host: program %u, runtime %lu, realtime: %lu, size %llu\n", program->pind, runtime, realtime,job->args.mr_len[0]);
+        femu_debug("run_on_host: program %u, runtime %lu, realtime: %lu, size %llu\n", program->pind, runtime, realtime,job->args.mr_len[0]);
 
-    set_sched_runtime(job, runtime);
+        /* Print realtime and runtime to stdout for quick inspection */
+        printf("CEMU_COMPUTE: program %u, realtime=%lu ns, runtime=%lu ns\n",
+            program->pind, (unsigned long)realtime, (unsigned long)runtime);
+
+        set_sched_runtime(job, runtime);
+
+    /* record baseline counters */
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t job_ns = (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec);
+    atomic_fetch_add_explicit(&csd_total_compute_ns, (uint_fast64_t)realtime, memory_order_relaxed);
+    atomic_fetch_add_explicit(&csd_total_job_ns, (uint_fast64_t)job_ns, memory_order_relaxed);
+    uint64_t jobs = atomic_fetch_add_explicit(&csd_job_count, 1, memory_order_relaxed) + 1;
+    if (jobs % CSD_BASELINE_PRINT_FREQ == 0) {
+        uint64_t total_c = atomic_load_explicit(&csd_total_compute_ns, memory_order_relaxed);
+        uint64_t total_j = atomic_load_explicit(&csd_total_job_ns, memory_order_relaxed);
+        double frac = total_j ? ((double)total_c / (double)total_j) : 0.0;
+        femu_log("CSD baseline: jobs=%lu, compute_ns=%lu, total_ns=%lu, compute_fraction=%.4f\n", jobs, total_c, total_j, frac);
+    }
     return res;
 }
 
@@ -1070,8 +1098,8 @@ static void *indirect_main(void *arg)
     long long *mr_len = indirect_req->job->args.mr_len;
     int numr_per_chunk = indirect_req->job->args.numr / parallel_chunks;
 
-    femu_log("indirect main thread start: parallel_chunks %d, chunk_nlb %d\n", parallel_chunks, chunk_nlb);
-    femu_log("indirect main thread mem_ctrl %p\n", indirect_req->mem_ctrl);
+    femu_debug("indirect main thread start: parallel_chunks %d, chunk_nlb %d\n", parallel_chunks, chunk_nlb);
+    femu_debug("indirect main thread mem_ctrl %p\n", indirect_req->mem_ctrl);
 
     NvmeRequest **reqs = malloc(sizeof(NvmeRequest *) * parallel_chunks);
     for (int i = 0; i < parallel_chunks; i++) {
@@ -1109,7 +1137,7 @@ static void *indirect_main(void *arg)
 
     pqueue_t *pq = pqueue_init(FEMU_MAX_INF_REQS, cmp_pri, get_pri, set_pri,
                                get_pos, set_pos);
-    femu_log("indirect finished init pqueue\n");
+    femu_debug("indirect finished init pqueue\n");
 
     while (true) {
         // wait io
@@ -1222,7 +1250,7 @@ static void *indirect_main(void *arg)
             break;
     }
 
-    femu_log("indirect finish\n");
+    femu_debug("indirect finish\n");
     for (int i = 0; i < parallel_chunks; i++) {
         if (reqs[i]->sres) {
             sched_job_finish_indirect(reqs[i]->job);
@@ -1247,7 +1275,7 @@ static void *indirect_main(void *arg)
     femu_ring_enqueue(cns->to_csd[0], (void *)&indirect_req, 1);
 
     uint64_t end = clock_ns();
-    femu_log("indirect: total time %zu, input time %zu, compute time %zu, output time %zu\n", end - start, input_time, compute_time, output_time);
+    femu_debug("indirect: total time %zu, input time %zu, compute time %zu, output time %zu\n", end - start, input_time, compute_time, output_time);
 
     return NULL;
 }
@@ -1270,7 +1298,7 @@ static void *compute_thread(void *arg)
 
     struct rte_ring *to_csd = cns->to_csd[id];
 
-    femu_log("csd_thread %d start\n", id);
+    femu_debug("csd_thread %d start\n", id);
 
     // int next_poller = 1;
 
