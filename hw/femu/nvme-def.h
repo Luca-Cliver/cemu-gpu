@@ -449,7 +449,7 @@ typedef struct NvmeLoadProgramCmd {
     uint8_t     sel      : 1;   // 0 for load 1 for unload
     uint8_t     pit      : 3;   // program identifier type, 0 is not used, 1 is PUID (program unique identifier)
     uint8_t     indirect : 1;
-    uint8_t     rsvd10   : 3;
+    uint8_t     target   : 3;
     uint32_t    psize;          // total program size in bytes
     uint64_t    pid;            // program identifier, PUID when pit is 1
     uint32_t    numb;           // number of bytes to transfer

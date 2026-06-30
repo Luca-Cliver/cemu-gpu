@@ -286,6 +286,7 @@ void prep_shared_library(const char *file, const char *kernel, struct ioctl_down
     download->addr = program;
     download->size = strlen(file) + strlen(kernel) + 2;
     download->ptype = PROGRAM_TYPE_SHARED_LIB;
+    download->target = PROGRAM_TARGET_HOST;
 }
 
 void prep_ebpf(const char *file, const char *kernel, bool jit, struct ioctl_download *download)
@@ -297,6 +298,18 @@ void prep_ebpf(const char *file, const char *kernel, bool jit, struct ioctl_down
     download->size = strlen(file) + strlen(kernel) + 2;
     download->ptype = PROGRAM_TYPE_EBPF;
     download->jit = jit;
+    download->target = PROGRAM_TARGET_HOST;
+}
+
+void prep_cuda_lib(const char *file, const char *kernel, struct ioctl_download *download)
+{
+    char *program = (char *)aligned_alloc(4096, 4096);
+    sprintf(program, "%s", file);
+    sprintf(program + strlen(file) + 1, "%s", kernel);
+    download->addr = program;
+    download->size = strlen(file) + strlen(kernel) + 2;
+    download->ptype = PROGRAM_TYPE_SHARED_LIB;
+    download->target = PROGRAM_TARGET_CUDA_DEVPTR;
 }
 
 void prep_mrs(struct ioctl_create_mrs *mrs, int nr_fd)

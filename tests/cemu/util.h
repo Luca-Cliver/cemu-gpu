@@ -117,6 +117,14 @@ extern int get_file_mappings(const char *filename, uint64_t *filesize, NvmeCopyF
 extern void prep_shared_library(const char *file, const char *kernel, struct ioctl_download *download);
 
 /**
+ * Prepare CUDA shared library for program execution with device-pointer args
+ * @param file: shared library file name
+ * @param kernel: kernel file name
+ * @param download: download structure
+ */
+extern void prep_cuda_lib(const char *file, const char *kernel, struct ioctl_download *download);
+
+/**
  * Prepare eBPF program for program execution
  * @param file: eBPF program file name
  * @param kernel: kernel file name

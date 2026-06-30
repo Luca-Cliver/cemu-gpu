@@ -42,6 +42,12 @@ enum ProgramType {
     PROGRAM_TYPE_INVALID,
 };
 
+enum ProgramTarget {
+    PROGRAM_TARGET_HOST,
+    PROGRAM_TARGET_CUDA_DEVPTR,
+    PROGRAM_TARGET_INVALID,
+};
+
 /**** CSF Metadata ****/
 typedef struct CsfRuntime {
     uint64_t avg_runtime;
@@ -62,6 +68,7 @@ typedef struct Program {
     uint16_t pind;              // program index
     uint8_t state;              // enum ProgramState
     uint8_t type;               // enum ProgramType
+    uint8_t target;             // enum ProgramTarget
     void *code;                 // program data
     uint32_t size;              // program size
     uint32_t load_size;         // bytes loaded

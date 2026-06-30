@@ -352,6 +352,7 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     int pit = load->pit;
     int jit = load->jit;
     int indirect = load->indirect;
+    int target = load->target;
     uint16_t runtime_scale = le16_to_cpu(load->runtime_scale);
     uint32_t runtime = le32_to_cpu(load->runtime);
     uint16_t pind = le16_to_cpu(load->pind);
@@ -362,8 +363,8 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     uint64_t prp1 = le64_to_cpu(load->prp1);
     uint64_t prp2 = le64_to_cpu(load->prp2);
 
-    femu_debug("load_program: sel %d, indirect %d, runtime %u, runtime_scale %f, ptype %d, pind %d, psize %d, numb %d, loff %d, pid %ld, prp1 %lx, prp2 %lx\n",
-               sel, indirect, runtime, runtime_scale / 10.0, ptype, pind, psize, numb, loff, pid, prp1, prp2);
+    femu_debug("load_program: sel %d, indirect %d, target %d, runtime %u, runtime_scale %f, ptype %d, pind %d, psize %d, numb %d, loff %d, pid %ld, prp1 %lx, prp2 %lx\n",
+               sel, indirect, target, runtime, runtime_scale / 10.0, ptype, pind, psize, numb, loff, pid, prp1, prp2);
 
     // get program
     if (pind == 0 || pind > MAX_PIND) {
@@ -391,13 +392,19 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
             if (pit == 1) {
                 program->pid = pid;
             }
-            if (program->type >= PROGRAM_TYPE_INVALID) {
+            if (ptype >= PROGRAM_TYPE_INVALID) {
                 pthread_mutex_unlock(&program->lock);
-                femu_err("load_program: program %u type %u not supported!\n", pind, program->type);
+                femu_err("load_program: program %u type %u not supported!\n", pind, ptype);
                 return NVME_INVALID_PTYPE;
+            }
+            if (target >= PROGRAM_TARGET_INVALID) {
+                pthread_mutex_unlock(&program->lock);
+                femu_err("load_program: program %u target %u not supported!\n", pind, target);
+                return NVME_INVALID_FIELD;
             }
             program->size = psize;
             program->type = ptype;
+            program->target = target;
             qatomic_set(&program->jobs_running, 0);
             program->code = malloc(psize);
             program->state = PROGRAM_STATE_LOADING;
@@ -767,9 +774,26 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         dlen -= sizeof(NvmeMemoryRange) * numr;
     }
 
-    for(uint32_t i = 0; i < numr; i++)
-    {
-        backend_cuda_sync_ptr(mr_backend[i], mr_addr[i], mr_len[i], true);
+    void **mr_dev_addr = NULL;
+    if (program->target == PROGRAM_TARGET_CUDA_DEVPTR && numr) {
+        femu_debug("program_execute: preparing CUDA devptr args, numr %u\n", numr);
+        mr_dev_addr = malloc(sizeof(void *) * numr);
+        if (!mr_dev_addr) {
+            femu_err("program_execute: mr_dev_addr allocation failed\n");
+            return NVME_DNR;
+        }
+        for (uint32_t i = 0; i < numr; i++) {
+            backend_cuda_sync_ptr(mr_backend[i], mr_addr[i], mr_len[i], true);
+            mr_dev_addr[i] = backend_host_to_device(mr_backend[i], mr_addr[i], mr_len[i]);
+            if (!mr_dev_addr[i]) {
+                femu_err("program_execute: failed to prepare CUDA devptr for mr %u, host %p len %lld\n",
+                         i, mr_addr[i], mr_len[i]);
+                free(mr_dev_addr);
+                return NVME_DNR;
+            }
+            femu_debug("program_execute: mr_dev_addr[%u] = %p for host %p len %lld\n",
+                       i, mr_dev_addr[i], mr_addr[i], mr_len[i]);
+        }
     }
 
     sched_alloc_job(compute_ns(req->ns), req);
@@ -779,19 +803,9 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.numr = numr;
     job->args.mr_addr = mr_addr;
     job->args.mr_len = mr_len;
+    job->args.mr_dev_addr = mr_dev_addr;
+    job->owns_mr_dev_addr = mr_dev_addr != NULL;
     job->mr_backend = mr_backend;
-
-    femu_debug("program_execute: numr %u\n", numr);
-    job->args.mr_dev_addr = malloc(sizeof(uint64_t) * numr);
-    femu_debug("program_execute: mr_addr[0] %p, mr_len[0] %lld\n", mr_addr[0], mr_len[0]);
-    if (job->args.mr_dev_addr) {
-        for (uint32_t i = 0; i < numr; i++) {
-            job->args.mr_dev_addr[i] = backend_host_to_device(mr_backend[i], mr_addr[i], mr_len[i]);
-            femu_debug("program_execute: mr_dev_addr[%u] = %p for host %p len %lld\n", i, job->args.mr_dev_addr[i], mr_addr[i], mr_len[i]);
-        }
-    } else {
-        femu_debug("program_execute: mr_dev_addr allocation failed\n");
-    }
     job->args.cparam1 = cparam1;
     job->args.cparam2 = cparam2;
     job->args.data_buffer = dlen ? data_buffer : NULL;
@@ -905,15 +919,6 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         struct timespec ts,te;
         struct timespec cs,ce;
 
-        if(job->mr_backend)
-        {
-            for(uint32_t i = 0; i < job->args.numr; i++)
-            {
-                backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i], job->args.mr_len[i], true);
-            }
-        }
-        
-        femu_debug("run_functional_modeling: after cuda_sync_ptr\n");
         clock_gettime(CLOCK_MONOTONIC, &cs);
         enter_compute_section();
         clock_gettime(CLOCK_MONOTONIC, &ce);
@@ -924,21 +929,54 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             runtime -= time_cost;
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        switch (program->type) {
-        case PROGRAM_TYPE_SHARED_LIB:
-            res = program->shared_lib.jit_fn(&job->args);
-            break;
-        case PROGRAM_TYPE_EBPF:
-            if (program->ebpf.jit_fn == NULL) {
-                femu_debug("running non-jit ebpf...\n");
-                if (ubpf_exec(program->ebpf.vm, &job->args, &res) < 0) {
-                    res = -1;
-                    femu_err("running ebpf: ubpf_exec error\n");
+        switch (program->target) {
+        case PROGRAM_TARGET_HOST:
+            switch (program->type) {
+            case PROGRAM_TYPE_SHARED_LIB:
+                res = program->shared_lib.jit_fn(&job->args);
+                break;
+            case PROGRAM_TYPE_EBPF:
+                if (program->ebpf.jit_fn == NULL) {
+                    femu_debug("running non-jit ebpf...\n");
+                    if (ubpf_exec(program->ebpf.vm, &job->args, &res) < 0) {
+                        res = -1;
+                        femu_err("running ebpf: ubpf_exec error\n");
+                    }
+                } else {
+                    femu_debug("running jit ebpf...\n");
+                    res = program->ebpf.jit_fn(&job->args);
                 }
-            } else {
-                femu_debug("running jit ebpf...\n");
-                res = program->ebpf.jit_fn(&job->args);
+                break;
+            default:
+                res = -1;
+                femu_err("run_functional_modeling: program type %u not supported for HOST target\n",
+                         program->type);
+                break;
             }
+            break;
+        case PROGRAM_TARGET_CUDA_DEVPTR:
+            if (program->type != PROGRAM_TYPE_SHARED_LIB) {
+                res = -1;
+                femu_err("run_functional_modeling: CUDA_DEVPTR target requires shared library program, type %u\n",
+                         program->type);
+            } else if (!job->args.mr_dev_addr) {
+                res = -1;
+                femu_err("run_functional_modeling: CUDA_DEVPTR target missing mr_dev_addr\n");
+            } else {
+                if (job->mr_backend) {
+                    for (uint32_t i = 0; i < job->args.numr; i++) {
+                        backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
+                                              job->args.mr_len[i], true);
+                    }
+                }
+                femu_debug("running CUDA devptr shared lib...\n");
+                res = program->shared_lib.jit_fn(&job->args);
+            }
+            break;
+        default:
+            res = -1;
+            femu_err("run_functional_modeling: program target %u not supported\n",
+                     program->target);
             break;
         }
         clock_gettime(CLOCK_MONOTONIC, &te);
@@ -1038,6 +1076,7 @@ static NvmeRequest *req_dup(NvmeRequest *req)
     sched_alloc_job(compute_ns(new_req->ns), new_req);
     memcpy(new_req->job, req->job, sizeof(ComputeJob));
     new_req->job->req = new_req;
+    new_req->job->owns_mr_dev_addr = false;
     sched_enqueue_job(compute_ns(new_req->ns), new_req);
     return new_req;
 }
@@ -1095,7 +1134,9 @@ static void *indirect_main(void *arg)
     }
 
     void **mr_addr = indirect_req->job->args.mr_addr;
+    void **mr_dev_addr = indirect_req->job->args.mr_dev_addr;
     long long *mr_len = indirect_req->job->args.mr_len;
+    SsdBackend **mr_backend = indirect_req->job->mr_backend;
     int numr_per_chunk = indirect_req->job->args.numr / parallel_chunks;
 
     femu_debug("indirect main thread start: parallel_chunks %d, chunk_nlb %d\n", parallel_chunks, chunk_nlb);
@@ -1107,7 +1148,9 @@ static void *indirect_main(void *arg)
         reqs[i]->indirect_task.chunk_id = i;
 
         reqs[i]->job->args.mr_addr = mr_addr + numr_per_chunk * i;
+        reqs[i]->job->args.mr_dev_addr = mr_dev_addr ? mr_dev_addr + numr_per_chunk * i : NULL;
         reqs[i]->job->args.mr_len = mr_len + numr_per_chunk * i;
+        reqs[i]->job->mr_backend = mr_backend ? mr_backend + numr_per_chunk * i : NULL;
         reqs[i]->job->args.numr = numr_per_chunk;
         reqs[i]->indirect_task.ring = ring;
         reqs[i]->indirect_task.stage = 0;

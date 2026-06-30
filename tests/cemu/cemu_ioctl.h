@@ -11,6 +11,12 @@
 
 #define CEMU_IOCTL_MAGIC  'C'
 
+enum {
+    PROGRAM_TARGET_HOST,
+    PROGRAM_TARGET_CUDA_DEVPTR,
+    PROGRAM_TARGET_INVALID,
+};
+
 /* IOCTL_CEMU_DOWNLOAD / IOCTL_CEMU_UNLOAD / ACTIVATE / DEACTIVATE argument */
 struct ioctl_download {
     const char *name;
@@ -21,6 +27,7 @@ struct ioctl_download {
     int32_t     runtime_scale;
     int32_t     jit;
     int32_t     indirect;
+    int32_t     target;
     int32_t     pind;   /* out for DOWNLOAD */
 };
 

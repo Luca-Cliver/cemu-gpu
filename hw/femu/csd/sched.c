@@ -338,6 +338,8 @@ static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
         qatomic_dec(&program->jobs_running);
         if (job->args.data_buffer)
             free(job->args.data_buffer);
+        if (job->owns_mr_dev_addr && job->args.mr_dev_addr)
+            free(job->args.mr_dev_addr);
         job_group_remove(job->group, job);
         job_free(ce, job);
     } else {
@@ -353,6 +355,8 @@ void sched_job_finish_indirect(ComputeJob *job)
     pthread_spin_unlock(&job->group->lock);
 
     qatomic_dec(&job->program->jobs_running);
+    if (job->owns_mr_dev_addr && job->args.mr_dev_addr)
+        free(job->args.mr_dev_addr);
     job_group_remove(job->group, job);
     job_free(job->ce, job);
 }

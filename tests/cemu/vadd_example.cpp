@@ -52,7 +52,7 @@ int main(int argc, char *argv[])
     if (use_ebpf) {
         prep_ebpf("./build/vadd.bpf.o", "vadd", use_jit, &download);
     } else if (use_cuda_devptr) {
-        prep_shared_library("./build/vadd_cuda_devptr.so", "vadd", &download);
+        prep_cuda_lib("./build/vadd_cuda_devptr.so", "vadd", &download);
     } else if (use_cuda) {
         prep_shared_library("./build/vadd_cuda.so", "vadd", &download);
     } else {

@@ -58,6 +58,7 @@ typedef struct ComputeJob {
     struct Program *program;
     struct ComputeEngine *ce;
     SsdBackend **mr_backend;
+    bool owns_mr_dev_addr;
 
     struct ubpf_jit_args args;
 } ComputeJob;
