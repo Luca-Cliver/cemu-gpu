@@ -901,6 +901,75 @@ static void leave_compute_section(void) {
 //     qemu_mutex_unlock(&compute_mutex);
 // }
 
+static uint64_t run_host_program(ComputeJob *job)
+{
+    Program *program = job->program;
+    uint64_t res = 0;
+
+    switch (program->type) {
+    case PROGRAM_TYPE_SHARED_LIB:
+        return program->shared_lib.jit_fn(&job->args);
+    case PROGRAM_TYPE_EBPF:
+        if (program->ebpf.jit_fn == NULL) {
+            femu_debug("running non-jit ebpf...\n");
+            if (ubpf_exec(program->ebpf.vm, &job->args, &res) < 0) {
+                femu_err("running ebpf: ubpf_exec error\n");
+                return (uint64_t)-1;
+            }
+            return res;
+        }
+
+        femu_debug("running jit ebpf...\n");
+        return program->ebpf.jit_fn(&job->args);
+    default:
+        femu_err("run_host_program: program type %u not supported for HOST target\n",
+                 program->type);
+        return (uint64_t)-1;
+    }
+}
+
+static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
+{
+    Program *program = job->program;
+
+    if (program->type != PROGRAM_TYPE_SHARED_LIB) {
+        femu_err("run_cuda_devptr_shared_lib: CUDA_DEVPTR target requires shared library program, type %u\n",
+                 program->type);
+        return (uint64_t)-1;
+    }
+
+    if (!job->args.mr_dev_addr) {
+        femu_err("run_cuda_devptr_shared_lib: CUDA_DEVPTR target missing mr_dev_addr\n");
+        return (uint64_t)-1;
+    }
+
+    if (job->mr_backend) {
+        for (uint32_t i = 0; i < job->args.numr; i++) {
+            backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
+                                  job->args.mr_len[i], true);
+        }
+    }
+
+    femu_debug("running CUDA devptr shared lib...\n");
+    return program->shared_lib.jit_fn(&job->args);
+}
+
+static uint64_t run_program_by_target(ComputeJob *job)
+{
+    Program *program = job->program;
+
+    switch (program->target) {
+    case PROGRAM_TARGET_HOST:
+        return run_host_program(job);
+    case PROGRAM_TARGET_CUDA_DEVPTR:
+        return run_cuda_devptr_shared_lib(job);
+    default:
+        femu_err("run_program_by_target: program target %u not supported\n",
+                 program->target);
+        return (uint64_t)-1;
+    }
+}
+
 static uint64_t run_functional_modeling(ComputeJob *job)
 {
     Program *program = job->program;
@@ -929,56 +998,7 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             runtime -= time_cost;
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        switch (program->target) {
-        case PROGRAM_TARGET_HOST:
-            switch (program->type) {
-            case PROGRAM_TYPE_SHARED_LIB:
-                res = program->shared_lib.jit_fn(&job->args);
-                break;
-            case PROGRAM_TYPE_EBPF:
-                if (program->ebpf.jit_fn == NULL) {
-                    femu_debug("running non-jit ebpf...\n");
-                    if (ubpf_exec(program->ebpf.vm, &job->args, &res) < 0) {
-                        res = -1;
-                        femu_err("running ebpf: ubpf_exec error\n");
-                    }
-                } else {
-                    femu_debug("running jit ebpf...\n");
-                    res = program->ebpf.jit_fn(&job->args);
-                }
-                break;
-            default:
-                res = -1;
-                femu_err("run_functional_modeling: program type %u not supported for HOST target\n",
-                         program->type);
-                break;
-            }
-            break;
-        case PROGRAM_TARGET_CUDA_DEVPTR:
-            if (program->type != PROGRAM_TYPE_SHARED_LIB) {
-                res = -1;
-                femu_err("run_functional_modeling: CUDA_DEVPTR target requires shared library program, type %u\n",
-                         program->type);
-            } else if (!job->args.mr_dev_addr) {
-                res = -1;
-                femu_err("run_functional_modeling: CUDA_DEVPTR target missing mr_dev_addr\n");
-            } else {
-                if (job->mr_backend) {
-                    for (uint32_t i = 0; i < job->args.numr; i++) {
-                        backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
-                                              job->args.mr_len[i], true);
-                    }
-                }
-                femu_debug("running CUDA devptr shared lib...\n");
-                res = program->shared_lib.jit_fn(&job->args);
-            }
-            break;
-        default:
-            res = -1;
-            femu_err("run_functional_modeling: program target %u not supported\n",
-                     program->target);
-            break;
-        }
+        res = run_program_by_target(job);
         clock_gettime(CLOCK_MONOTONIC, &te);
         realtime = (te.tv_sec-ts.tv_sec)* 1000000000LL + (te.tv_nsec-ts.tv_nsec);
         if(!runtime)
