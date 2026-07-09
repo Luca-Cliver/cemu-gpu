@@ -50,6 +50,7 @@ int group = 0;
 uint64_t runtime = 0;
 double bw = 0;
 int sched_prio = 0;
+bool use_cuda_devptr = false;
 
 std::vector<int> kernel_times;
 std::vector<int> input_times;
@@ -167,7 +168,11 @@ struct Task {
         download.name = kernel.c_str();
         download.runtime = kernel_time;
         download.runtime_scale = runtime_scale;
-        prep_shared_library(kernel_file.c_str(), kernel.c_str(), &download);
+        if (use_cuda_devptr) {
+            prep_cuda_lib(kernel_file.c_str(), kernel.c_str(), &download);
+        } else {
+            prep_shared_library(kernel_file.c_str(), kernel.c_str(), &download);
+        }
         int ret = ioctl(ctl_fd, IOCTL_CEMU_DOWNLOAD, &download);
         if (ret <= 0) {
             perror("load_program ioctl error");
@@ -431,10 +436,14 @@ static void parse_arg(int argc, char **argv) {
         {"shared_library", required_argument, 0, 'l'},
         {"kernel", required_argument, 0, 'n'},
         {"runtime_scale", required_argument, 0, 'x'},
+        {"cuda-devptr", no_argument, 0, 'u'},
         {0, 0, 0, 0}
     };
-    while ((opt = getopt_long(argc, argv, "vc:p:f:s:d:t:o:e:b:m:a:g:r:i:l:n:x:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "uvc:p:f:s:d:t:o:e:b:m:a:g:r:i:l:n:x:", long_options, &option_index)) != -1) {
         switch (opt) {
+        case 'u':
+            use_cuda_devptr = true;
+            break;
         case 'v':
             print_time = 1;
             break;
@@ -498,6 +507,7 @@ static void parse_arg(int argc, char **argv) {
         [-x runtime_scale]\n\
         [-e output_ratio]\n\
         [-o 0/1] 0: output to host, 1: output to NAND\n\
+        [-u] use CUDA device-pointer shared library target\n\
         [-v] profile time of every step\n\
 ";
             exit(EXIT_FAILURE);
@@ -530,6 +540,7 @@ int main(int argc, char **argv) {
     std::cout << "INFO: kernel_time     = " << kernel_time / 1000 << " us" << std::endl;
     std::cout << "INFO: kernel_file     = " << kernel_file << std::endl;
     std::cout << "INFO: kernel          = " << kernel << std::endl;
+    std::cout << "INFO: cuda_devptr     = " << use_cuda_devptr << std::endl;
     std::cout << "INFO: drive           = " << drive_str << std::endl;
     std::cout << "INFO: print_time      = " << print_time << std::endl;
     std::cout << "INFO: datafile        = " << datafile << std::endl;
