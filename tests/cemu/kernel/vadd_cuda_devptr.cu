@@ -57,9 +57,9 @@ extern "C" long long vadd(struct cemu_args *args)
     }
 
     int size = static_cast<int>(args->cparam1);
-    int *device_output = static_cast<int *>(args->mr_dev_addr[0]);
-    int *device_input = static_cast<int *>(args->mr_dev_addr[1]);
-    int *host_output = static_cast<int *>(args->mr_addr[0]);
+    int *device_input = static_cast<int *>(args->mr_dev_addr[0]);
+    int *device_output = static_cast<int *>(args->mr_dev_addr[1]);
+    int *host_output = static_cast<int *>(args->mr_addr[1]);
 
     constexpr int threads_per_block = 256;
     int blocks = (size + threads_per_block - 1) / threads_per_block;

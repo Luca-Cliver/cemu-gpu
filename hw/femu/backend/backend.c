@@ -177,10 +177,46 @@ void backend_cuda_sync_fini(SsdBackend *b)
     }
 }
 
+void *backend_cuda_ensure_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len)
+{
+    uint8_t *host;
+    uint64_t offset;
+    femu_debug("backend_cuda_ensure_device_ptr: b %p, cuda_sync %d, host_ptr %p, len %lu\n",
+             b, b ? b->cuda_sync : -1, host_ptr, len);
+
+    if(!b || !b->cuda_sync || !host_ptr)
+        return NULL;
+
+    host = (uint8_t *)b->logical_space;
+    if((uint8_t *)host_ptr < host)
+    {
+        femu_err("Pointer %p out of backend logical space range!\n", host_ptr);
+        return NULL;
+    }
+
+    offset = (uint64_t)((uint8_t *)host_ptr - host);
+
+    if(len == 0 ||
+       offset >= (uint64_t)b->size ||
+       len > (uint64_t)b->size - offset)
+    {
+        femu_err("Pointer %p with len %lu out of backend logical space range!\n", host_ptr, len);
+        return NULL;
+    }
+
+    CudaMirrorRange *entry = cuda_mirror_ensure(b, host_ptr, len);
+    if(!entry)
+    {
+        femu_err("Failed to ensure CUDA mirror for host %p len %lu\n", host_ptr, len);
+        return NULL;
+    }
+
+    return entry->device_ptr;
+}
+
 void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len, bool to_device)
 {
     uint8_t *host;
-    uint8_t *mirror;
     uint64_t offset;
     femu_debug("backend_cuda_sync_ptr: b %p, cuda_sync %d, ptr %p, len %lu, to_device %d\n",
              b, b ? b->cuda_sync : -1, ptr, len, to_device);

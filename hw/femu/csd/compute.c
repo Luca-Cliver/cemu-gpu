@@ -783,8 +783,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             return NVME_DNR;
         }
         for (uint32_t i = 0; i < numr; i++) {
-            backend_cuda_sync_ptr(mr_backend[i], mr_addr[i], mr_len[i], true);
-            mr_dev_addr[i] = backend_host_to_device(mr_backend[i], mr_addr[i], mr_len[i]);
+            mr_dev_addr[i] = backend_cuda_ensure_device_ptr(mr_backend[i], mr_addr[i], mr_len[i]);
             if (!mr_dev_addr[i]) {
                 femu_err("program_execute: failed to prepare CUDA devptr for mr %u, host %p len %lld\n",
                          i, mr_addr[i], mr_len[i]);
@@ -931,6 +930,13 @@ static uint64_t run_host_program(ComputeJob *job)
 static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
 {
     Program *program = job->program;
+    uint64_t res = 0;
+
+    if(!job->mr_backend)
+    {
+        femu_err("run_cuda_devptr_shared_lib: CUDA_DEVPTR target missing mr_backend\n");
+        return (uint64_t)-1;
+    }
 
     if (program->type != PROGRAM_TYPE_SHARED_LIB) {
         femu_err("run_cuda_devptr_shared_lib: CUDA_DEVPTR target requires shared library program, type %u\n",
@@ -943,15 +949,31 @@ static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
         return (uint64_t)-1;
     }
 
-    if (job->mr_backend) {
+    if(!program->is_indirect && job->args.numr < 2) {
+        femu_err("run_cuda_devptr_shared_lib: direct CUDA_DEVPTR requires input/output ranges\n");
+        return (uint64_t)-1;
+    }
+
+    if(program->is_indirect) {
         for (uint32_t i = 0; i < job->args.numr; i++) {
             backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
                                   job->args.mr_len[i], true);
         }
+    } else {
+        backend_cuda_sync_ptr(job->mr_backend[0], job->args.mr_addr[0],
+                                  job->args.mr_len[0], true);
     }
 
     femu_debug("running CUDA devptr shared lib...\n");
-    return program->shared_lib.jit_fn(&job->args);
+    res = program->shared_lib.jit_fn(&job->args);
+
+    /* Temporary direct-path D2H until range-level dirty tracking exists. */
+    if(!program->is_indirect) {
+        backend_cuda_sync_ptr(job->mr_backend[1], job->args.mr_addr[1],
+                                  job->args.mr_len[1], false);
+    }
+
+    return res;
 }
 
 static uint64_t run_program_by_target(ComputeJob *job)

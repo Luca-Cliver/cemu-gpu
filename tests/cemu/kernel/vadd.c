@@ -7,7 +7,7 @@ long long vadd(struct cemu_args *args);
 long long vadd_indirect(struct cemu_args *args);
 
 /*
- * For direct usage model, mr[0] is output, mr[1] is input.
+ * For direct usage model, mr[0] is input, mr[1] is output.
  */
 long long vadd(struct cemu_args *args) {
     printf("vadd called with numr %d, cparam1 %lld, cparam2 %lld, data_buffer %p, buffer_len %lld\n", args->numr, args->cparam1, args->cparam2, args->data_buffer, args->buffer_len);
@@ -23,9 +23,9 @@ long long vadd(struct cemu_args *args) {
     assert(numr == 2);
 
     long long size = cparam1;
-    int *a = ((int **)mr_addr)[1];
+    int *a = ((int **)mr_addr)[0];
     int *b = a + 1;
-    int *out = ((int **)mr_addr)[0];
+    int *out = ((int **)mr_addr)[1];
 
     for (int i = 0; i < size; i++) {
         out[i] = a[i*2] + b[i*2];

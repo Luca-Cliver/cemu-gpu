@@ -107,9 +107,9 @@ int main(int argc, char *argv[])
     // Restrict each memory range to actual working-set bytes.
     // size == 0 means "use the whole file range" in kernel/FEMU.
     mrs.off[0] = 0;
-    mrs.size[0] = 4096;
+    mrs.size[0] = 8192;
     mrs.off[1] = 0;
-    mrs.size[1] = 8192;
+    mrs.size[1] = 4096;
     ret = ioctl(ctl_fd, IOCTL_CEMU_CREATE_MRS, &mrs);
     if (ret)
         perror("ioctl CREATE_MRS");
@@ -137,17 +137,17 @@ int main(int argc, char *argv[])
         // copy data from nvm to fdm
         long off_in = 0;
         long off_out = 0;
-        ret = copy_file_range(nvm_in_fd, &off_in, mrs.fd[1], &off_out, 8192, 0);
+        ret = copy_file_range(nvm_in_fd, &off_in, mrs.fd[0], &off_out, 8192, 0);
         assert(ret == 8192);
 
         close(nvm_in_fd);
     } else {
         // directly write data to memory range set
-        ret = pwrite(mrs.fd[1], buf_in, 8192, 0);
+        ret = pwrite(mrs.fd[0], buf_in, 8192, 0);
         assert(ret == 8192);
     }
     // clear output buffer
-    ret = pwrite(mrs.fd[0], buf_out, 4096, 0);
+    ret = pwrite(mrs.fd[1], buf_out, 4096, 0);
     assert(ret == 4096);
 
     // execute program
@@ -224,7 +224,7 @@ int main(int argc, char *argv[])
         }
         long off_in = 0;
         long off_out = 0;
-        ret = copy_file_range(mrs.fd[0], &off_in, nvm_out_fd, &off_out, 4096, 0);
+        ret = copy_file_range(mrs.fd[1], &off_in, nvm_out_fd, &off_out, 4096, 0);
         assert(ret == 4096);
 
         // read output from nvm
@@ -233,7 +233,7 @@ int main(int argc, char *argv[])
         close(nvm_out_fd);
     } else {
         // read directly from fdm
-        ret = pread(mrs.fd[0], buf_out, 4096, 0);
+        ret = pread(mrs.fd[1], buf_out, 4096, 0);
         assert(ret == 4096);
     }
 

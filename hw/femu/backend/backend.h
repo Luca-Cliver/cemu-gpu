@@ -27,6 +27,7 @@ void free_dram_backend(SsdBackend *b);
 
 int backend_cuda_sync_init(SsdBackend *b);
 void backend_cuda_sync_fini(SsdBackend *b);
+void *backend_cuda_ensure_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len);
 void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len,
                            bool to_device);
 

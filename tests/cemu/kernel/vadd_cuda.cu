@@ -68,8 +68,8 @@ static long long vadd_gpu(struct cemu_args *args)
     (void)args->data_buffer;
     (void)args->buffer_len;
 
-    int *host_input = static_cast<int *>(mr_addr[1]);
-    int *host_output = static_cast<int *>(mr_addr[0]);
+    int *host_input = static_cast<int *>(mr_addr[0]);
+    int *host_output = static_cast<int *>(mr_addr[1]);
     size_t input_elems = static_cast<size_t>(size) * 2;
     size_t input_bytes = input_elems * sizeof(int);
     size_t output_bytes = static_cast<size_t>(size) * sizeof(int);
