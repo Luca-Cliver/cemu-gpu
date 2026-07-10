@@ -69,10 +69,10 @@ extern "C" long long vadd(struct cemu_args *args)
     cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
     if (host_output) {
-        cuda_check(cudaMemcpy(host_output, device_output,
-                              static_cast<size_t>(size) * sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "cudaMemcpy D2H");
+        // cuda_check(cudaMemcpy(host_output, device_output,
+        //                       static_cast<size_t>(size) * sizeof(int),
+        //                       cudaMemcpyDeviceToHost),
+        //            "cudaMemcpy D2H");
     }
 
     return size;

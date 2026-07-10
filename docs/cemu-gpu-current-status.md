@@ -129,6 +129,21 @@ tests/cemu 用户态工具
 
 这一节重点说明：数据如何从 CSD 的 MRS/FDM range 进入 GPU，以及 CUDA shared library 如何使用这些 GPU pointer。
 
+整体链路可以概括为：
+
+```text
+用户提交 CSF/MRS
+  -> CEMU 解析 MRS，得到 FDM/backend host pointer: mr_addr[]
+  -> CUDA_DEVPTR target 为每个 range 准备 GPU mirror: mr_dev_addr[]
+  -> 执行前按语义 H2D，同步 input range 到 GPU
+  -> CUDA shared library 使用 mr_dev_addr[] launch GPU kernel
+  -> GPU kernel 写 device output
+  -> 执行后 D2H，把 output range 回写到 FDM/backend host memory
+  -> 后续 pread 或 FDM -> NVM copy 读取结果
+```
+
+也就是说，用户侧仍然只感知 CSD 的 CSF/MRS 接口；GPU pointer 是 CEMU 在设备模型内部根据 MRS 自动形成的，CUDA kernel 通过 `args->mr_dev_addr[]` 使用这些 pointer。
+
 ### 4.1 用户提交的是什么
 
 用户态程序并不直接把 GPU pointer 传给 CEMU。用户提交的是：

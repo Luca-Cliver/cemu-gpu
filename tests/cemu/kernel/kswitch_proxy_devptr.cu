@@ -144,10 +144,10 @@ extern "C" long long kswitch_proxy(struct cemu_args *args)
     cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
     if (host_output) {
-        cuda_check(cudaMemcpy(host_output, device_output,
-                              static_cast<size_t>(n) * sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost),
-                   "cudaMemcpy D2H");
+        // cuda_check(cudaMemcpy(host_output, device_output,
+        //                       static_cast<size_t>(n) * sizeof(uint32_t),
+        //                       cudaMemcpyDeviceToHost),
+        //            "cudaMemcpy D2H");
         // std::printf("kswitch_proxy(devptr): checksum=0x%016llx\n",
         //             static_cast<unsigned long long>(checksum_u32(host_output, n)));
 
