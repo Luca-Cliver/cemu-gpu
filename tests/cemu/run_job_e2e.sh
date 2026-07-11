@@ -202,7 +202,7 @@ BEGIN {
     }
     if (realtime != "" && runtime != "") {
         printf "%d,%s,%.3f,%.3f\n",
-               index++, program, realtime / 1000000.0, runtime / 1000000.0;
+               compute_idx++, program, realtime / 1000000.0, runtime / 1000000.0;
     }
 }
 ' "${LOG_FILE}" > "${COMPUTE_CSV_FILE}"
