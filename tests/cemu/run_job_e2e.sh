@@ -7,6 +7,8 @@ GUEST_DIR='$HOME/CEMU/tests/cemu'
 MODE="native"
 LOG_FILE=""
 CSV_FILE=""
+STAGE_CSV_FILE=""
+STAGE_SUMMARY_FILE=""
 SUMMARY_FILE=""
 WARMUP_ITERS="1"
 
@@ -24,6 +26,8 @@ Options:
   --guest-dir DIR       Guest benchmark dir, default: $HOME/CEMU/tests/cemu.
   --log FILE            Timestamped raw log output.
   --csv FILE            Per-job E2E CSV output.
+  --stage-csv FILE      Per-stage latency CSV output.
+  --stage-summary FILE  Per-stage summary CSV output.
   --summary FILE        Summary output.
   --warmup N            Exclude iter < N from summary, default: 1.
   -h, --help            Show this help.
@@ -76,6 +80,14 @@ while [[ $# -gt 0 ]]; do
         CSV_FILE="$2"
         shift 2
         ;;
+    --stage-csv)
+        STAGE_CSV_FILE="$2"
+        shift 2
+        ;;
+    --stage-summary)
+        STAGE_SUMMARY_FILE="$2"
+        shift 2
+        ;;
     --summary)
         SUMMARY_FILE="$2"
         shift 2
@@ -119,6 +131,12 @@ fi
 if [[ -z "$CSV_FILE" ]]; then
     CSV_FILE="${LOG_FILE%.log}.csv"
 fi
+if [[ -z "$STAGE_CSV_FILE" ]]; then
+    STAGE_CSV_FILE="${LOG_FILE%.log}_stages.csv"
+fi
+if [[ -z "$STAGE_SUMMARY_FILE" ]]; then
+    STAGE_SUMMARY_FILE="${LOG_FILE%.log}_stages_summary.csv"
+fi
 if [[ -z "$SUMMARY_FILE" ]]; then
     SUMMARY_FILE="${LOG_FILE%.log}_summary.txt"
 fi
@@ -131,6 +149,8 @@ echo "Guest dir:  ${GUEST_DIR}"
 echo "Mode:       ${MODE}"
 echo "Log:        ${LOG_FILE}"
 echo "CSV:        ${CSV_FILE}"
+echo "Stage CSV:  ${STAGE_CSV_FILE}"
+echo "Stage Sum:  ${STAGE_SUMMARY_FILE}"
 echo "Summary:    ${SUMMARY_FILE}"
 echo "Command:    ${BENCH_CMD}"
 
@@ -157,6 +177,52 @@ BEGIN {
 }
 ' "${LOG_FILE}" > "${CSV_FILE}"
 
+awk '
+BEGIN {
+    print "job,iter,stage,latency_ms";
+}
+/JOB_STAGE_START/ {
+    key = $3 " " $4 " " $5;
+    start[key] = $1;
+}
+/JOB_STAGE_END/ {
+    key = $3 " " $4 " " $5;
+    if (key in start) {
+        split($3, job, "=");
+        split($4, iter, "=");
+        split($5, stage, "=");
+        printf "%s,%s,%s,%.3f\n",
+               job[2], iter[2], stage[2], ($1 - start[key]) / 1000000.0;
+    }
+}
+' "${LOG_FILE}" > "${STAGE_CSV_FILE}"
+
+awk -F, -v warmup="${WARMUP_ITERS}" '
+NR == 1 {
+    next;
+}
+$2 >= warmup {
+    stage = $3;
+    v = $4;
+    sum[stage] += v;
+    count[stage]++;
+    if (!(stage in min) || v < min[stage]) {
+        min[stage] = v;
+    }
+    if (!(stage in max) || v > max[stage]) {
+        max[stage] = v;
+    }
+}
+END {
+    print "stage,n,avg_ms,min_ms,max_ms,warmup_iters";
+    for (stage in count) {
+        printf "%s,%d,%.3f,%.3f,%.3f,%s\n",
+               stage, count[stage], sum[stage] / count[stage],
+               min[stage], max[stage], warmup;
+    }
+}
+' "${STAGE_CSV_FILE}" > "${STAGE_SUMMARY_FILE}"
+
 awk -F, -v warmup="${WARMUP_ITERS}" '
 NR == 1 {
     next;
@@ -181,3 +247,5 @@ END {
     }
 }
 ' "${CSV_FILE}" | tee "${SUMMARY_FILE}"
+
+cat "${STAGE_SUMMARY_FILE}"

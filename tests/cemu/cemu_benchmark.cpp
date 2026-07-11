@@ -70,6 +70,20 @@ static void log_job_e2e_marker(const char *marker, uint64_t job_id,
               << std::endl;
 }
 
+static void log_job_stage_marker(const char *marker, const char *stage,
+                                 uint64_t job_id, uint64_t iter_id,
+                                 size_t nvm_off, size_t size)
+{
+    std::lock_guard<std::mutex> lock(e2e_log_mutex);
+    std::cout << marker
+              << " job=" << job_id
+              << " iter=" << iter_id
+              << " stage=" << stage
+              << " off=" << nvm_off
+              << " size=" << size
+              << std::endl;
+}
+
 static void split(const std::string &s, char delim, std::vector<std::string> &result) {
     std::stringstream ss(s);
     std::string item;
@@ -311,19 +325,38 @@ struct Job {
 
     bool finished() { return stage == 2 && stage_finished; }
 
+    const char *stage_name() const {
+        switch (stage) {
+        case 0:
+            return "input";
+        case 1:
+            return "compute";
+        case 2:
+            return "output";
+        default:
+            return "unknown";
+        }
+    }
+
     void setup_io(io_uring_sqe *sqe) {
         switch (stage) {
         case 0:
             log_job_e2e_marker("JOB_E2E_START", job_id, iter_id, nvm_off, size);
+            log_job_stage_marker("JOB_STAGE_START", "input", job_id, iter_id,
+                                 nvm_off, size);
             io_uring_prep_copy_file_range(sqe, nvm_fd, mr->fdm_fd[0], size, nvm_off, 0);
             // io_uring_prep_read(sqe, mr->fdm_fd[0], data_buf, size, 0);
             // io_uring_prep_read(sqe, nvm_fd, data_buf, size, 0);
             // io_uring_prep_compute(sqe, task->ng3_fd, cparam1, cparam2, pind, rsid, kernel_time);
             break;
         case 1:
+            log_job_stage_marker("JOB_STAGE_START", "compute", job_id, iter_id,
+                                 nvm_off, size);
             io_uring_prep_compute(sqe, task->ng3_fd, cparam1, cparam2, pind, rsid, kernel_time, group, sched_prio);
             break;
         case 2:
+            log_job_stage_marker("JOB_STAGE_START", "output", job_id, iter_id,
+                                 nvm_off, output_size);
             if (output_mode) {
                 // std::cout << "copy from nvm to fdm" << std::endl;
                 io_uring_prep_copy_file_range(sqe, mr->fdm_fd[1], nvm_out_fd, output_size, 0, nvm_out_off);
@@ -416,6 +449,9 @@ static void *thread_main(void *arg) {
         // std::cout << "cqe->res: " << cqe->res << std::endl;
         job->stage_finished = true;
         job->end = end;
+        log_job_stage_marker("JOB_STAGE_END", job->stage_name(),
+                             job->job_id, job->iter_id, job->nvm_off,
+                             job->stage == 2 ? output_size : job->size);
         if (print_time)
             job->print_time(cqe->res);
         if (!job->finished()) {
