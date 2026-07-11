@@ -147,6 +147,15 @@ fi
 if [[ -z "$SUMMARY_FILE" ]]; then
     SUMMARY_FILE="${LOG_FILE%.log}_summary.txt"
 fi
+if [[ -n "$COMPUTE_LOG_FILE" ]]; then
+    LOG_ABS=$(realpath -m "${LOG_FILE}")
+    COMPUTE_LOG_ABS=$(realpath -m "${COMPUTE_LOG_FILE}")
+    if [[ "$LOG_ABS" == "$COMPUTE_LOG_ABS" ]]; then
+        echo "ERROR: --log and --compute-log must be different files." >&2
+        echo "       --log is overwritten by this script; --compute-log should be the QEMU stdout log." >&2
+        exit 1
+    fi
+fi
 
 BENCH_CMD=$(quote_args "${BENCH_ARGS[@]}")
 REMOTE_CMD="cd ${GUEST_DIR} && stdbuf -oL ${BENCH_CMD}"
