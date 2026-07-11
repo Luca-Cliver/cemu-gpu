@@ -9,6 +9,7 @@ LOG_FILE=""
 CSV_FILE=""
 COMPUTE_CSV_FILE=""
 COMPUTE_SUMMARY_FILE=""
+COMPUTE_LOG_FILE=""
 SUMMARY_FILE=""
 WARMUP_ITERS="1"
 
@@ -29,6 +30,7 @@ Options:
   --compute-csv FILE    CEMU backend compute realtime CSV output.
   --compute-summary FILE
                         CEMU backend compute realtime summary output.
+  --compute-log FILE    Host QEMU stdout log containing CEMU_COMPUTE lines.
   --summary FILE        Summary output.
   --warmup N            Exclude iter < N from summary, default: 1.
   -h, --help            Show this help.
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
         COMPUTE_SUMMARY_FILE="$2"
         shift 2
         ;;
+    --compute-log)
+        COMPUTE_LOG_FILE="$2"
+        shift 2
+        ;;
     --summary)
         SUMMARY_FILE="$2"
         shift 2
@@ -144,6 +150,14 @@ fi
 
 BENCH_CMD=$(quote_args "${BENCH_ARGS[@]}")
 REMOTE_CMD="cd ${GUEST_DIR} && stdbuf -oL ${BENCH_CMD}"
+COMPUTE_SOURCE_FILE="${LOG_FILE}"
+COMPUTE_SKIP_LINES=0
+if [[ -n "$COMPUTE_LOG_FILE" ]]; then
+    COMPUTE_SOURCE_FILE="${COMPUTE_LOG_FILE}"
+    if [[ -f "$COMPUTE_LOG_FILE" ]]; then
+        COMPUTE_SKIP_LINES=$(wc -l < "${COMPUTE_LOG_FILE}")
+    fi
+fi
 
 echo "SSH target: ${SSH_TARGET}:${SSH_PORT}"
 echo "Guest dir:  ${GUEST_DIR}"
@@ -152,6 +166,11 @@ echo "Log:        ${LOG_FILE}"
 echo "CSV:        ${CSV_FILE}"
 echo "Compute CSV:${COMPUTE_CSV_FILE}"
 echo "Compute Sum:${COMPUTE_SUMMARY_FILE}"
+if [[ -n "$COMPUTE_LOG_FILE" ]]; then
+    echo "Compute Log:${COMPUTE_LOG_FILE} (skip first ${COMPUTE_SKIP_LINES} lines)"
+else
+    echo "Compute Log:${LOG_FILE} (SSH output fallback)"
+fi
 echo "Summary:    ${SUMMARY_FILE}"
 echo "Command:    ${BENCH_CMD}"
 
@@ -159,6 +178,15 @@ ssh "${SSH_TARGET}" -p "${SSH_PORT}" "${REMOTE_CMD}" 2>&1 \
 | while IFS= read -r line; do
     printf "%s %s\n" "$(date +%s%N)" "$line"
 done | tee "${LOG_FILE}"
+
+if [[ -n "$COMPUTE_LOG_FILE" ]]; then
+    sleep 0.2
+    if [[ ! -f "$COMPUTE_LOG_FILE" ]]; then
+        echo "WARN: compute log not found: ${COMPUTE_LOG_FILE}" >&2
+        COMPUTE_SOURCE_FILE="/dev/null"
+        COMPUTE_SKIP_LINES=0
+    fi
+fi
 
 awk '
 BEGIN {
@@ -178,9 +206,12 @@ BEGIN {
 }
 ' "${LOG_FILE}" > "${CSV_FILE}"
 
-awk '
+awk -v skip_lines="${COMPUTE_SKIP_LINES}" '
 BEGIN {
     print "index,program,realtime_ms,runtime_ms";
+}
+NR <= skip_lines {
+    next;
 }
 /CEMU_COMPUTE:/ {
     program = "";
@@ -205,7 +236,7 @@ BEGIN {
                compute_idx++, program, realtime / 1000000.0, runtime / 1000000.0;
     }
 }
-' "${LOG_FILE}" > "${COMPUTE_CSV_FILE}"
+' "${COMPUTE_SOURCE_FILE}" > "${COMPUTE_CSV_FILE}"
 
 awk -F, -v warmup="${WARMUP_ITERS}" '
 BEGIN {
