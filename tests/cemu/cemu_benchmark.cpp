@@ -8,6 +8,7 @@
 #include <deque>
 #include <vector>
 #include <thread>
+#include <mutex>
 #include <fstream>
 #include <sstream>
 #include <stdio.h>
@@ -55,6 +56,19 @@ bool use_cuda_devptr = false;
 std::vector<int> kernel_times;
 std::vector<int> input_times;
 std::vector<int> output_times;
+static std::mutex e2e_log_mutex;
+
+static void log_job_e2e_marker(const char *marker, uint64_t job_id,
+                               uint64_t iter_id, size_t nvm_off, size_t size)
+{
+    std::lock_guard<std::mutex> lock(e2e_log_mutex);
+    std::cout << marker
+              << " job=" << job_id
+              << " iter=" << iter_id
+              << " off=" << nvm_off
+              << " size=" << size
+              << std::endl;
+}
 
 static void split(const std::string &s, char delim, std::vector<std::string> &result) {
     std::stringstream ss(s);
@@ -247,6 +261,8 @@ struct Job {
     size_t nvm_out_off;
     size_t size;
     size_t finished_size;
+    uint64_t job_id;
+    uint64_t iter_id;
 
     MemoryRangeSet *mr;
     void *data_buf;
@@ -279,10 +295,13 @@ struct Job {
         rsid = mr->rsid;
         data_buf = aligned_alloc(4096, size);
         finished_size = 0;
+        job_id = 0;
+        iter_id = 0;
     }
 
     void reset(size_t off, size_t size, size_t out_off = 0) {
         finished_size += this->size;
+        iter_id++;
         this->size = size;
         nvm_off = off;
         nvm_out_off = out_off;
@@ -295,6 +314,7 @@ struct Job {
     void setup_io(io_uring_sqe *sqe) {
         switch (stage) {
         case 0:
+            log_job_e2e_marker("JOB_E2E_START", job_id, iter_id, nvm_off, size);
             io_uring_prep_copy_file_range(sqe, nvm_fd, mr->fdm_fd[0], size, nvm_off, 0);
             // io_uring_prep_read(sqe, mr->fdm_fd[0], data_buf, size, 0);
             // io_uring_prep_read(sqe, nvm_fd, data_buf, size, 0);
@@ -401,12 +421,16 @@ static void *thread_main(void *arg) {
         if (!job->finished()) {
             job->stage++;
             pending_jobs.push_back(job);
-        } else if (runtime || job->nvm_off + job->size * parallel_chunks < file_size) {
-            size_t off = (job->nvm_off + job->size * parallel_chunks) % file_size;
-            job->reset(off, job->size, off);
-            pending_jobs.push_back(job);
         } else {
-            break;
+            log_job_e2e_marker("JOB_E2E_END", job->job_id, job->iter_id,
+                               job->nvm_off, job->size);
+            if (runtime || job->nvm_off + job->size * parallel_chunks < file_size) {
+                size_t off = (job->nvm_off + job->size * parallel_chunks) % file_size;
+                job->reset(off, job->size, off);
+                pending_jobs.push_back(job);
+            } else {
+                break;
+            }
         }
         io_uring_cqe_seen(&ring, cqe);
     }
@@ -590,6 +614,7 @@ int main(int argc, char **argv) {
         for (unsigned j = parallel_chunks*i; j < parallel_chunks*(i+1); j++) {
             Job *job = &jobs[j];
             job->init(task, task->cur_off, task->chunk_size, task->mrs[j], task->cur_off);
+            job->job_id = j;
             task->cur_off += task->chunk_size;
             job->end_time = end_time;
         }
