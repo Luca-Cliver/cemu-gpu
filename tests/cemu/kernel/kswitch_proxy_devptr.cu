@@ -116,18 +116,23 @@ extern "C" long long kswitch_proxy(struct cemu_args *args)
 {
     log_cuda_device_once();
 
-    if (!args || !args->mr_dev_addr || !args->mr_dev_addr[0] || !args->mr_dev_addr[1]) {
-        std::fprintf(stderr, "kswitch_proxy(devptr): missing device pointers\n");
+    if (!args || !args->mr_addr || !args->mr_addr[0] ||
+        !args->mr_dev_addr || !args->mr_dev_addr[0] || !args->mr_dev_addr[1]) {
+        std::fprintf(stderr, "kswitch_proxy(devptr): missing host or device pointers\n");
         return -1;
     }
 
     const int n = static_cast<int>(args->cparam1);
     const int rounds = (args->cparam2 > 0) ? static_cast<int>(args->cparam2) : 24;
 
-    const uint32_t *device_input = static_cast<const uint32_t *>(args->mr_dev_addr[0]);
+    uint32_t *device_input = static_cast<uint32_t *>(args->mr_dev_addr[0]);
     uint32_t *device_output = static_cast<uint32_t *>(args->mr_dev_addr[1]);
     uint32_t *host_output = static_cast<uint32_t *>(args->mr_addr[1]);
     const uint32_t *host_input = static_cast<const uint32_t *>(args->mr_addr[0]);
+    const size_t input_bytes = static_cast<size_t>(n) * sizeof(uint32_t);
+
+    cuda_check(cudaMemcpy(device_input, host_input, input_bytes, cudaMemcpyHostToDevice),
+               "cudaMemcpy FDM to device_input");
 
     // std::printf("kswitch_proxy(devptr): host_input_checksum=0x%016llx\n",
     //             static_cast<unsigned long long>(checksum_u32(host_input, n)));

@@ -1,4 +1,6 @@
 BUILD_DIR := build
+INSTATTENTION_DIR := instattention
+INSTATTENTION_BUILD_DIR := $(INSTATTENTION_DIR)/build-guest
 TARGETS = \
 	$(BUILD_DIR)/libcemu.a \
 	$(BUILD_DIR)/cemu_benchmark \
@@ -14,12 +16,26 @@ CXX = g++
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel
+.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test
 
-all: $(BUILD_DIR) $(TARGETS)
+all: $(BUILD_DIR) $(TARGETS) instattention
 
 kernel:
 	$(MAKE) -C kernel all
+
+instattention:
+	cmake -S $(INSTATTENTION_DIR) -B $(INSTATTENTION_BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo
+	cmake --build $(INSTATTENTION_BUILD_DIR) --parallel
+
+instattention-client-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py
+
+instattention-device-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
+
+instattention-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py
+	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -54,4 +70,4 @@ $(BUILD_DIR)/test_p2p: test_p2p.cpp $(BUILD_DIR)/libcemu.a
 	$(CXX) $(CXXFLAGS) -o $@ $^ -luring
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(INSTATTENTION_BUILD_DIR)
