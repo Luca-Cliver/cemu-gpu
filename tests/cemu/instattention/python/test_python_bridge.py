@@ -19,12 +19,20 @@ def parse_args():
     parser.add_argument("--namespace", default="/dev/ng0n3")
     parser.add_argument("--input", default="/mnt/fdm0/inst_py_input")
     parser.add_argument("--output", default="/mnt/fdm0/inst_py_output")
-    parser.add_argument("--program", default="./build/vadd.so")
+    parser.add_argument("--program")
+    parser.add_argument("--cuda", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    program_path = args.program or (
+        "./build/vadd_cuda_devptr.so" if args.cuda else "./build/vadd.so"
+    )
+    program_target = (
+        ProgramTarget.CUDA_DEVICE_POINTER if args.cuda else ProgramTarget.HOST
+    )
+    program_name = "python_vadd_cuda" if args.cuda else "python_vadd"
     element_count = 1024
     input_data = np.empty(element_count * 2, dtype=np.int32)
     indices = np.arange(element_count, dtype=np.int32)
@@ -34,10 +42,10 @@ def main():
 
     with CemuClient(args.control, args.namespace) as client:
         client.load_program(
-            "python_vadd",
-            args.program,
+            program_name,
+            program_path,
             "vadd",
-            ProgramTarget.HOST,
+            program_target,
             replace_existing=True,
         )
         client.activate_program()
@@ -52,7 +60,11 @@ def main():
 
     output = np.asarray(output_bytes).view(np.int32)
     np.testing.assert_array_equal(output, indices * 3)
-    print(f"Python-to-CEMU bridge passed for {element_count} vadd elements")
+    mode = "CUDA device-pointer" if args.cuda else "CPU host"
+    print(
+        f"Python-to-CEMU bridge passed for {element_count} vadd elements "
+        f"using {mode}"
+    )
 
 
 if __name__ == "__main__":

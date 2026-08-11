@@ -20,12 +20,17 @@ def parse_args():
     parser.add_argument("--namespace", default="/dev/ng0n3")
     parser.add_argument("--input", default="/mnt/fdm0/device_input")
     parser.add_argument("--output", default="/mnt/fdm0/device_output")
-    parser.add_argument("--program", default="./build/vadd.so")
+    parser.add_argument("--program")
+    parser.add_argument("--cuda", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    program_path = args.program or (
+        "./build/vadd_cuda_devptr.so" if args.cuda else "./build/vadd.so"
+    )
+    program_name = "device_vadd_cuda" if args.cuda else "device_vadd"
     element_count = 1024
     indices = np.arange(element_count, dtype=np.int32)
 
@@ -35,8 +40,8 @@ def main():
     output_data = np.zeros(element_count, dtype=np.int32)
 
     device = CemuDevice(
-        program_name="device_vadd",
-        program_path=args.program,
+        program_name=program_name,
+        program_path=program_path,
         function_name="vadd",
         ranges=[
             RangeSpec(args.input, input_data.nbytes),
@@ -44,6 +49,7 @@ def main():
         ],
         control_path=args.control,
         namespace_path=args.namespace,
+        cuda_target=args.cuda,
         replace_existing=True,
     )
 
@@ -60,7 +66,10 @@ def main():
 
     assert not device.is_open
     np.testing.assert_array_equal(output, indices * 3)
-    print(f"CemuDevice vadd test passed for {element_count} elements")
+    mode = "CUDA device-pointer" if args.cuda else "CPU host"
+    print(
+        f"CemuDevice vadd test passed for {element_count} elements using {mode}"
+    )
 
 
 if __name__ == "__main__":

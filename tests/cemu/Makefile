@@ -16,7 +16,7 @@ CXX = g++
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test
+.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test
 
 all: $(BUILD_DIR) $(TARGETS) instattention
 
@@ -33,9 +33,21 @@ instattention-client-test: instattention
 instattention-device-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
 
+instattention-layout-test:
+	python3 $(INSTATTENTION_DIR)/python/test_kv_layout.py
+
+instattention-kv-store-test:
+	CEMU_KV_TEST_DIR="$(NVM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_store.py
+
 instattention-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_kv_layout.py
+	CEMU_KV_TEST_DIR="$(NVM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_store.py
 	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
+
+instattention-gpu-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py --cuda
+	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py --cuda
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
