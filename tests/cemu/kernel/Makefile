@@ -3,6 +3,8 @@ TARGETS = \
 	$(BUILD_DIR)/vadd.so \
 	$(BUILD_DIR)/vadd_cuda.so \
 	$(BUILD_DIR)/vadd_cuda_devptr.so \
+	$(BUILD_DIR)/dense_attention.so \
+	$(BUILD_DIR)/dense_attention_devptr.so \
 	$(BUILD_DIR)/lz4.so \
 	$(BUILD_DIR)/grep.so \
 	$(BUILD_DIR)/sql.so \
@@ -30,6 +32,12 @@ $(BUILD_DIR)/vadd_cuda.so: vadd_cuda.cu
 	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 
 $(BUILD_DIR)/vadd_cuda_devptr.so: vadd_cuda_devptr.cu
+	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
+
+$(BUILD_DIR)/dense_attention.so: dense_attention.cc attention_abi.h cemu_def.h
+	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $<
+
+$(BUILD_DIR)/dense_attention_devptr.so: dense_attention_devptr.cu attention_abi.h cemu_def.h
 	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 
 $(BUILD_DIR)/lz4.so: lz4.cc

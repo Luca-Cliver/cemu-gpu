@@ -16,7 +16,7 @@ CXX = g++
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test
+.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-attention-test instattention-attention-gpu-test
 
 all: $(BUILD_DIR) $(TARGETS) instattention
 
@@ -39,9 +39,23 @@ instattention-layout-test:
 instattention-kv-store-test:
 	CEMU_KV_TEST_DIR="$(NVM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_store.py
 
+instattention-kv-staging-test:
+	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_staging.py
+
+instattention-prefill-test:
+	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_prefill.py
+
+instattention-attention-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_attention.py --nvm-dir "$(NVM_TEST_DIR)" --fdm-dir "$(FDM_TEST_DIR)"
+
+instattention-attention-gpu-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_attention.py --cuda --nvm-dir "$(NVM_TEST_DIR)" --fdm-dir "$(FDM_TEST_DIR)"
+
 instattention-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_kv_layout.py
 	CEMU_KV_TEST_DIR="$(NVM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_store.py
+	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_staging.py
+	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_prefill.py
 	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
 

@@ -960,8 +960,11 @@ static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
                                   job->args.mr_len[i], true);
         }
     } else {
-        backend_cuda_sync_ptr(job->mr_backend[0], job->args.mr_addr[0],
-                                  job->args.mr_len[0], true);
+        /* Direct CUDA ABI: mr[0..numr-2] are inputs, mr[numr-1] is output. */
+        for (uint32_t i = 0; i + 1 < job->args.numr; i++) {
+            backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
+                                  job->args.mr_len[i], true);
+        }
     }
 
     femu_debug("running CUDA devptr shared lib...\n");
@@ -969,8 +972,16 @@ static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
 
     /* Temporary direct-path D2H until range-level dirty tracking exists. */
     if(!program->is_indirect) {
-        backend_cuda_sync_ptr(job->mr_backend[1], job->args.mr_addr[1],
-                                  job->args.mr_len[1], false);
+        uint32_t output_index = job->args.numr - 1;
+        backend_cuda_sync_ptr(job->mr_backend[output_index],
+                              job->args.mr_addr[output_index],
+                              job->args.mr_len[output_index], false);
+        /* Attention uses mr[3] as a persistent read/write state range. */
+        if (job->args.numr == 5) {
+            backend_cuda_sync_ptr(job->mr_backend[3],
+                                  job->args.mr_addr[3],
+                                  job->args.mr_len[3], false);
+        }
     }
 
     return res;

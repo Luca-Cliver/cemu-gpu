@@ -47,6 +47,11 @@ class KvCacheStoreTest(unittest.TestCase):
         self.assertFalse(store.is_open)
         with store:
             self.assertTrue(store.is_open)
+            print(
+                "\n[kv-store] created "
+                f"K={self.k_path}, V={self.v_path}, "
+                f"file_size={self.layout.file_size} bytes"
+            )
             self.assertEqual(self.k_path.stat().st_size, self.layout.file_size)
             self.assertEqual(self.v_path.stat().st_size, self.layout.file_size)
         self.assertFalse(store.is_open)
@@ -59,10 +64,19 @@ class KvCacheStoreTest(unittest.TestCase):
             store.write_token(1, 3, key, value)
             stored_key, stored_value = store.read_token(1, 3)
 
+        offset = self.layout.token_offset(1, 3)
+        print(
+            "\n[kv-store] single token: "
+            f"layer=1, token=3, offset={offset}, shape={key.shape}"
+        )
+        print(f"  K write[:8]={key.reshape(-1)[:8].tolist()}")
+        print(f"  K read [:8]={stored_key.reshape(-1)[:8].tolist()}")
+        print(f"  V write[:8]={value.reshape(-1)[:8].tolist()}")
+        print(f"  V read [:8]={stored_value.reshape(-1)[:8].tolist()}")
+
         np.testing.assert_array_equal(stored_key, key)
         np.testing.assert_array_equal(stored_value, value)
 
-        offset = self.layout.token_offset(1, 3)
         with self.k_path.open("rb") as cache_file:
             cache_file.seek(offset)
             raw_token = cache_file.read(self.layout.token_stride)
@@ -79,6 +93,16 @@ class KvCacheStoreTest(unittest.TestCase):
         with self._new_store() as store:
             store.write_tokens(0, 1, keys, values)
             stored_keys, stored_values = store.read_tokens(0, 1, 3)
+
+        print(
+            "\n[kv-store] token batch: "
+            f"layer=0, tokens=[1, 4), "
+            f"offset={self.layout.token_offset(0, 1)}, shape={keys.shape}"
+        )
+        print(f"  first K write[:8]={keys[0].reshape(-1)[:8].tolist()}")
+        print(f"  first K read [:8]={stored_keys[0].reshape(-1)[:8].tolist()}")
+        print(f"  last V write[:8]={values[-1].reshape(-1)[:8].tolist()}")
+        print(f"  last V read [:8]={stored_values[-1].reshape(-1)[:8].tolist()}")
 
         np.testing.assert_array_equal(stored_keys, keys)
         np.testing.assert_array_equal(stored_values, values)

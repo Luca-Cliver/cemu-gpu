@@ -82,6 +82,10 @@ class CemuDevice:
     def memory_range_set_id(self) -> int:
         return self._require_client().memory_range_set_id
 
+    @property
+    def memory_range_count(self) -> int:
+        return self._require_client().memory_range_count
+
     def open(self):
         if self._client is not None:
             return self
