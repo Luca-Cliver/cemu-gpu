@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -91,14 +91,18 @@ class CemuAttentionDevice:
         runtime_scale_tenths: int = 0,
         replace_program: bool = False,
         replace_staging_files: bool = False,
+        logger: Optional[Callable[[str], None]] = None,
     ):
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
         if not isinstance(buffers, AttentionBufferConfig):
             raise TypeError("buffers must be an AttentionBufferConfig")
+        if logger is not None and not callable(logger):
+            raise TypeError("logger must be callable")
 
         self.layout = layout
         self.buffers = buffers
+        self.logger = logger
         self.ranges = buffers.range_specs()
         self.staging = KvStagingManager(
             layout=layout,
@@ -150,6 +154,10 @@ class CemuAttentionDevice:
         if self._device is not None or self.staging.is_open:
             self.close()
 
+        self._log(
+            f"open program={self._device_config['program_name']}, "
+            f"cuda_target={self._device_config['cuda_target']}"
+        )
         self.staging.open()
         device = CemuDevice(**self._device_config)
         try:
@@ -159,11 +167,20 @@ class CemuAttentionDevice:
             self.staging.close()
             raise
         self._device = device
+        self._log(
+            f"ready program_id={device.program_id}, "
+            f"mrs_id={device.memory_range_set_id}, ranges={device.memory_range_count}"
+        )
         return self
 
     def stage_chunk(self, chunk: KvChunk) -> int:
         self._require_device()
-        return self.staging.stage_chunk(chunk)
+        copied = self.staging.stage_chunk(chunk)
+        self._log(
+            f"stage layer={chunk.layer}, tokens=[{chunk.start_token}, "
+            f"{chunk.end_token}), nvm_offset={chunk.nvm_offset}, bytes={copied}"
+        )
+        return copied
 
     def run_chunk(
         self,
@@ -191,6 +208,10 @@ class CemuAttentionDevice:
         if write_query:
             device.write_tensor(AttentionRange.QUERY, query_array)
         device.execute(metadata=metadata.pack())
+        self._log(
+            f"execute chunk_tokens={chunk.token_count}, "
+            f"reset={metadata.reset_state}, finalize={metadata.finalize}"
+        )
         if not read_output:
             return None
         return device.read_tensor(
@@ -222,6 +243,10 @@ class CemuAttentionDevice:
         )
         if not chunks:
             raise ValueError("valid_tokens must produce at least one KV chunk")
+        self._log(
+            f"decode layer={layer}, valid_tokens={valid_tokens}, chunks={len(chunks)}, "
+            f"query={query_array.shape}"
+        )
 
         for chunk_index, chunk in enumerate(chunks):
             metadata = DenseAttentionMetadata.from_layout(
@@ -239,17 +264,20 @@ class CemuAttentionDevice:
                 read_output=False,
             )
 
-        return self.device.read_tensor(
+        output = self.device.read_tensor(
             AttentionRange.OUTPUT,
             metadata.output_shape,
             np.float32,
         )
+        self._log(f"decode complete output={output.shape}")
+        return output
 
     def close(self) -> None:
         if self._device is not None:
             self._device.close()
             self._device = None
         self.staging.close()
+        self._log("closed")
 
     def __enter__(self):
         return self.open()
@@ -261,3 +289,7 @@ class CemuAttentionDevice:
         if self._device is None:
             raise RuntimeError("CEMU attention device is not open")
         return self._device
+
+    def _log(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger(f"[cemu-attention] {message}")

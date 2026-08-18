@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -17,14 +17,18 @@ class FlexGenAttentionBackend:
         v_cache_path: Any = "/mnt/nvme0/v_cache",
         attention_device: Optional[Any] = None,
         replace_existing: bool = False,
+        logger: Optional[Callable[[str], None]] = None,
     ):
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
+        if logger is not None and not callable(logger):
+            raise TypeError("logger must be callable")
 
         self.layout = layout
         self.k_cache_path = Path(k_cache_path)
         self.v_cache_path = Path(v_cache_path)
         self.attention_device = attention_device
+        self.logger = logger
         self.store = KvCacheStore(
             layout=layout,
             k_path=self.k_cache_path,
@@ -38,6 +42,10 @@ class FlexGenAttentionBackend:
 
     def open(self):
         self.store.open()
+        self._log(
+            f"opened K={self.k_cache_path}, V={self.v_cache_path}, "
+            f"file_size={self.layout.file_size}"
+        )
         return self
 
     def write_prefill(self, layer: int, keys: Any, values: Any) -> int:
@@ -49,6 +57,10 @@ class FlexGenAttentionBackend:
             raise ValueError("keys and values must contain the same number of tokens")
 
         self.store.write_tokens(layer, 0, key_array, value_array)
+        self._log(
+            f"write layer={layer}, tokens={key_array.shape[0]}, "
+            f"shape={key_array.shape}, bytes={key_array.nbytes + value_array.nbytes}"
+        )
         return key_array.shape[0]
 
     def append_decode(
@@ -66,12 +78,17 @@ class FlexGenAttentionBackend:
             raise ValueError("Decode key and value must each contain exactly one token")
 
         self.store.write_token(layer, token, key_array[0], value_array[0])
+        self._log(f"append layer={layer}, token={token}")
 
     def decode(self, layer: int, query: Any, valid_tokens: int) -> np.ndarray:
         """Run CEMU Decode Attention with an unscaled FlexGen query tensor."""
         if self.attention_device is None:
             raise RuntimeError("no CEMU attention device is configured")
         query_array = self._normalize_query(query)
+        self._log(
+            f"decode layer={layer}, valid_tokens={valid_tokens}, "
+            f"query={query_array.shape}"
+        )
         return self.attention_device.run_decode(
             query_array,
             layer=layer,
@@ -80,9 +97,11 @@ class FlexGenAttentionBackend:
 
     def flush(self) -> None:
         self.store.flush()
+        self._log("flushed KV files")
 
     def close(self) -> None:
         self.store.close()
+        self._log("closed KV files")
 
     def __enter__(self):
         return self.open()
@@ -173,3 +192,7 @@ class FlexGenAttentionBackend:
     def _require_open(self) -> None:
         if not self.is_open:
             raise RuntimeError("FlexGen CEMU backend is not open")
+
+    def _log(self, message: str) -> None:
+        if self.logger is not None:
+            self.logger(f"[kv-backend] {message}")

@@ -13,10 +13,12 @@ TARGETS = \
 
 CC = gcc
 CXX = g++
+PYTHON ?= python3
+PYTHON_EXECUTABLE := $(shell command -v $(PYTHON))
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-attention-test instattention-attention-gpu-test
+.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-cemu-gpu-test instattention-attention-test instattention-attention-gpu-test
 
 all: $(BUILD_DIR) $(TARGETS) instattention
 
@@ -24,7 +26,7 @@ kernel:
 	$(MAKE) -C kernel all
 
 instattention:
-	cmake -S $(INSTATTENTION_DIR) -B $(INSTATTENTION_BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo
+	cmake -S $(INSTATTENTION_DIR) -B $(INSTATTENTION_BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE="$(PYTHON_EXECUTABLE)"
 	cmake --build $(INSTATTENTION_BUILD_DIR) --parallel
 
 instattention-client-test: instattention
@@ -44,6 +46,19 @@ instattention-kv-staging-test:
 
 instattention-prefill-test:
 	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_prefill.py
+
+instattention-flexgen-prefill-test:
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_prefill_runtime.py
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_full_prefill.py
+
+instattention-flexgen-prefill-gpu-test:
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_prefill_runtime.py --cuda
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_full_prefill.py --cuda
+
+instattention-flexgen-cemu-gpu-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_cemu_pipeline.py \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)"
 
 instattention-attention-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_attention.py --nvm-dir "$(NVM_TEST_DIR)" --fdm-dir "$(FDM_TEST_DIR)"

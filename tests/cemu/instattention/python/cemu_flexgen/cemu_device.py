@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -57,8 +58,15 @@ class CemuDevice:
         if not all(isinstance(spec, RangeSpec) for spec in range_specs):
             raise TypeError("ranges must contain RangeSpec objects")
 
+        normalized_program_path = str(program_path)
+        if (
+            not Path(normalized_program_path).is_absolute()
+            and not normalized_program_path.startswith(".")
+        ):
+            normalized_program_path = f"./{normalized_program_path}"
+
         self.program_name = program_name
-        self.program_path = program_path
+        self.program_path = normalized_program_path
         self.function_name = function_name
         self.ranges = range_specs
         self.control_path = control_path
