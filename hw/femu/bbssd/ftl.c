@@ -895,6 +895,8 @@ static uint64_t memory_copy_nvm(NvmeNamespace *ns, NvmeRequest *req)
 {
     FemuCtrl *n = ns->ctrl;
     void *sdaddr = req->sdaddr;
+    SsdBackend *memory_backend =
+        nvme_find_namespace(req->mem_ctrl, 2)->backend;
 
     // femu_log("memory_copy lat: %lu\n", clock_ns() - req->stat.stime);
     uint64_t copyed = 0;
@@ -918,7 +920,14 @@ static uint64_t memory_copy_nvm(NvmeNamespace *ns, NvmeRequest *req)
         uint64_t nbyte = (uint64_t)nlb << data_shift;
         uint64_t off = slba << data_shift;
         femu_debug("memory_copy off %lu, nbyte %lu, sdaddr 0x%p\n", off, nbyte, sdaddr);
+        if (req->is_write &&
+            backend_cuda_prepare_host(memory_backend, sdaddr, nbyte) != 0) {
+            return NVME_DNR;
+        }
         backend_rw_internal(sns->backend, sdaddr, off, nbyte, req->is_write);
+        if (!req->is_write) {
+            backend_cuda_mark_host_dirty(memory_backend, sdaddr, nbyte);
+        }
         femu_debug("memory_copy backend_rw_internal finished\n");
 #ifdef CEMU_THROTTLE_INTERNAL
         for (int j = 0; j < nlb; j += 32) {
@@ -1221,4 +1230,3 @@ static void *ftl_thread(void *arg)
 
     return NULL;
 }
-

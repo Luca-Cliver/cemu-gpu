@@ -15,7 +15,6 @@ int init_dram_backend(SsdBackend *b)
 
     b->cuda_mirror = NULL;
     b->cuda_sync = false;
-    b->cuda_mirror_valid = false;
     backend_cuda_sync_init(b);
 
     // if (mlock(b->logical_space, b->size) == -1) {

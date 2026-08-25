@@ -6,7 +6,6 @@ typedef int (*cuda_set_decive_fn)(int);
 typedef int (*cuda_malloc_fn)(void **, size_t);
 typedef int (*cuda_free_fn)(void *);
 typedef int (*cuda_memcpy_fn)(void *, const void *, size_t, int);
-typedef int (*cuda_synchronize_fn)(void);
 
 typedef struct CudaSyncApi
 {
@@ -16,15 +15,30 @@ typedef struct CudaSyncApi
     cuda_malloc_fn malloc;
     cuda_free_fn free;
     cuda_memcpy_fn memcpy;
-    cuda_synchronize_fn synchronize;
 } CudaSyncApi;
 
 static CudaSyncApi cuda_api = {0};
+
+typedef enum CudaRangeState {
+    CUDA_RANGE_UNINITIALIZED,
+    CUDA_RANGE_CLEAN,
+    CUDA_RANGE_HOST_DIRTY,
+    CUDA_RANGE_DEVICE_DIRTY,
+} CudaRangeState;
+
+typedef struct CudaMirrorSegment {
+    uint64_t start;
+    uint64_t end;
+    CudaRangeState state;
+} CudaMirrorSegment;
 
 typedef struct CudaMirrorRange {
     void *host_ptr;
     uint64_t len;
     void *device_ptr;
+    CudaMirrorSegment *segments;
+    uint32_t nr_segments;
+    uint32_t segment_capacity;
     struct CudaMirrorRange *next;
 } CudaMirrorRange;
 
@@ -38,7 +52,18 @@ static void cuda_mirror_set_head(SsdBackend *b, CudaMirrorRange *head)
     b->cuda_mirror = head;
 }
 
-static CudaMirrorRange *cuda_mirror_find(SsdBackend *b, void *host_ptr, uint64_t len)
+static bool cuda_ranges_overlap(void *first_ptr, uint64_t first_len,
+                                void *second_ptr, uint64_t second_len)
+{
+    uintptr_t first = (uintptr_t)first_ptr;
+    uintptr_t second = (uintptr_t)second_ptr;
+
+    return first <= second ? second - first < first_len
+                           : first - second < second_len;
+}
+
+static CudaMirrorRange *cuda_mirror_find_exact(SsdBackend *b, void *host_ptr,
+                                                uint64_t len)
 {
     for (CudaMirrorRange *cur = cuda_mirror_head(b); cur; cur = cur->next) {
         if (cur->host_ptr == host_ptr && cur->len == len) {
@@ -48,23 +73,118 @@ static CudaMirrorRange *cuda_mirror_find(SsdBackend *b, void *host_ptr, uint64_t
     return NULL;
 }
 
-static CudaMirrorRange *cuda_mirror_ensure(SsdBackend *b, void *host_ptr, uint64_t len)
+static void cuda_mirror_reserve_segments(CudaMirrorRange *entry,
+                                         uint32_t capacity)
 {
-    CudaMirrorRange *entry = cuda_mirror_find(b, host_ptr, len);
+    if (capacity <= entry->segment_capacity) {
+        return;
+    }
+
+    uint32_t new_capacity = MAX(capacity, entry->segment_capacity * 2);
+    entry->segments = g_renew(CudaMirrorSegment, entry->segments,
+                              new_capacity);
+    entry->segment_capacity = new_capacity;
+}
+
+static uint32_t cuda_mirror_split_segment(CudaMirrorRange *entry,
+                                          uint64_t offset)
+{
+    for (uint32_t index = 0; index < entry->nr_segments; index++) {
+        CudaMirrorSegment *segment = &entry->segments[index];
+        if (offset == segment->start) {
+            return index;
+        }
+        if (offset > segment->start && offset < segment->end) {
+            CudaMirrorSegment right = {
+                .start = offset,
+                .end = segment->end,
+                .state = segment->state,
+            };
+
+            cuda_mirror_reserve_segments(entry, entry->nr_segments + 1);
+            segment = &entry->segments[index];
+            memmove(&entry->segments[index + 2],
+                    &entry->segments[index + 1],
+                    (entry->nr_segments - index - 1) * sizeof(*segment));
+            segment->end = offset;
+            entry->segments[index + 1] = right;
+            entry->nr_segments++;
+            return index + 1;
+        }
+    }
+    return entry->nr_segments;
+}
+
+static void cuda_mirror_merge_segments(CudaMirrorRange *entry)
+{
+    uint32_t index = 0;
+
+    while (index + 1 < entry->nr_segments) {
+        CudaMirrorSegment *segment = &entry->segments[index];
+        CudaMirrorSegment *next = &entry->segments[index + 1];
+        if (segment->state == next->state && segment->end == next->start) {
+            segment->end = next->end;
+            memmove(next, next + 1,
+                    (entry->nr_segments - index - 2) * sizeof(*next));
+            entry->nr_segments--;
+        } else {
+            index++;
+        }
+    }
+}
+
+static void cuda_mirror_set_state(CudaMirrorRange *entry, uint64_t start,
+                                  uint64_t end, CudaRangeState state)
+{
+    if (start >= end || end > entry->len) {
+        return;
+    }
+
+    cuda_mirror_split_segment(entry, start);
+    if (end < entry->len) {
+        cuda_mirror_split_segment(entry, end);
+    }
+
+    for (uint32_t index = 0; index < entry->nr_segments; index++) {
+        CudaMirrorSegment *segment = &entry->segments[index];
+        if (segment->start >= end) {
+            break;
+        }
+        if (segment->end > start) {
+            segment->state = state;
+        }
+    }
+    cuda_mirror_merge_segments(entry);
+}
+
+static CudaMirrorRange *cuda_mirror_ensure_locked(SsdBackend *b,
+                                                   void *host_ptr,
+                                                   uint64_t len)
+{
+    CudaMirrorRange *entry = cuda_mirror_find_exact(b, host_ptr, len);
     if (entry) {
-        if (entry->len != len) {
-            femu_err("CUDA mirror range size mismatch for host %p: have %lu, want %lu\n",
-                     host_ptr, entry->len, len);
+        return entry;
+    }
+
+    for (CudaMirrorRange *cur = cuda_mirror_head(b); cur; cur = cur->next) {
+        if (cuda_ranges_overlap(cur->host_ptr, cur->len, host_ptr, len)) {
+            femu_err("Overlapping CUDA mirrors are unsupported: existing %p/%lu, requested %p/%lu\n",
+                     cur->host_ptr, cur->len, host_ptr, len);
             return NULL;
         }
-        return entry;
     }
 
     entry = g_malloc0(sizeof(*entry));
     entry->host_ptr = host_ptr;
     entry->len = len;
+    entry->segment_capacity = 4;
+    entry->segments = g_new0(CudaMirrorSegment, entry->segment_capacity);
+    entry->nr_segments = 1;
+    entry->segments->end = len;
+    entry->segments->state = CUDA_RANGE_UNINITIALIZED;
     if (cuda_api.malloc(&entry->device_ptr, len) != 0) {
         femu_err("Failed to allocate CUDA memory for host %p, len %lu.\n", host_ptr, len);
+        g_free(entry->segments);
         g_free(entry);
         return NULL;
     }
@@ -74,12 +194,104 @@ static CudaMirrorRange *cuda_mirror_ensure(SsdBackend *b, void *host_ptr, uint64
     return entry;
 }
 
+static int cuda_mirror_sync_segment(CudaMirrorRange *entry,
+                                    CudaMirrorSegment *segment,
+                                    bool to_device)
+{
+    uint8_t *host = (uint8_t *)entry->host_ptr + segment->start;
+    uint8_t *device = (uint8_t *)entry->device_ptr + segment->start;
+    uint64_t len = segment->end - segment->start;
+    int kind = to_device ? 1 : 2;
+    int rc = cuda_api.memcpy(to_device ? device : host,
+                             to_device ? host : device, len, kind);
+
+    femu_debug("CUDA mirror %s: host=%p, offset=%lu, len=%lu\n",
+               to_device ? "H2D" : "D2H", entry->host_ptr,
+               segment->start, len);
+    if (rc != 0) {
+        femu_err("cudaMemcpy %s failed: rc=%d, ptr=%p, offset=%lu, len=%lu\n",
+                 to_device ? "host->device" : "device->host", rc,
+                 entry->host_ptr, segment->start, len);
+        return -1;
+    }
+    segment->state = CUDA_RANGE_CLEAN;
+    return 0;
+}
+
+static int cuda_mirror_prepare_locked(SsdBackend *b, void *ptr, uint64_t len,
+                                      bool to_device)
+{
+    uintptr_t request_start = (uintptr_t)ptr;
+    uintptr_t request_end = request_start + len;
+
+    for (CudaMirrorRange *entry = cuda_mirror_head(b); entry;
+         entry = entry->next) {
+        uintptr_t entry_start = (uintptr_t)entry->host_ptr;
+        uintptr_t entry_end = entry_start + entry->len;
+        uintptr_t overlap_start = MAX(request_start, entry_start);
+        uintptr_t overlap_end = MIN(request_end, entry_end);
+
+        if (overlap_start >= overlap_end) {
+            continue;
+        }
+
+        uint64_t start = overlap_start - entry_start;
+        uint64_t end = overlap_end - entry_start;
+        cuda_mirror_split_segment(entry, start);
+        if (end < entry->len) {
+            cuda_mirror_split_segment(entry, end);
+        }
+
+        for (uint32_t index = 0; index < entry->nr_segments; index++) {
+            CudaMirrorSegment *segment = &entry->segments[index];
+            bool needs_sync;
+
+            if (segment->start >= end) {
+                break;
+            }
+            if (segment->end <= start) {
+                continue;
+            }
+            needs_sync = to_device
+                ? segment->state == CUDA_RANGE_UNINITIALIZED ||
+                      segment->state == CUDA_RANGE_HOST_DIRTY
+                : segment->state == CUDA_RANGE_DEVICE_DIRTY;
+            if (needs_sync && cuda_mirror_sync_segment(entry, segment,
+                                                        to_device) != 0) {
+                return -1;
+            }
+        }
+        cuda_mirror_merge_segments(entry);
+    }
+    return 0;
+}
+
+static void cuda_mirror_mark_locked(SsdBackend *b, void *ptr, uint64_t len,
+                                    CudaRangeState state)
+{
+    uintptr_t request_start = (uintptr_t)ptr;
+    uintptr_t request_end = request_start + len;
+
+    for (CudaMirrorRange *entry = cuda_mirror_head(b); entry;
+         entry = entry->next) {
+        uintptr_t entry_start = (uintptr_t)entry->host_ptr;
+        uintptr_t entry_end = entry_start + entry->len;
+        uintptr_t overlap_start = MAX(request_start, entry_start);
+        uintptr_t overlap_end = MIN(request_end, entry_end);
+
+        if (overlap_start < overlap_end) {
+            cuda_mirror_set_state(entry, overlap_start - entry_start,
+                                  overlap_end - entry_start, state);
+        }
+    }
+}
+
 static void *cuda_get_symbol(const char *name)
 {
     return cuda_api.module ? dlsym(cuda_api.module, name) : NULL;
 }
 
-static void backend_cuda_close_module()
+static void backend_cuda_close_module(void)
 {
     if (!cuda_api.module) {
         return;
@@ -89,7 +301,7 @@ static void backend_cuda_close_module()
     cuda_api.module = NULL;
 }
 
-static int backend_cuda_load_module()
+static int backend_cuda_load_module(void)
 {
     const char *names[] = {"libcudart.so", "libcudart.so.11.0", "libcudart.so.12.0"};
 
@@ -102,7 +314,7 @@ static int backend_cuda_load_module()
     return false;
 }
 
-static int backend_cuda_init_api()
+static int backend_cuda_init_api(void)
 {
     if(cuda_api.loaded)
     {
@@ -117,9 +329,9 @@ static int backend_cuda_init_api()
     cuda_api.malloc = (cuda_malloc_fn)cuda_get_symbol("cudaMalloc");
     cuda_api.free = (cuda_free_fn)cuda_get_symbol("cudaFree");
     cuda_api.memcpy = (cuda_memcpy_fn)cuda_get_symbol("cudaMemcpy");
-    cuda_api.synchronize = (cuda_synchronize_fn)cuda_get_symbol("cudaDeviceSynchronize");
 
-    if (!cuda_api.set_device || !cuda_api.malloc || !cuda_api.free || !cuda_api.memcpy || !cuda_api.synchronize) {
+    if (!cuda_api.set_device || !cuda_api.malloc || !cuda_api.free ||
+        !cuda_api.memcpy) {
         backend_cuda_close_module();
         return false;
     }
@@ -150,8 +362,8 @@ int backend_cuda_sync_init(SsdBackend *b)
     }
 
     b->cuda_sync = true;
-    b->cuda_mirror_valid = false;
     b->cuda_mirror = NULL;
+    qemu_mutex_init(&b->cuda_mirror_lock);
     return 0;
 }
 
@@ -164,16 +376,17 @@ void backend_cuda_sync_fini(SsdBackend *b)
             if (cur->device_ptr) {
                 cuda_api.free(cur->device_ptr);
             }
+            g_free(cur->segments);
             g_free(cur);
             cur = next;
         }
         cuda_mirror_set_head(b, NULL);
+        qemu_mutex_destroy(&b->cuda_mirror_lock);
     }
 
     if(b)
     {
         b->cuda_sync = false;
-        b->cuda_mirror_valid = false;
     }
 }
 
@@ -204,7 +417,9 @@ void *backend_cuda_ensure_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len
         return NULL;
     }
 
-    CudaMirrorRange *entry = cuda_mirror_ensure(b, host_ptr, len);
+    qemu_mutex_lock(&b->cuda_mirror_lock);
+    CudaMirrorRange *entry = cuda_mirror_ensure_locked(b, host_ptr, len);
+    qemu_mutex_unlock(&b->cuda_mirror_lock);
     if(!entry)
     {
         femu_err("Failed to ensure CUDA mirror for host %p len %lu\n", host_ptr, len);
@@ -214,125 +429,81 @@ void *backend_cuda_ensure_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len
     return entry->device_ptr;
 }
 
-void backend_cuda_sync_ptr(SsdBackend *b, void *ptr, uint64_t len, bool to_device)
+static bool backend_cuda_valid_range(SsdBackend *b, void *ptr, uint64_t len)
 {
-    uint8_t *host;
-    uint64_t offset;
-    femu_debug("backend_cuda_sync_ptr: b %p, cuda_sync %d, ptr %p, len %lu, to_device %d\n",
-             b, b ? b->cuda_sync : -1, ptr, len, to_device);
+    uintptr_t host = (uintptr_t)b->logical_space;
+    uintptr_t range = (uintptr_t)ptr;
 
-    if(!b || !b->cuda_sync || !ptr || len == 0 || !cuda_api.memcpy)
-    {
-        return;
+    if (range < host || len > (uint64_t)b->size ||
+        range - host > (uint64_t)b->size - len) {
+        femu_err("Pointer %p with len %lu out of backend logical space range!\n",
+                 ptr, len);
+        return false;
     }
-
-    host = (uint8_t *)b->logical_space;
-    if((uint8_t *)ptr < host)
-    {
-        femu_err("Pointer %p out of backend logical space range!\n", ptr);
-        return;
-    }
-
-    offset = (uint64_t)((uint8_t *)ptr - host);
-    if(offset >= (uint64_t)b->size || offset + len > (uint64_t)b->size)
-    {
-        femu_err("Pointer %p with len %lu out of backend logical space range!\n", ptr, len);
-        return;
-    }
-
-    CudaMirrorRange *entry = NULL;
-    if (to_device) {
-        /* For host->device we need an allocation/mirror; ensure it exists */
-        entry = cuda_mirror_ensure(b, ptr, len);
-        if (!entry) {
-            return;
-        }
-    } else {
-        /* For device->host only use an existing mirror; don't allocate on read-path */
-        entry = cuda_mirror_find(b, ptr, len);
-        if (!entry) {
-            femu_debug("backend_cuda_sync_ptr: no mirror entry for ptr %p len %lu; skipping device->host copy\n", ptr, len);
-            return;
-        }
-    }
-
-    if(to_device)
-    {
-        int rc = cuda_api.memcpy(entry->device_ptr, ptr, len, 1 /* host to device */);
-        if (rc != 0) {
-            femu_err("cudaMemcpy host->device failed: rc=%d, ptr=%p, len=%lu\n", rc, ptr, len);
-            return;
-        }
-        /* mark mirror as containing up-to-date data for this range */
-        b->cuda_mirror_valid = true;
-    }
-    else
-    {
-        /* Only copy back from device if mirror has valid data. If the mirror
-         * hasn't been initialized from the host (no prior host->device copy),
-         * skip device->host copy to avoid overwriting valid host memory with
-         * uninitialized device contents.
-         */
-        if (!b->cuda_mirror_valid) {
-            femu_debug("backend_cuda_sync_ptr: skipping device->host copy because mirror not valid (ptr %p, len %lu)\n", ptr, len);
-        } else {
-            int rc = cuda_api.memcpy(ptr, entry->device_ptr, len, 2 /* device to host */);
-            if (rc != 0) {
-                femu_err("cudaMemcpy device->host failed: rc=%d, ptr=%p, len=%lu\n", rc, ptr, len);
-                return;
-            }
-        }
-    }
-
-    /* cudaMemcpy on the default stream is already synchronous.
-     * Keep an explicit device sync optional so normal file I/O is not
-     * serialized behind a full-device barrier.
-     */
-    if (cuda_api.synchronize && g_getenv("CEMU_CUDA_SYNC_WAIT"))
-    {
-        int rc = cuda_api.synchronize();
-        if (rc != 0) {
-            femu_err("cudaDeviceSynchronize failed: rc=%d, ptr=%p, len=%lu\n", rc, ptr, len);
-        }
-    }
+    return true;
 }
 
-void *backend_host_to_device(SsdBackend *b, void *host_ptr, uint64_t len)
+int backend_cuda_prepare_device(SsdBackend *b, void *ptr, uint64_t len)
 {
-    uint8_t *host;
-    uint64_t offset;
-    femu_debug("backend_host_to_device: b %p, cuda_sync %d, host_ptr %p, len %lu\n",
-             b, b ? b->cuda_sync : -1, host_ptr, len);
+    int rc;
 
-    if(!b || !b->cuda_sync || !host_ptr)
-    {
-        return NULL;
+    if (!b || !b->cuda_sync || !ptr || len == 0 || !cuda_api.memcpy) {
+        return 0;
+    }
+    if (!backend_cuda_valid_range(b, ptr, len)) {
+        return -1;
     }
 
-    host = (uint8_t *)b->logical_space;
-    if((uint8_t *)host_ptr < host)
-    {
-        femu_err("Pointer %p out of backend logical space range!\n", host_ptr);
-        return NULL;
-    }
-
-    offset = (uint64_t)((uint8_t *)host_ptr - host);
-    if(offset >= (uint64_t)b->size)
-    {
-        femu_err("Pointer %p out of backend logical space range!\n", host_ptr);
-        return NULL;
-    }
-
-    CudaMirrorRange *entry = cuda_mirror_find(b, host_ptr, len);
+    qemu_mutex_lock(&b->cuda_mirror_lock);
+    CudaMirrorRange *entry = cuda_mirror_ensure_locked(b, ptr, len);
     if (!entry) {
-        entry = cuda_mirror_ensure(b, host_ptr, len);
-        if (!entry) {
-            femu_debug("backend_host_to_device: no CUDA mirror for host_ptr %p len %lu\n", host_ptr, len);
-            return NULL;
-        }
+        qemu_mutex_unlock(&b->cuda_mirror_lock);
+        return -1;
+    }
+    rc = cuda_mirror_prepare_locked(b, ptr, len, true);
+    qemu_mutex_unlock(&b->cuda_mirror_lock);
+    return rc;
+}
+
+int backend_cuda_prepare_host(SsdBackend *b, void *ptr, uint64_t len)
+{
+    int rc;
+
+    if (!b || !b->cuda_sync || !ptr || len == 0 || !cuda_api.memcpy) {
+        return 0;
+    }
+    if (!backend_cuda_valid_range(b, ptr, len)) {
+        return -1;
     }
 
-    return entry->device_ptr;
+    qemu_mutex_lock(&b->cuda_mirror_lock);
+    rc = cuda_mirror_prepare_locked(b, ptr, len, false);
+    qemu_mutex_unlock(&b->cuda_mirror_lock);
+    return rc;
+}
+
+void backend_cuda_mark_host_dirty(SsdBackend *b, void *ptr, uint64_t len)
+{
+    if (!b || !b->cuda_sync || !ptr || len == 0 ||
+        !backend_cuda_valid_range(b, ptr, len)) {
+        return;
+    }
+
+    qemu_mutex_lock(&b->cuda_mirror_lock);
+    cuda_mirror_mark_locked(b, ptr, len, CUDA_RANGE_HOST_DIRTY);
+    qemu_mutex_unlock(&b->cuda_mirror_lock);
+}
+
+void backend_cuda_mark_device_dirty(SsdBackend *b, void *ptr, uint64_t len)
+{
+    if (!b || !b->cuda_sync || !ptr || len == 0 ||
+        !backend_cuda_valid_range(b, ptr, len)) {
+        return;
+    }
+
+    qemu_mutex_lock(&b->cuda_mirror_lock);
+    cuda_mirror_mark_locked(b, ptr, len, CUDA_RANGE_DEVICE_DIRTY);
+    qemu_mutex_unlock(&b->cuda_mirror_lock);
 }
 
 int init_backend(SsdBackend **mbe, BackendType type, char *path, int64_t nbytes)
@@ -385,8 +556,16 @@ int backend_rw(SsdBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write)
     while (sg_cur_index < qsg->nsg) {
         cur_addr = qsg->sg[sg_cur_index].base + sg_cur_byte;
         cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+        if (!is_write &&
+            backend_cuda_prepare_host(b, mb + mb_oft, cur_len) != 0) {
+            qemu_sglist_destroy(qsg);
+            return -1;
+        }
         if (dma_memory_rw(qsg->as, cur_addr, mb + mb_oft, cur_len, dir, MEMTXATTRS_UNSPECIFIED)) {
             femu_err("dma_memory_rw error\n");
+        }
+        if (is_write) {
+            backend_cuda_mark_host_dirty(b, mb + mb_oft, cur_len);
         }
 
         sg_cur_byte += cur_len;
@@ -415,41 +594,23 @@ int backend_rw(SsdBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write)
 void backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
                          uint64_t data_size, int is_write)
 {
-    const uint64_t copy_threshold = 16UL * 1024UL;
-    const uint64_t page_size = 4096;
-    const uint64_t page_mask = page_size - 1;
-
     void *src, *dest;
     if (is_write) {
         src = buf;
         dest = b->logical_space + data_offset;
     } else {
-        backend_cuda_sync_ptr(b, b->logical_space + data_offset, data_size, false);
+        if (backend_cuda_prepare_host(b, b->logical_space + data_offset,
+                                      data_size) != 0) {
+            return;
+        }
         src = b->logical_space + data_offset;
         dest = buf;
     }
-    if (data_size <= copy_threshold) {
-        memmove(dest, src, data_size);
-    } else {
-        uint64_t remain = data_size;
-        if (data_offset & page_mask) {
-            uint64_t sz = page_size - (data_offset & page_mask);
-            memmove(dest, src, sz);
-            remain -= sz;
-            dest += sz;
-            src += sz;
-        }
-        while (remain > 0) {
-            uint64_t sz = remain > copy_threshold ? copy_threshold : remain;
-            memmove(dest, src, sz);
-            remain -= sz;
-            dest += sz;
-            src += sz;
-        }
-    }
+    memmove(dest, src, data_size);
 
     if(is_write) {
-        backend_cuda_sync_ptr(b, b->logical_space + data_offset, data_size, true);
+        backend_cuda_mark_host_dirty(b, b->logical_space + data_offset,
+                                     data_size);
     }
 }
 
@@ -461,6 +622,19 @@ void *backend_get_ptr(SsdBackend *b, uint64_t offset)
 void backend_copy_internal(SsdBackend *b, uint64_t doff, uint64_t soff,
                            uint64_t data_size)
 {
+    if (backend_cuda_prepare_host(b, b->logical_space + soff,
+                                  data_size) != 0) {
+        return;
+    }
     void *dest = b->logical_space + doff;
-    backend_rw_internal(b, dest, soff, data_size, 0);
+    memmove(dest, b->logical_space + soff, data_size);
+    backend_cuda_mark_host_dirty(b, dest, data_size);
+}
+
+void backend_fill(SsdBackend *b, uint64_t offset, uint64_t len)
+{
+    void *dest = backend_addr(b, offset);
+
+    memset(dest, 0, len);
+    backend_cuda_mark_host_dirty(b, dest, len);
 }

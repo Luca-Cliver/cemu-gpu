@@ -21,6 +21,32 @@ bool cuda_ok(cudaError_t error, const char *operation)
     return false;
 }
 
+size_t shared_memory_limit()
+{
+    static const size_t limit = []() {
+        int device = 0;
+        cudaDeviceProp properties = {};
+        if (!cuda_ok(cudaGetDevice(&device), "cudaGetDevice") ||
+            !cuda_ok(cudaGetDeviceProperties(&properties, device),
+                     "cudaGetDeviceProperties")) {
+            return static_cast<size_t>(0);
+        }
+        std::fprintf(
+            stderr,
+            "[cemu-cuda-attention] device=%d name=%s cc=%d.%d sm_count=%d "
+            "total_mem=%zuMB shared_mem_per_block=%zuB\n",
+            device,
+            properties.name,
+            properties.major,
+            properties.minor,
+            properties.multiProcessorCount,
+            static_cast<size_t>(properties.totalGlobalMem / (1024 * 1024)),
+            static_cast<size_t>(properties.sharedMemPerBlock));
+        return static_cast<size_t>(properties.sharedMemPerBlock);
+    }();
+    return limit;
+}
+
 bool load_metadata(const cemu_args *args, cemu_attention_metadata *metadata)
 {
     if (!args || !metadata || !args->data_buffer ||
@@ -198,20 +224,17 @@ extern "C" long long dense_attention(struct cemu_args *args)
         return -1;
     }
 
-    int device = 0;
-    cudaDeviceProp properties = {};
-    if (!cuda_ok(cudaGetDevice(&device), "cudaGetDevice") ||
-        !cuda_ok(cudaGetDeviceProperties(&properties, device),
-                 "cudaGetDeviceProperties")) {
+    const size_t shared_limit = shared_memory_limit();
+    if (shared_limit == 0) {
         return -1;
     }
     const size_t shared_bytes =
         static_cast<size_t>(metadata.token_count) * sizeof(float);
-    if (shared_bytes > properties.sharedMemPerBlock) {
+    if (shared_bytes > shared_limit) {
         std::fprintf(stderr,
                      "dense_attention(devptr): %zu shared bytes exceed device limit %zu\n",
                      shared_bytes,
-                     static_cast<size_t>(properties.sharedMemPerBlock));
+                     shared_limit);
         return -1;
     }
 

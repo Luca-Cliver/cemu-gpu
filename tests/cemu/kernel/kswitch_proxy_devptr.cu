@@ -128,11 +128,6 @@ extern "C" long long kswitch_proxy(struct cemu_args *args)
     uint32_t *device_input = static_cast<uint32_t *>(args->mr_dev_addr[0]);
     uint32_t *device_output = static_cast<uint32_t *>(args->mr_dev_addr[1]);
     uint32_t *host_output = static_cast<uint32_t *>(args->mr_addr[1]);
-    const uint32_t *host_input = static_cast<const uint32_t *>(args->mr_addr[0]);
-    const size_t input_bytes = static_cast<size_t>(n) * sizeof(uint32_t);
-
-    cuda_check(cudaMemcpy(device_input, host_input, input_bytes, cudaMemcpyHostToDevice),
-               "cudaMemcpy FDM to device_input");
 
     // std::printf("kswitch_proxy(devptr): host_input_checksum=0x%016llx\n",
     //             static_cast<unsigned long long>(checksum_u32(host_input, n)));

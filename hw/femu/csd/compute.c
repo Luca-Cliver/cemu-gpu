@@ -956,31 +956,32 @@ static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
 
     if(program->is_indirect) {
         for (uint32_t i = 0; i < job->args.numr; i++) {
-            backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
-                                  job->args.mr_len[i], true);
+            if (backend_cuda_prepare_device(job->mr_backend[i],
+                                            job->args.mr_addr[i],
+                                            job->args.mr_len[i]) != 0) {
+                return (uint64_t)-1;
+            }
         }
     } else {
         /* Direct CUDA ABI: mr[0..numr-2] are inputs, mr[numr-1] is output. */
         for (uint32_t i = 0; i + 1 < job->args.numr; i++) {
-            backend_cuda_sync_ptr(job->mr_backend[i], job->args.mr_addr[i],
-                                  job->args.mr_len[i], true);
+            if (backend_cuda_prepare_device(job->mr_backend[i],
+                                            job->args.mr_addr[i],
+                                            job->args.mr_len[i]) != 0) {
+                return (uint64_t)-1;
+            }
         }
     }
 
     femu_debug("running CUDA devptr shared lib...\n");
     res = program->shared_lib.jit_fn(&job->args);
 
-    /* Temporary direct-path D2H until range-level dirty tracking exists. */
-    if(!program->is_indirect) {
-        uint32_t output_index = job->args.numr - 1;
-        backend_cuda_sync_ptr(job->mr_backend[output_index],
-                              job->args.mr_addr[output_index],
-                              job->args.mr_len[output_index], false);
-        /* Attention uses mr[3] as a persistent read/write state range. */
-        if (job->args.numr == 5) {
-            backend_cuda_sync_ptr(job->mr_backend[3],
-                                  job->args.mr_addr[3],
-                                  job->args.mr_len[3], false);
+    if (res != (uint64_t)-1) {
+        uint32_t first_dirty = program->is_indirect ? 0 : 1;
+        for (uint32_t i = first_dirty; i < job->args.numr; i++) {
+            backend_cuda_mark_device_dirty(job->mr_backend[i],
+                                           job->args.mr_addr[i],
+                                           job->args.mr_len[i]);
         }
     }
 
@@ -990,10 +991,37 @@ static uint64_t run_cuda_devptr_shared_lib(ComputeJob *job)
 static uint64_t run_program_by_target(ComputeJob *job)
 {
     Program *program = job->program;
+    uint64_t res;
 
     switch (program->target) {
     case PROGRAM_TARGET_HOST:
-        return run_host_program(job);
+        if (program->is_indirect) {
+            for (uint32_t i = 0; i < job->args.numr; i++) {
+                if (backend_cuda_prepare_host(job->mr_backend[i],
+                                              job->args.mr_addr[i],
+                                              job->args.mr_len[i]) != 0) {
+                    return (uint64_t)-1;
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i + 1 < job->args.numr; i++) {
+                if (backend_cuda_prepare_host(job->mr_backend[i],
+                                              job->args.mr_addr[i],
+                                              job->args.mr_len[i]) != 0) {
+                    return (uint64_t)-1;
+                }
+            }
+        }
+        res = run_host_program(job);
+        if (res != (uint64_t)-1) {
+            uint32_t first_dirty = program->is_indirect ? 0 : 1;
+            for (uint32_t i = first_dirty; i < job->args.numr; i++) {
+                backend_cuda_mark_host_dirty(job->mr_backend[i],
+                                             job->args.mr_addr[i],
+                                             job->args.mr_len[i]);
+            }
+        }
+        return res;
     case PROGRAM_TARGET_CUDA_DEVPTR:
         return run_cuda_devptr_shared_lib(job);
     default:
