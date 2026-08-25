@@ -70,6 +70,7 @@ class FlexGenWeightLoader:
             raise IndexError("layer is outside the model configuration")
 
         hidden_size = self.config.hidden_size
+        kv_hidden_size = self.config.num_key_value_heads * self.config.head_dim
         intermediate_size = self.config.intermediate_size
         prefix = f"layers.{layer}."
         attention = FlexGenAttentionWeights(
@@ -79,11 +80,11 @@ class FlexGenWeightLoader:
             ),
             key=self._load(
                 prefix + "self_attn.k_proj.weight",
-                (hidden_size, hidden_size),
+                (kv_hidden_size, hidden_size),
             ),
             value=self._load(
                 prefix + "self_attn.v_proj.weight",
-                (hidden_size, hidden_size),
+                (kv_hidden_size, hidden_size),
             ),
             output=self._load(
                 prefix + "self_attn.o_proj.weight",

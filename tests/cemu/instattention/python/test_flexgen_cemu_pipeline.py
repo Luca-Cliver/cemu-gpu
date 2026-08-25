@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import math
 import sys
 import tempfile
 from pathlib import Path
@@ -25,8 +24,11 @@ from cemu_flexgen import (
 )
 from flexgen_adapter import FlexGenAttentionBackend
 from flexgen_runtime import (
+    FlexGenDecodeRunner,
+    FlexGenGenerationRunner,
     FlexGenLlamaConfig,
     FlexGenPrefillRunner,
+    FlexGenTorchAttentionBackend,
     FlexGenWeightLoader,
 )
 
@@ -40,7 +42,34 @@ def parse_args():
     parser.add_argument("--nvm-dir", default="/mnt/nvme0")
     parser.add_argument("--fdm-dir", default="/mnt/fdm0")
     parser.add_argument("--program", default="./build/dense_attention_devptr.so")
-    return parser.parse_args()
+    parser.add_argument("--decode-steps", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--hidden-size", type=int, default=16)
+    parser.add_argument("--num-attention-heads", type=int, default=4)
+    parser.add_argument("--num-key-value-heads", type=int, default=2)
+    parser.add_argument("--staging-tokens", type=int, default=0)
+    args = parser.parse_args()
+    if args.decode_steps <= 0:
+        parser.error("--decode-steps must be positive")
+    if args.num_layers <= 0:
+        parser.error("--num-layers must be positive")
+    if args.hidden_size <= 0:
+        parser.error("--hidden-size must be positive")
+    if args.num_attention_heads <= 0:
+        parser.error("--num-attention-heads must be positive")
+    if args.num_key_value_heads <= 0:
+        parser.error("--num-key-value-heads must be positive")
+    if args.hidden_size % args.num_attention_heads != 0:
+        parser.error("--num-attention-heads must divide --hidden-size")
+    if args.num_attention_heads % args.num_key_value_heads != 0:
+        parser.error(
+            "--num-key-value-heads must divide --num-attention-heads"
+        )
+    if args.hidden_size // args.num_attention_heads % 2 != 0:
+        parser.error("the configured head dimension must be even for RoPE")
+    if args.staging_tokens < 0:
+        parser.error("--staging-tokens must be non-negative")
+    return args
 
 
 def log(message):
@@ -59,13 +88,19 @@ def write_weight(directory, filename, values):
         np.save(weight_file, values)
 
 
-def create_test_model(directory):
+def create_test_model(
+    directory,
+    num_layers,
+    hidden_size,
+    num_attention_heads,
+    num_key_value_heads,
+):
     config_values = {
-        "num_hidden_layers": 2,
-        "hidden_size": 8,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 2,
-        "intermediate_size": 12,
+        "num_hidden_layers": num_layers,
+        "hidden_size": hidden_size,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "intermediate_size": hidden_size * 3 // 2,
         "vocab_size": 24,
         "pad_token_id": 0,
         "rope_theta": 10000.0,
@@ -88,10 +123,16 @@ def create_test_model(directory):
     random_weight("norm.weight", (config.hidden_size,))
     for layer in range(config.num_hidden_layers):
         prefix = f"layers.{layer}."
-        for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        for projection in ("q_proj", "o_proj"):
             random_weight(
                 prefix + f"self_attn.{projection}.weight",
                 (config.hidden_size, config.hidden_size),
+            )
+        kv_hidden_size = config.num_key_value_heads * config.head_dim
+        for projection in ("k_proj", "v_proj"):
+            random_weight(
+                prefix + f"self_attn.{projection}.weight",
+                (kv_hidden_size, config.hidden_size),
             )
         random_weight(prefix + "input_layernorm.weight", (config.hidden_size,))
         random_weight(
@@ -113,30 +154,6 @@ def create_test_model(directory):
     return config
 
 
-def attention_reference(query, keys, values, num_kv_heads):
-    batch_size, num_query_heads, head_dim = query.shape
-    token_count = keys.shape[0]
-    scale = np.float32(1.0 / math.sqrt(head_dim))
-    output = np.empty_like(query)
-
-    for batch in range(batch_size):
-        for query_head in range(num_query_heads):
-            kv_head = query_head * num_kv_heads // num_query_heads
-            scores = np.empty(token_count, dtype=np.float32)
-            for token in range(token_count):
-                scores[token] = (
-                    np.dot(query[batch, query_head], keys[token, batch, kv_head])
-                    * scale
-                )
-            probabilities = np.exp(scores - np.max(scores))
-            probabilities /= np.sum(probabilities)
-            output[batch, query_head] = np.sum(
-                probabilities[:, np.newaxis] * values[:, batch, kv_head],
-                axis=0,
-            )
-    return output
-
-
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
@@ -151,7 +168,7 @@ def main():
     if not program_file.is_absolute() and not program_reference.startswith("."):
         program_reference = f"./{program_reference}"
 
-    log("[pipeline] step 1/6: prepare deterministic two-layer Llama model")
+    log("[pipeline] step 1/7: prepare deterministic configurable Llama model")
     log(
         f"[pipeline] CSD operator guest_file={program_file}, "
         f"host_reference={program_reference}"
@@ -166,8 +183,15 @@ def main():
         weight_path = Path(weight_directory)
         nvm_path = Path(nvm_directory)
         fdm_path = Path(fdm_directory)
-        config = create_test_model(weight_path)
+        config = create_test_model(
+            weight_path,
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_attention_heads=args.num_attention_heads,
+            num_key_value_heads=args.num_key_value_heads,
+        )
         prompt_tokens = 5
+        max_seq_len = prompt_tokens + args.decode_steps
         selected_layer = config.num_hidden_layers - 1
         token_ids = torch.tensor(
             [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]],
@@ -176,14 +200,15 @@ def main():
         layout = KvCacheLayout(
             KvLayoutConfig(
                 num_layers=config.num_hidden_layers,
-                max_seq_len=prompt_tokens,
+                max_seq_len=max_seq_len,
                 batch_size=token_ids.shape[0],
                 num_kv_heads=config.num_key_value_heads,
                 head_dim=config.head_dim,
                 dtype=np.float32,
             )
         )
-        staging_bytes = 2 * layout.token_stride
+        staging_tokens = args.staging_tokens or max_seq_len
+        staging_bytes = staging_tokens * layout.token_stride
         query_shape = (
             layout.config.batch_size,
             config.num_attention_heads,
@@ -194,7 +219,13 @@ def main():
         buffers = AttentionBufferConfig(
             query_bytes=align_up(np.prod(query_shape) * np.dtype(np.float32).itemsize, 512),
             staging_bytes=staging_bytes,
-            state_bytes=512,
+            state_bytes=align_up(
+                layout.config.batch_size
+                * config.num_attention_heads
+                * (config.head_dim + 2)
+                * np.dtype(np.float32).itemsize,
+                512,
+            ),
             output_bytes=align_up(np.prod(query_shape) * np.dtype(np.float32).itemsize, 512),
             query_path=fdm_path / "attention_query",
             k_staging_path=fdm_path / "k_staging_0",
@@ -225,27 +256,38 @@ def main():
             replace_existing=True,
             logger=log,
         )
-        runner = FlexGenPrefillRunner(
+        log(
+            f"[pipeline] model layers={config.num_hidden_layers}, "
+            f"hidden={config.hidden_size}, query_heads={config.num_attention_heads}, "
+            f"kv_heads={config.num_key_value_heads}, "
+            f"groups={config.num_key_value_groups}"
+        )
+        log(
+            f"[pipeline] FDM staging capacity={staging_tokens} tokens, "
+            f"bytes={staging_bytes}, token_stride={layout.token_stride}"
+        )
+        weight_loader = FlexGenWeightLoader(
+            config,
+            weight_path,
+            device="cuda:0",
+        )
+        prefill_runner = FlexGenPrefillRunner(
             config=config,
-            weight_loader=FlexGenWeightLoader(
-                config,
-                weight_path,
-                device="cuda:0",
-            ),
+            weight_loader=weight_loader,
             kv_writer=backend,
             logger=log,
         )
 
         log(
-            "[pipeline] step 2/6: run full Prefill on Guest GPU "
+            "[pipeline] step 2/7: run full Prefill on Guest GPU "
             f"({torch.cuda.get_device_name(0)})"
         )
         with backend:
-            result = runner.run(token_ids, collect_kv_cache=True)
+            prefill_result = prefill_runner.run(token_ids, collect_kv_cache=True)
             torch.cuda.synchronize()
             backend.flush()
 
-            log("[pipeline] step 3/6: verify GPU-produced KV in CEMU NVM")
+            log("[pipeline] step 3/7: verify Prefill KV in CEMU NVM")
             with KvCacheStore(layout, k_cache_path, v_cache_path) as store:
                 stored_keys, stored_values = store.read_tokens(
                     selected_layer,
@@ -253,7 +295,7 @@ def main():
                     prompt_tokens,
                 )
             expected_keys = (
-                result.kv_cache[selected_layer][0]
+                prefill_result.kv_cache[selected_layer][0]
                 .detach()
                 .cpu()
                 .reshape(
@@ -265,7 +307,7 @@ def main():
                 .numpy()
             )
             expected_values = (
-                result.kv_cache[selected_layer][1]
+                prefill_result.kv_cache[selected_layer][1]
                 .detach()
                 .cpu()
                 .reshape(expected_keys.shape)
@@ -278,41 +320,198 @@ def main():
                 f"K/V={stored_keys.shape}, K[:4]={stored_keys.reshape(-1)[:4].tolist()}"
             )
 
-            log("[pipeline] step 4/6: prepare one synthetic Decode query")
-            query = np.random.default_rng(20260819).normal(size=query_shape).astype(
-                np.float32
-            )
-            expected_output = attention_reference(
-                query,
-                stored_keys,
-                stored_values,
-                layout.config.num_kv_heads,
-            )
-            chunk_count = layout.chunk_count(
-                prompt_tokens,
-                layout.tokens_per_chunk(staging_bytes, staging_bytes),
-            )
             log(
-                f"[pipeline] query={query.shape}, chunks={chunk_count}, "
-                f"tokens_per_chunk={layout.tokens_per_chunk(staging_bytes, staging_bytes)}"
+                "[pipeline] step 4/7: run pure PyTorch autoregressive Decode reference"
+            )
+            reference_backend = FlexGenTorchAttentionBackend(
+                config,
+                prefill_result.kv_cache,
+                logger=log,
+            )
+            reference_runner = FlexGenDecodeRunner(
+                config,
+                weight_loader,
+                reference_backend,
+                logger=log,
+            )
+            reference_generation = FlexGenGenerationRunner(
+                reference_runner,
+                logger=log,
+            ).run(
+                prefill_result.next_token_ids,
+                start_position=prompt_tokens,
+                decode_steps=args.decode_steps,
+                collect_layer_outputs=True,
+            )
+            torch.cuda.synchronize()
+            log(
+                f"[pipeline] Prefill next_tokens="
+                f"{prefill_result.next_token_ids.detach().cpu().reshape(-1).tolist()}, "
+                f"reference sequence="
+                f"{reference_generation.token_ids.detach().cpu().tolist()}"
             )
 
-            log("[pipeline] step 5/6: NVM -> FDM -> 5 MRS -> CSD CUDA Attention")
-            with attention_device:
-                output = backend.decode(
-                    layer=selected_layer,
-                    query=query,
-                    valid_tokens=prompt_tokens,
+            tokens_per_chunk = layout.tokens_per_chunk(
+                staging_bytes,
+                staging_bytes,
+            )
+            for decode_step in range(args.decode_steps):
+                valid_tokens = prompt_tokens + decode_step + 1
+                chunk_count = layout.chunk_count(valid_tokens, tokens_per_chunk)
+                log(
+                    f"[pipeline] Decode step={decode_step}, "
+                    f"position={prompt_tokens + decode_step}, "
+                    f"valid_tokens={valid_tokens}, chunks={chunk_count}, "
+                    f"tokens_per_chunk={tokens_per_chunk}"
                 )
+
+            log(
+                "[pipeline] step 5/7: autoregressive tokens -> QKV/RoPE -> "
+                "NVM -> FDM -> 5 MRS -> CSD CUDA Attention"
+            )
+            cemu_decode_runner = FlexGenDecodeRunner(
+                config,
+                weight_loader,
+                backend,
+                logger=log,
+            )
+            with attention_device:
+                cemu_generation = FlexGenGenerationRunner(
+                    cemu_decode_runner,
+                    logger=log,
+                ).run(
+                    prefill_result.next_token_ids,
+                    start_position=prompt_tokens,
+                    decode_steps=args.decode_steps,
+                    collect_layer_outputs=True,
+                )
+                torch.cuda.synchronize()
                 if attention_device.memory_range_count != 5:
                     raise AssertionError("CEMU Attention must create exactly five MRS")
 
-            log("[pipeline] step 6/6: compare CSD output with CPU reference")
-            np.testing.assert_allclose(output, expected_output, rtol=2e-5, atol=2e-5)
-            log(f"[pipeline] output[0,0]={output[0, 0].tolist()}")
-            log(f"[pipeline] reference[0,0]={expected_output[0, 0].tolist()}")
+            log("[pipeline] step 6/7: verify all Decode K/V appends in CEMU NVM")
+            backend.flush()
+            with KvCacheStore(layout, k_cache_path, v_cache_path) as store:
+                appended_keys, appended_values = store.read_tokens(
+                    selected_layer,
+                    prompt_tokens,
+                    args.decode_steps,
+                )
+            expected_appended_keys = np.concatenate(
+                [
+                    step.decode_result.layer_outputs[selected_layer]
+                    .key.detach()
+                    .cpu()
+                    .reshape(
+                        1,
+                        layout.config.batch_size,
+                        layout.config.num_kv_heads,
+                        layout.config.head_dim,
+                    )
+                    .numpy()
+                    for step in cemu_generation.steps
+                ],
+                axis=0,
+            )
+            expected_appended_values = np.concatenate(
+                [
+                    step.decode_result.layer_outputs[selected_layer]
+                    .value.detach()
+                    .cpu()
+                    .reshape(
+                        1,
+                        layout.config.batch_size,
+                        layout.config.num_kv_heads,
+                        layout.config.head_dim,
+                    )
+                    .numpy()
+                    for step in cemu_generation.steps
+                ],
+                axis=0,
+            )
+            np.testing.assert_array_equal(appended_keys, expected_appended_keys)
+            np.testing.assert_array_equal(appended_values, expected_appended_values)
+            log(
+                f"[pipeline] NVM append verified layer={selected_layer}, "
+                f"tokens=[{prompt_tokens}, {max_seq_len}), "
+                f"K[:4]={appended_keys.reshape(-1)[:4].tolist()}"
+            )
 
-    log("[pipeline] PASS: Guest GPU Prefill -> CEMU NVM/FDM -> CSD GPU Attention")
+            log(
+                "[pipeline] step 7/7: compare every CEMU Decode step with "
+                "PyTorch reference"
+            )
+            torch.testing.assert_close(
+                cemu_generation.token_ids,
+                reference_generation.token_ids,
+            )
+            for cemu_step, reference_step in zip(
+                cemu_generation.steps,
+                reference_generation.steps,
+            ):
+                torch.testing.assert_close(
+                    cemu_step.input_token_ids,
+                    reference_step.input_token_ids,
+                )
+                cemu_result = cemu_step.decode_result
+                reference_result = reference_step.decode_result
+                for layer, (cemu_layer, reference_layer) in enumerate(
+                    zip(cemu_result.layer_outputs, reference_result.layer_outputs)
+                ):
+                    torch.testing.assert_close(
+                        cemu_layer.query,
+                        reference_layer.query,
+                        rtol=3e-4,
+                        atol=3e-4,
+                    )
+                    torch.testing.assert_close(
+                        cemu_layer.key,
+                        reference_layer.key,
+                        rtol=3e-4,
+                        atol=3e-4,
+                    )
+                    torch.testing.assert_close(
+                        cemu_layer.value,
+                        reference_layer.value,
+                        rtol=3e-4,
+                        atol=3e-4,
+                    )
+                    torch.testing.assert_close(
+                        cemu_layer.attention_output,
+                        reference_layer.attention_output,
+                        rtol=3e-4,
+                        atol=3e-4,
+                    )
+                    log(
+                        f"[pipeline] step={cemu_step.step}, layer={layer} "
+                        "Q/K/V and Attention match"
+                    )
+                torch.testing.assert_close(
+                    cemu_result.hidden_states,
+                    reference_result.hidden_states,
+                    rtol=3e-4,
+                    atol=3e-4,
+                )
+                torch.testing.assert_close(
+                    cemu_result.logits,
+                    reference_result.logits,
+                    rtol=3e-4,
+                    atol=3e-4,
+                )
+                torch.testing.assert_close(
+                    cemu_result.next_token_ids,
+                    reference_result.next_token_ids,
+                )
+                log(
+                    f"[pipeline] step={cemu_step.step} logits match, "
+                    f"next_tokens={cemu_result.next_token_ids.detach().cpu().reshape(-1).tolist()}"
+                )
+
+    log(
+        f"[pipeline] PASS: Guest GPU Prefill -> {args.decode_steps} autoregressive "
+        "Decode steps -> CEMU Attention -> Wo/MLP/LM head; token_sequence="
+        f"{cemu_generation.token_ids.detach().cpu().tolist()}"
+    )
 
 
 if __name__ == "__main__":

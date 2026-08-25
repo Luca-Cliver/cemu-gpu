@@ -42,4 +42,6 @@ sudo CUDA_DEVICE_ORDER="$CUDA_DEVICE_ORDER" \
     -device virtio-9p-pci,fsdev=cemusrc,mount_tag=cemusrc \
     -fsdev local,path=../../linux-cemu,security_model=none,id=linuxsrc \
     -device virtio-9p-pci,fsdev=linuxsrc,mount_tag=linuxsrc \
+    -fsdev local,path=../../models,security_model=none,id=modelsrc \
+    -device virtio-9p-pci,fsdev=modelsrc,mount_tag=modelsrc \
     -qmp unix:./qmp-sock,server,nowait 2>&1 | tee log

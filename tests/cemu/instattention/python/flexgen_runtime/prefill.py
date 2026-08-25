@@ -9,6 +9,7 @@ import torch.nn.functional as F
 @dataclass(frozen=True)
 class FlexGenPrefillOutput:
     hidden_states: torch.Tensor
+    mlp_inputs: torch.Tensor
     keys: torch.Tensor
     values: torch.Tensor
 
@@ -80,6 +81,7 @@ def run_flexgen_prefill(
     input_norm_weight: torch.Tensor,
     post_attention_norm_weight: torch.Tensor,
     num_heads: int,
+    num_key_value_heads: Optional[int] = None,
     position_ids: Optional[torch.Tensor] = None,
     rope_theta: float = 10000.0,
     epsilon: float = 1e-6,
@@ -91,6 +93,15 @@ def run_flexgen_prefill(
     batch_size, sequence_length, hidden_size = inputs.shape
     if num_heads <= 0 or hidden_size % num_heads != 0:
         raise ValueError("num_heads must divide the hidden size")
+    if num_key_value_heads is None:
+        num_key_value_heads = num_heads
+    if (
+        not isinstance(num_key_value_heads, int)
+        or isinstance(num_key_value_heads, bool)
+        or num_key_value_heads <= 0
+        or num_heads % num_key_value_heads != 0
+    ):
+        raise ValueError("num_key_value_heads must divide num_heads")
     if attention_mask.shape != (batch_size, sequence_length):
         raise ValueError("attention_mask must have shape [batch, sequence]")
     if attention_mask.dtype != torch.bool:
@@ -98,15 +109,21 @@ def run_flexgen_prefill(
     if not math.isfinite(float(rope_theta)) or rope_theta <= 0:
         raise ValueError("rope_theta must be finite and positive")
 
+    head_dim = hidden_size // num_heads
     matrix_shape = (hidden_size, hidden_size)
     for name, weight in (
         ("query_weight", query_weight),
-        ("key_weight", key_weight),
-        ("value_weight", value_weight),
         ("output_weight", output_weight),
     ):
         if weight.shape != matrix_shape:
             raise ValueError(f"{name} must have shape {matrix_shape}")
+    kv_matrix_shape = (num_key_value_heads * head_dim, hidden_size)
+    for name, weight in (
+        ("key_weight", key_weight),
+        ("value_weight", value_weight),
+    ):
+        if weight.shape != kv_matrix_shape:
+            raise ValueError(f"{name} must have shape {kv_matrix_shape}")
     for name, weight in (
         ("input_norm_weight", input_norm_weight),
         ("post_attention_norm_weight", post_attention_norm_weight),
@@ -114,7 +131,6 @@ def run_flexgen_prefill(
         if weight.shape != (hidden_size,):
             raise ValueError(f"{name} must have shape ({hidden_size},)")
 
-    head_dim = hidden_size // num_heads
     if use_rotary_embedding and head_dim % 2 != 0:
         raise ValueError("RoPE requires an even head dimension")
     if position_ids is None:
@@ -133,8 +149,18 @@ def run_flexgen_prefill(
     value = F.linear(hidden, value_weight, bias=None)
 
     query = query.view(batch_size, sequence_length, num_heads, head_dim)
-    key = key.view(batch_size, sequence_length, num_heads, head_dim)
-    value = value.view(batch_size, sequence_length, num_heads, head_dim)
+    key = key.view(
+        batch_size,
+        sequence_length,
+        num_key_value_heads,
+        head_dim,
+    )
+    value = value.view(
+        batch_size,
+        sequence_length,
+        num_key_value_heads,
+        head_dim,
+    )
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
     value = value.permute(0, 2, 1, 3)
@@ -157,22 +183,25 @@ def run_flexgen_prefill(
 
     flexgen_keys = key.permute(2, 0, 1, 3).reshape(
         sequence_length,
-        batch_size * num_heads,
+        batch_size * num_key_value_heads,
         head_dim,
     )
     flexgen_values = value.permute(2, 0, 1, 3).reshape(
         sequence_length,
-        batch_size * num_heads,
+        batch_size * num_key_value_heads,
         head_dim,
     )
 
+    num_key_value_groups = num_heads // num_key_value_heads
+    attention_key = key.repeat_interleave(num_key_value_groups, dim=1)
+    attention_value = value.repeat_interleave(num_key_value_groups, dim=1)
     query = query.reshape(batch_size * num_heads, sequence_length, head_dim)
-    attention_keys = key.reshape(
+    attention_keys = attention_key.reshape(
         batch_size * num_heads,
         sequence_length,
         head_dim,
     ).transpose(1, 2)
-    attention_values = value.reshape(
+    attention_values = attention_value.reshape(
         batch_size * num_heads,
         sequence_length,
         head_dim,
@@ -218,7 +247,12 @@ def run_flexgen_prefill(
         hidden_size,
     )
     output = F.linear(output, output_weight, bias=None)
-    output = output + inputs
-    output = _rms_norm(post_attention_norm_weight, output, epsilon)
+    hidden_states = output + inputs
+    mlp_inputs = _rms_norm(post_attention_norm_weight, hidden_states, epsilon)
 
-    return FlexGenPrefillOutput(output, flexgen_keys, flexgen_values)
+    return FlexGenPrefillOutput(
+        hidden_states=hidden_states,
+        mlp_inputs=mlp_inputs,
+        keys=flexgen_keys,
+        values=flexgen_values,
+    )

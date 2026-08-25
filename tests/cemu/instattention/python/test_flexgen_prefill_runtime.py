@@ -109,6 +109,69 @@ class FlexGenPrefillRuntimeTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(result.keys).all())
         self.assertTrue(torch.isfinite(result.values).all())
 
+    def test_gqa_matches_equivalent_expanded_mha(self):
+        num_key_value_heads = 1
+        compact_key_weight = torch.randn(
+            num_key_value_heads * self.head_dim,
+            self.hidden_size,
+            device=TEST_DEVICE,
+        )
+        compact_value_weight = torch.randn(
+            num_key_value_heads * self.head_dim,
+            self.hidden_size,
+            device=TEST_DEVICE,
+        )
+        gqa_result = run_flexgen_prefill(
+            inputs=self.inputs,
+            attention_mask=self.attention_mask,
+            query_weight=self.weights[0],
+            key_weight=compact_key_weight,
+            value_weight=compact_value_weight,
+            output_weight=self.weights[3],
+            input_norm_weight=self.norm_weights[0],
+            post_attention_norm_weight=self.norm_weights[1],
+            num_heads=self.num_heads,
+            num_key_value_heads=num_key_value_heads,
+            use_rotary_embedding=False,
+        )
+        mha_result = run_flexgen_prefill(
+            inputs=self.inputs,
+            attention_mask=self.attention_mask,
+            query_weight=self.weights[0],
+            key_weight=compact_key_weight.repeat(self.num_heads, 1),
+            value_weight=compact_value_weight.repeat(self.num_heads, 1),
+            output_weight=self.weights[3],
+            input_norm_weight=self.norm_weights[0],
+            post_attention_norm_weight=self.norm_weights[1],
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_heads,
+            use_rotary_embedding=False,
+        )
+
+        self.assertEqual(
+            gqa_result.keys.shape,
+            (self.sequence_length, self.batch_size, self.head_dim),
+        )
+        self.assertEqual(gqa_result.values.shape, gqa_result.keys.shape)
+        expanded_keys = mha_result.keys.reshape(
+            self.sequence_length,
+            self.batch_size,
+            self.num_heads,
+            self.head_dim,
+        )
+        expanded_values = mha_result.values.reshape_as(expanded_keys)
+        torch.testing.assert_close(gqa_result.keys, expanded_keys[:, :, 0, :])
+        torch.testing.assert_close(gqa_result.values, expanded_values[:, :, 0, :])
+        torch.testing.assert_close(
+            expanded_keys[:, :, 0, :],
+            expanded_keys[:, :, 1, :],
+        )
+        torch.testing.assert_close(
+            expanded_values[:, :, 0, :],
+            expanded_values[:, :, 1, :],
+        )
+        torch.testing.assert_close(gqa_result.hidden_states, mha_result.hidden_states)
+
     def test_invalid_attention_mask_is_rejected(self):
         with self.assertRaises(TypeError):
             self._run_prefill(attention_mask=self.attention_mask.float())

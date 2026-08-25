@@ -42,3 +42,19 @@ for ((i=0; i<$nr_dev; i++)); do
 		fi
 	fi
 done
+
+### Model Share Mount
+model_tag="modelsrc"
+model_dir="/root/models"
+if grep -qs " $model_dir " /proc/mounts; then
+	echo "$model_tag already mounted at $model_dir!"
+else
+	mkdir -p "$model_dir"
+	if mount -t 9p \
+		-o trans=virtio,version=9p2000.L,msize=512000 \
+		"$model_tag" "$model_dir"; then
+		echo "Mount $model_tag to $model_dir"
+	else
+		echo "Warning: unable to mount optional model share $model_tag" >&2
+	fi
+fi

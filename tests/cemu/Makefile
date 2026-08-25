@@ -18,7 +18,7 @@ PYTHON_EXECUTABLE := $(shell command -v $(PYTHON))
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-cemu-gpu-test instattention-attention-test instattention-attention-gpu-test
+.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-decode-test instattention-flexgen-decode-gpu-test instattention-flexgen-cemu-gpu-test instattention-hf-checkpoint-test instattention-tinyllama-checkpoint-test instattention-tinyllama-prefill-test instattention-tinyllama-reference-test instattention-tinyllama-decode-reference-test instattention-tinyllama-cemu-gpu-test instattention-attention-test instattention-attention-gpu-test
 
 all: $(BUILD_DIR) $(TARGETS) instattention
 
@@ -55,10 +55,71 @@ instattention-flexgen-prefill-gpu-test:
 	python3 $(INSTATTENTION_DIR)/python/test_flexgen_prefill_runtime.py --cuda
 	python3 $(INSTATTENTION_DIR)/python/test_flexgen_full_prefill.py --cuda
 
+instattention-flexgen-decode-test:
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_decode_runtime.py
+
+instattention-flexgen-decode-gpu-test:
+	python3 $(INSTATTENTION_DIR)/python/test_flexgen_decode_runtime.py --cuda
+
+instattention-hf-checkpoint-test:
+	python3 $(INSTATTENTION_DIR)/python/test_hf_checkpoint.py
+
+instattention-tinyllama-checkpoint-test:
+	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_checkpoint.py \
+		--model-dir "$(MODEL_DIR)" \
+		$(if $(CUDA),--cuda) \
+		$(if $(ALL_LAYERS),--all-layers)
+
+instattention-tinyllama-prefill-test:
+	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_prefill.py \
+		--model-dir "$(MODEL_DIR)" \
+		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
+		--prompt-length "$(if $(PROMPT_LENGTH),$(PROMPT_LENGTH),8)" \
+		$(if $(CUDA),--cuda)
+
+instattention-tinyllama-reference-test:
+	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_reference.py \
+		--model-dir "$(MODEL_DIR)" \
+		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
+		--prompt-length "$(if $(PROMPT_LENGTH),$(PROMPT_LENGTH),8)" \
+		--atol "$(if $(ATOL),$(ATOL),1e-4)" \
+		--rtol "$(if $(RTOL),$(RTOL),1e-4)" \
+		$(if $(CUDA),--cuda)
+
+instattention-tinyllama-decode-reference-test:
+	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_decode_reference.py \
+		--model-dir "$(MODEL_DIR)" \
+		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
+		--prompt-length "$(if $(PROMPT_LENGTH),$(PROMPT_LENGTH),8)" \
+		--atol "$(if $(ATOL),$(ATOL),1e-4)" \
+		--rtol "$(if $(RTOL),$(RTOL),1e-4)" \
+		$(if $(CUDA),--cuda)
+
+instattention-tinyllama-cemu-gpu-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_cemu_pipeline.py \
+		--model-dir "$(MODEL_DIR)" \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--csd-target "$(if $(CSD_TARGET),$(CSD_TARGET),cuda)" \
+		--program "$(if $(PROGRAM),$(PROGRAM),$(if $(filter cpu,$(CSD_TARGET)),./build/dense_attention.so,./build/dense_attention_devptr.so))" \
+		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
+		--prompt-length "$(if $(PROMPT_LENGTH),$(PROMPT_LENGTH),8)" \
+		$(if $(PROMPT_TEXT),--prompt-text "$(PROMPT_TEXT)") \
+		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),1)" \
+		--staging-tokens "$(if $(STAGING_TOKENS),$(STAGING_TOKENS),0)" \
+		--atol "$(if $(ATOL),$(ATOL),1e-3)" \
+		--rtol "$(if $(RTOL),$(RTOL),1e-3)"
+
 instattention-flexgen-cemu-gpu-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_flexgen_cemu_pipeline.py \
 		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
-		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)"
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),4)" \
+		--num-layers "$(if $(NUM_LAYERS),$(NUM_LAYERS),2)" \
+		--hidden-size "$(if $(HIDDEN_SIZE),$(HIDDEN_SIZE),16)" \
+		--num-attention-heads "$(if $(QUERY_HEADS),$(QUERY_HEADS),4)" \
+		--num-key-value-heads "$(if $(KV_HEADS),$(KV_HEADS),2)" \
+		--staging-tokens "$(if $(STAGING_TOKENS),$(STAGING_TOKENS),0)"
 
 instattention-attention-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_attention.py --nvm-dir "$(NVM_TEST_DIR)" --fdm-dir "$(FDM_TEST_DIR)"

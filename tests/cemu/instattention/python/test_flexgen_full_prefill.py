@@ -207,6 +207,7 @@ class FlexGenFullPrefillTest(unittest.TestCase):
 
     def _write_model_weights(self):
         hidden_size = self.config.hidden_size
+        kv_hidden_size = self.config.num_key_value_heads * self.config.head_dim
         intermediate_size = self.config.intermediate_size
         self._write_random_weight(
             "embed_tokens.weight",
@@ -220,10 +221,15 @@ class FlexGenFullPrefillTest(unittest.TestCase):
 
         for layer in range(self.config.num_hidden_layers):
             prefix = f"layers.{layer}."
-            for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            for projection in ("q_proj", "o_proj"):
                 self._write_random_weight(
                     prefix + f"self_attn.{projection}.weight",
                     (hidden_size, hidden_size),
+                )
+            for projection in ("k_proj", "v_proj"):
+                self._write_random_weight(
+                    prefix + f"self_attn.{projection}.weight",
+                    (kv_hidden_size, hidden_size),
                 )
             self._write_random_weight(
                 prefix + "input_layernorm.weight",

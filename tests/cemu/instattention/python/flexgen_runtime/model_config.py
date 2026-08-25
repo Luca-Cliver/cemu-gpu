@@ -45,8 +45,16 @@ class FlexGenLlamaConfig:
             raise ValueError("num_attention_heads must divide hidden_size")
 
         num_key_value_heads = self.num_key_value_heads or self.num_attention_heads
-        if num_key_value_heads != self.num_attention_heads:
-            raise ValueError("the current FlexGen Prefill path supports MHA, not GQA")
+        if (
+            not isinstance(num_key_value_heads, int)
+            or isinstance(num_key_value_heads, bool)
+            or num_key_value_heads <= 0
+        ):
+            raise ValueError("num_key_value_heads must be a positive integer")
+        if self.num_attention_heads % num_key_value_heads != 0:
+            raise ValueError(
+                "num_key_value_heads must divide num_attention_heads"
+            )
         object.__setattr__(self, "num_key_value_heads", num_key_value_heads)
         if self.dtype not in (torch.float16, torch.float32, torch.bfloat16):
             raise ValueError("unsupported model dtype")
@@ -54,6 +62,10 @@ class FlexGenLlamaConfig:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
+
+    @property
+    def num_key_value_groups(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
 
     @classmethod
     def from_json(cls, path: Any):
