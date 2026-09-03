@@ -4,8 +4,10 @@ import argparse
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -18,6 +20,7 @@ from flexgen_runtime import (
     FlexGenDecodeRunner,
     FlexGenGenerationRunner,
     FlexGenLlamaConfig,
+    FlexGenMultiBatchDecodeRunner,
     FlexGenPrefillRunner,
     FlexGenTorchAttentionBackend,
     FlexGenWeightLoader,
@@ -25,6 +28,106 @@ from flexgen_runtime import (
 
 
 TEST_DEVICE = torch.device("cpu")
+
+
+class PipelineRequest:
+    def __init__(self, layer, output):
+        self.layer = layer
+        self.output = output
+
+
+class OrderedPipelineBackend:
+    supports_pipelined_decode = True
+
+    def __init__(self):
+        self.events = []
+        self.first_submit = threading.Event()
+
+    def prefetch_decode(self, layer, history_tokens):
+        self.events.append(("prefetch", layer))
+        return SimpleNamespace(layer=layer, history_tokens=history_tokens)
+
+    def submit_prefetched_decode(
+        self,
+        prefetch,
+        layer,
+        token,
+        query,
+        key,
+        value,
+        valid_tokens,
+    ):
+        self.events.append(("submit", layer))
+        if layer == 0:
+            self.first_submit.set()
+        output = np.zeros(tuple(query.shape), dtype=np.float32)
+        return PipelineRequest(layer, output)
+
+    def wait_decode(self, request):
+        self.events.append(("wait", request.layer))
+        return request.output
+
+    def append_decode(self, layer, token, key, value):
+        raise AssertionError("the pipelined path must not use synchronous append")
+
+    def decode(self, layer, query, valid_tokens):
+        raise AssertionError("the pipelined path must not use synchronous decode")
+
+
+class OrderedMicrobatchPipelineBackend:
+    supports_pipelined_decode = True
+
+    def __init__(self, microbatch, events):
+        self.microbatch = microbatch
+        self.events = events
+
+    def prefetch_decode(self, layer, history_tokens):
+        self.events.append(("prefetch", layer, self.microbatch))
+        return SimpleNamespace(
+            layer=layer,
+            history_tokens=history_tokens,
+            microbatch=self.microbatch,
+        )
+
+    def submit_prefetched_decode(
+        self,
+        prefetch,
+        layer,
+        token,
+        query,
+        key,
+        value,
+        valid_tokens,
+    ):
+        self.events.append(("submit", layer, self.microbatch))
+        return PipelineRequest(
+            layer,
+            np.zeros(tuple(query.shape), dtype=np.float32),
+        )
+
+    def wait_decode(self, request):
+        self.events.append(("wait", request.layer, self.microbatch))
+        return request.output
+
+    def append_decode(self, layer, token, key, value):
+        raise AssertionError("the pipelined path must not use synchronous append")
+
+    def decode(self, layer, query, valid_tokens):
+        raise AssertionError("the pipelined path must not use synchronous decode")
+
+
+class BlockingNextLayerWeightLoader(FlexGenWeightLoader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.next_layer_started = threading.Event()
+        self.release_next_layer = threading.Event()
+
+    def load_layer(self, layer):
+        if layer == 1:
+            self.next_layer_started.set()
+            if not self.release_next_layer.wait(timeout=5):
+                raise TimeoutError("test did not release next-layer weight loading")
+        return super().load_layer(layer)
 
 
 class FlexGenDecodeRuntimeTest(unittest.TestCase):
@@ -160,6 +263,208 @@ class FlexGenDecodeRuntimeTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             runner.run(torch.tensor([[1, 2]]), token_position=1)
+
+    def test_pipelined_decode_prefetches_next_layer_before_waiting(self):
+        loader = FlexGenWeightLoader(
+            self.config,
+            self.weight_directory,
+            device=self.device,
+        )
+        backend = OrderedPipelineBackend()
+
+        result = FlexGenDecodeRunner(
+            self.config,
+            loader,
+            backend,
+        ).run(
+            torch.tensor([[1], [2]], dtype=torch.long),
+            token_position=3,
+        )
+
+        self.assertEqual(result.next_token_ids.shape, (2, 1))
+        self.assertEqual(
+            backend.events,
+            [
+                ("prefetch", 0),
+                ("prefetch", 1),
+                ("submit", 0),
+                ("wait", 0),
+                ("submit", 1),
+                ("wait", 1),
+            ],
+        )
+
+    def test_current_qkv_advances_while_next_layer_weights_load(self):
+        loader = BlockingNextLayerWeightLoader(
+            self.config,
+            self.weight_directory,
+            device=self.device,
+        )
+        backend = OrderedPipelineBackend()
+        result = []
+        errors = []
+
+        def run_decode():
+            try:
+                result.append(
+                    FlexGenDecodeRunner(
+                        self.config,
+                        loader,
+                        backend,
+                    ).run(
+                        torch.tensor([[1], [2]], dtype=torch.long),
+                        token_position=3,
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=run_decode, name="decode-overlap-test")
+        thread.start()
+        try:
+            self.assertTrue(loader.next_layer_started.wait(timeout=5))
+            self.assertTrue(backend.first_submit.wait(timeout=5))
+            self.assertTrue(thread.is_alive())
+            self.assertIn(("submit", 0), backend.events)
+        finally:
+            loader.release_next_layer.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result), 1)
+
+    def test_multi_batch_pipeline_advances_microbatch_before_waiting(self):
+        loader = FlexGenWeightLoader(
+            self.config,
+            self.weight_directory,
+            device=self.device,
+        )
+        events = []
+        backends = tuple(
+            OrderedMicrobatchPipelineBackend(microbatch, events)
+            for microbatch in range(2)
+        )
+
+        result = FlexGenMultiBatchDecodeRunner(
+            self.config,
+            loader,
+            backends,
+            gpu_batch_size=1,
+        ).run(
+            torch.tensor([[1], [2]], dtype=torch.long),
+            token_position=3,
+            collect_layer_outputs=True,
+        )
+
+        self.assertEqual(result.next_token_ids.shape, (2, 1))
+        self.assertEqual(len(result.layer_outputs), 2)
+        self.assertEqual(
+            events,
+            [
+                ("prefetch", 0, 0),
+                ("prefetch", 0, 1),
+                ("submit", 0, 0),
+                ("prefetch", 1, 0),
+                ("submit", 0, 1),
+                ("wait", 0, 0),
+                ("wait", 0, 1),
+                ("prefetch", 1, 1),
+                ("submit", 1, 0),
+                ("submit", 1, 1),
+                ("wait", 1, 0),
+                ("wait", 1, 1),
+            ],
+        )
+
+    def test_multi_batch_decode_matches_full_batch_reference(self):
+        loader = FlexGenWeightLoader(
+            self.config,
+            self.weight_directory,
+            device=self.device,
+        )
+        prompt = torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            dtype=torch.long,
+        )
+        prefill = FlexGenPrefillRunner(
+            self.config,
+            loader,
+        ).run(prompt, collect_kv_cache=True)
+        full_backend = FlexGenTorchAttentionBackend(
+            self.config,
+            prefill.kv_cache,
+        )
+        full_result = FlexGenDecodeRunner(
+            self.config,
+            loader,
+            full_backend,
+        ).run(
+            prefill.next_token_ids,
+            token_position=prompt.shape[1],
+            collect_layer_outputs=True,
+        )
+
+        gpu_batch_size = 2
+        microbatch_caches = [[], []]
+        for keys, values in prefill.kv_cache:
+            token_count = keys.shape[0]
+            keys = keys.reshape(
+                token_count,
+                prompt.shape[0],
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            )
+            values = values.reshape_as(keys)
+            for microbatch in range(2):
+                batch_start = microbatch * gpu_batch_size
+                batch_end = batch_start + gpu_batch_size
+                microbatch_caches[microbatch].append(
+                    (
+                        keys[:, batch_start:batch_end].reshape(
+                            token_count,
+                            gpu_batch_size * self.config.num_key_value_heads,
+                            self.config.head_dim,
+                        ),
+                        values[:, batch_start:batch_end].reshape(
+                            token_count,
+                            gpu_batch_size * self.config.num_key_value_heads,
+                            self.config.head_dim,
+                        ),
+                    )
+                )
+        microbatch_backends = tuple(
+            FlexGenTorchAttentionBackend(self.config, cache)
+            for cache in microbatch_caches
+        )
+        multi_result = FlexGenMultiBatchDecodeRunner(
+            self.config,
+            loader,
+            microbatch_backends,
+            gpu_batch_size=gpu_batch_size,
+        ).run(
+            prefill.next_token_ids,
+            token_position=prompt.shape[1],
+            collect_layer_outputs=True,
+        )
+
+        torch.testing.assert_close(multi_result.hidden_states, full_result.hidden_states)
+        torch.testing.assert_close(multi_result.logits, full_result.logits)
+        torch.testing.assert_close(
+            multi_result.next_token_ids,
+            full_result.next_token_ids,
+        )
+        for multi_layer, full_layer in zip(
+            multi_result.layer_outputs,
+            full_result.layer_outputs,
+        ):
+            torch.testing.assert_close(multi_layer.query, full_layer.query)
+            torch.testing.assert_close(multi_layer.key, full_layer.key)
+            torch.testing.assert_close(multi_layer.value, full_layer.value)
+            torch.testing.assert_close(
+                multi_layer.attention_output,
+                full_layer.attention_output,
+            )
 
     def test_gqa_prefill_and_decode_keep_compact_kv_cache(self):
         config = self._write_test_model(

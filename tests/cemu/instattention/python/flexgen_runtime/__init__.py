@@ -11,11 +11,13 @@ from .generation import (
     FlexGenGenerationStep,
 )
 from .hf_checkpoint import FlexGenHfCheckpointLoader
+from .multi_batch_decode import FlexGenMultiBatchDecodeRunner
 from .model_config import FlexGenLlamaConfig
 from .prefill import FlexGenPrefillOutput, run_flexgen_prefill
 from .prefill_runner import FlexGenFullPrefillResult, FlexGenPrefillRunner
 from .reference import FlexGenTorchAttentionBackend
 from .weights import FlexGenWeightLoader
+from .weight_prefetch import FlexGenWeightPrefetcher, FlexGenWeightRequest
 
 __all__ = [
     "FlexGenDecodeAttentionOutput",
@@ -28,10 +30,13 @@ __all__ = [
     "FlexGenHfCheckpointLoader",
     "FlexGenFullPrefillResult",
     "FlexGenLlamaConfig",
+    "FlexGenMultiBatchDecodeRunner",
     "FlexGenPrefillOutput",
     "FlexGenPrefillRunner",
     "FlexGenTorchAttentionBackend",
     "FlexGenWeightLoader",
+    "FlexGenWeightPrefetcher",
+    "FlexGenWeightRequest",
     "finish_flexgen_decode_attention",
     "prepare_flexgen_decode_attention",
     "run_flexgen_prefill",

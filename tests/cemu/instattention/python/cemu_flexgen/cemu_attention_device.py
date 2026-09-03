@@ -91,6 +91,7 @@ class CemuAttentionDevice:
         runtime_scale_tenths: int = 0,
         replace_program: bool = False,
         replace_staging_files: bool = False,
+        runtime_model: Optional[Any] = None,
         logger: Optional[Callable[[str], None]] = None,
     ):
         if not isinstance(layout, KvCacheLayout):
@@ -99,9 +100,14 @@ class CemuAttentionDevice:
             raise TypeError("buffers must be an AttentionBufferConfig")
         if logger is not None and not callable(logger):
             raise TypeError("logger must be callable")
+        if runtime_model is not None and not callable(
+            getattr(runtime_model, "estimate", None)
+        ):
+            raise TypeError("runtime_model must provide an estimate method")
 
         self.layout = layout
         self.buffers = buffers
+        self.runtime_model = runtime_model
         self.logger = logger
         self.ranges = buffers.range_specs()
         self.staging = KvStagingManager(
@@ -190,35 +196,104 @@ class CemuAttentionDevice:
         write_query: bool = True,
         read_output: bool = True,
     ) -> Optional[np.ndarray]:
+        self.stage_chunk(chunk)
+        self.execute_staged_chunk(
+            query,
+            chunk,
+            metadata,
+            write_query=write_query,
+        )
+        if not read_output:
+            return None
+        return self.collect_output(metadata)
+
+    def execute_staged_chunk(
+        self,
+        query: Any,
+        chunk: KvChunk,
+        metadata: DenseAttentionMetadata,
+        write_query: bool = True,
+    ) -> int:
+        """Execute one Attention chunk already loaded in the FDM staging ranges."""
         device = self._require_device()
         if not isinstance(metadata, DenseAttentionMetadata):
             raise TypeError("metadata must be DenseAttentionMetadata")
         metadata.validate_chunk(self.layout, chunk)
+        if self.staging.last_chunk != chunk:
+            raise RuntimeError("the requested KV chunk is not staged in FDM")
 
         query_array = np.ascontiguousarray(query)
-        if query_array.dtype != np.dtype(np.float32):
-            raise TypeError("dense Attention query must use float32")
+        if query_array.dtype != metadata.dtype:
+            raise TypeError(
+                f"dense Attention query must use {metadata.dtype}, "
+                f"got {query_array.dtype}"
+            )
         if query_array.shape != metadata.query_shape:
             raise ValueError(
                 f"query shape {query_array.shape} does not match "
                 f"{metadata.query_shape}"
             )
 
-        self.stage_chunk(chunk)
         if write_query:
             device.write_tensor(AttentionRange.QUERY, query_array)
-        device.execute(metadata=metadata.pack())
+        runtime_ns = self._estimate_runtime_ns(metadata)
+        device.execute(runtime=runtime_ns, metadata=metadata.pack())
         self._log(
             f"execute chunk_tokens={chunk.token_count}, "
-            f"reset={metadata.reset_state}, finalize={metadata.finalize}"
+            f"reset={metadata.reset_state}, finalize={metadata.finalize}, "
+            f"modeled_runtime_ns={runtime_ns}"
         )
-        if not read_output:
-            return None
-        return device.read_tensor(
+        return runtime_ns
+
+    def append_staged_token(self, key: Any, value: Any) -> KvChunk:
+        device = self._require_device()
+        chunk = self.staging.last_chunk
+        if chunk is None:
+            raise RuntimeError("no historical KV chunk is staged")
+        if chunk.start_token != 0:
+            raise ValueError("a prefetched Decode chunk must start at token zero")
+        if chunk.end_token >= self.layout.config.max_seq_len:
+            raise ValueError("the staged KV chunk has no room for another token")
+
+        key_array = self._normalize_cache_token("key", key)
+        value_array = self._normalize_cache_token("value", value)
+        range_offset = chunk.token_count * self.layout.token_stride
+        device.write_tensor(
+            AttentionRange.KEY_STAGING,
+            self._pack_cache_token(key_array),
+            range_offset=range_offset,
+        )
+        device.write_tensor(
+            AttentionRange.VALUE_STAGING,
+            self._pack_cache_token(value_array),
+            range_offset=range_offset,
+        )
+
+        extended_chunk = KvChunk(
+            layer=chunk.layer,
+            start_token=chunk.start_token,
+            token_count=chunk.token_count + 1,
+            nvm_offset=chunk.nvm_offset,
+            copy_size=chunk.copy_size + self.layout.token_stride,
+        )
+        self.staging.record_staged_chunk(extended_chunk)
+        self._log(
+            f"append staged layer={chunk.layer}, token={chunk.token_count}, "
+            f"offset={range_offset}"
+        )
+        return extended_chunk
+
+    def collect_output(self, metadata: DenseAttentionMetadata) -> np.ndarray:
+        """Collect the finalized Attention output from the CEMU output range."""
+        if not isinstance(metadata, DenseAttentionMetadata):
+            raise TypeError("metadata must be DenseAttentionMetadata")
+        output = self._require_device().read_tensor(
             AttentionRange.OUTPUT,
             metadata.output_shape,
-            np.float32,
+            metadata.dtype,
         )
+        self._log(f"collect output={output.shape}")
+        return output
 
     def run_decode(
         self,
@@ -228,8 +303,11 @@ class CemuAttentionDevice:
     ) -> np.ndarray:
         """Run one decode query by serially processing all KV chunks."""
         query_array = np.ascontiguousarray(query)
-        if query_array.dtype != np.dtype(np.float32):
-            raise TypeError("dense Attention query must use float32")
+        if query_array.dtype != self.layout.config.dtype:
+            raise TypeError(
+                f"dense Attention query must use {self.layout.config.dtype}, "
+                f"got {query_array.dtype}"
+            )
         if query_array.ndim != 3:
             raise ValueError("decode query must have shape [batch, heads, dim]")
 
@@ -264,11 +342,7 @@ class CemuAttentionDevice:
                 read_output=False,
             )
 
-        output = self.device.read_tensor(
-            AttentionRange.OUTPUT,
-            metadata.output_shape,
-            np.float32,
-        )
+        output = self.collect_output(metadata)
         self._log(f"decode complete output={output.shape}")
         return output
 
@@ -289,6 +363,48 @@ class CemuAttentionDevice:
         if self._device is None:
             raise RuntimeError("CEMU attention device is not open")
         return self._device
+
+    def _estimate_runtime_ns(self, metadata: DenseAttentionMetadata) -> int:
+        if self.runtime_model is None:
+            return 0
+        estimate = self.runtime_model.estimate(
+            batch_size=metadata.batch_size,
+            num_query_heads=metadata.num_query_heads,
+            head_dim=metadata.head_dim,
+            token_count=metadata.token_count,
+        )
+        runtime_ns = getattr(estimate, "total_ns", estimate)
+        if (
+            not isinstance(runtime_ns, int)
+            or isinstance(runtime_ns, bool)
+            or runtime_ns < 0
+            or runtime_ns > 0xFFFFFFFF
+        ):
+            raise ValueError("estimated runtime must fit in an unsigned 32-bit integer")
+        return runtime_ns
+
+    def _normalize_cache_token(self, name: str, value: Any) -> np.ndarray:
+        array = np.ascontiguousarray(value)
+        expected_shape = (
+            self.layout.config.batch_size,
+            self.layout.config.num_kv_heads,
+            self.layout.config.head_dim,
+        )
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"{name} shape {array.shape} does not match {expected_shape}"
+            )
+        if array.dtype != self.layout.config.dtype:
+            raise TypeError(
+                f"{name} dtype {array.dtype} does not match "
+                f"{self.layout.config.dtype}"
+            )
+        return array
+
+    def _pack_cache_token(self, token: np.ndarray) -> np.ndarray:
+        storage = np.zeros(self.layout.token_stride, dtype=np.uint8)
+        storage[: self.layout.token_bytes] = token.view(np.uint8).reshape(-1)
+        return storage
 
     def _log(self, message: str) -> None:
         if self.logger is not None:

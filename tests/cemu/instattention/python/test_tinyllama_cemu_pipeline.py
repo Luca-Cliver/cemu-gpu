@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
+import os
+import statistics
 import sys
 import tempfile
+import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -13,24 +18,38 @@ import torch
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR / "build-guest"))
 sys.path.insert(0, str(PROJECT_DIR / "python"))
+sys.path.insert(0, str(PROJECT_DIR))
 
 from cemu_flexgen import (
     AttentionBufferConfig,
     CemuAttentionDevice,
+    CemuAttentionSlotScheduler,
+    CemuAttentionSharedWorkers,
     KvCacheLayout,
     KvCacheStore,
     KvLayoutConfig,
     align_up,
 )
-from flexgen_adapter import FlexGenAttentionBackend
+from flexgen_adapter import FlexGenAttentionBackend, FlexGenMicrobatchKvWriter
 from flexgen_runtime import (
     FlexGenDecodeRunner,
     FlexGenGenerationRunner,
     FlexGenHfCheckpointLoader,
     FlexGenLlamaConfig,
+    FlexGenMultiBatchDecodeRunner,
     FlexGenPrefillRunner,
     FlexGenTorchAttentionBackend,
 )
+from experiments import PipelineTrace
+
+
+_LOG_START_NS = time.perf_counter_ns()
+_TIMELINE_ENABLED = os.environ.get("CEMU_PIPELINE_TIMELINE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_LOG_LOCK = threading.Lock()
 
 
 def positive_integer(value):
@@ -78,6 +97,11 @@ def parse_args():
         help="functional-model backend used only for CSD Attention",
     )
     parser.add_argument("--batch-size", type=positive_integer, default=1)
+    parser.add_argument(
+        "--gpu-batch-size",
+        type=positive_integer,
+        help="sequences handled by each independent GPU microbatch",
+    )
     parser.add_argument("--prompt-length", type=positive_integer, default=8)
     parser.add_argument(
         "--prompt-text",
@@ -88,18 +112,185 @@ def parse_args():
     )
     parser.add_argument("--decode-steps", type=positive_integer, default=1)
     parser.add_argument("--staging-tokens", type=nonnegative_integer, default=0)
+    parser.add_argument("--attention-slots", type=positive_integer, default=2)
     parser.add_argument("--atol", type=nonnegative_float, default=1e-3)
     parser.add_argument("--rtol", type=nonnegative_float, default=1e-3)
+    parser.add_argument(
+        "--trace-file",
+        type=Path,
+        help="record low-overhead Guest pipeline events and overlap analysis as CSV",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="skip correctness/reference work and measure the CEMU pipeline only",
+    )
+    parser.add_argument(
+        "--warmup-iterations",
+        type=nonnegative_integer,
+        default=1,
+    )
+    parser.add_argument("--iterations", type=positive_integer, default=5)
+    parser.add_argument(
+        "--benchmark-output",
+        type=Path,
+        default=PROJECT_DIR / "results" / "tinyllama-cemu-benchmark.csv",
+    )
     return parser.parse_args()
 
 
 def log(message):
-    print(message, flush=True)
+    with _LOG_LOCK:
+        if _TIMELINE_ENABLED:
+            elapsed_us = (time.perf_counter_ns() - _LOG_START_NS) / 1000.0
+            thread_name = threading.current_thread().name
+            print(
+                f"[pipeline-time][{elapsed_us:14.3f} us][{thread_name}] {message}",
+                flush=True,
+            )
+        else:
+            print(message, flush=True)
 
 
 def synchronize(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def make_cemu_decode_runner(
+    config,
+    loader,
+    cemu_backends,
+    gpu_batch_size,
+    logger,
+):
+    if len(cemu_backends) > 1:
+        return FlexGenMultiBatchDecodeRunner(
+            config,
+            loader,
+            cemu_backends,
+            gpu_batch_size=gpu_batch_size,
+            logger=logger,
+        )
+    return FlexGenDecodeRunner(
+        config,
+        loader,
+        cemu_backends[0],
+        logger=logger,
+    )
+
+
+def open_attention_schedulers(
+    stack,
+    attention_schedulers,
+    attention_slots_by_batch,
+    num_gpu_batches,
+):
+    for scheduler in attention_schedulers:
+        stack.enter_context(scheduler)
+    attention_slots = tuple(
+        slot for slots in attention_slots_by_batch for slot in slots
+    )
+    program_ids = tuple(slot.program_id for slot in attention_slots)
+    mrs_ids = tuple(slot.memory_range_set_id for slot in attention_slots)
+    if len(set(program_ids)) != len(program_ids):
+        raise AssertionError("CEMU Attention slots must use distinct programs")
+    if len(set(mrs_ids)) != len(mrs_ids):
+        raise AssertionError("CEMU Attention slots must use distinct MRS IDs")
+    if any(slot.memory_range_count != 5 for slot in attention_slots):
+        raise AssertionError("each CEMU Attention slot must create exactly five ranges")
+    log(
+        f"[tinyllama-cemu] Attention slots ready: programs={program_ids}, "
+        f"MRS={mrs_ids}, ranges={5 * len(attention_slots)}, "
+        f"gpu_batches={num_gpu_batches}"
+    )
+
+
+def run_pipeline_benchmark(
+    args,
+    token_ids,
+    prompt_length,
+    prefill_runner,
+    cemu_runner,
+    kv_writer,
+    device,
+):
+    rows = []
+    total_iterations = args.warmup_iterations + args.iterations
+    generation_runner = FlexGenGenerationRunner(cemu_runner, logger=None)
+    log(
+        f"[tinyllama-benchmark] warmup={args.warmup_iterations}, "
+        f"iterations={args.iterations}; checkpoint loading and CEMU setup excluded"
+    )
+    for sequence in range(total_iterations):
+        measured_iteration = sequence - args.warmup_iterations
+        is_warmup = measured_iteration < 0
+
+        synchronize(device)
+        total_start = time.perf_counter_ns()
+        prefill_start = total_start
+        prefill_result = prefill_runner.run(token_ids, collect_kv_cache=False)
+        kv_writer.flush()
+        synchronize(device)
+        prefill_end = time.perf_counter_ns()
+
+        generation = generation_runner.run(
+            prefill_result.next_token_ids,
+            start_position=prompt_length,
+            decode_steps=args.decode_steps,
+            collect_layer_outputs=False,
+        )
+        kv_writer.flush()
+        synchronize(device)
+        decode_end = time.perf_counter_ns()
+
+        prefill_seconds = (prefill_end - prefill_start) / 1e9
+        decode_seconds = (decode_end - prefill_end) / 1e9
+        total_seconds = (decode_end - total_start) / 1e9
+        generated_tokens = args.batch_size * args.decode_steps
+        del generation, prefill_result
+
+        label = "warmup" if is_warmup else f"iteration={measured_iteration}"
+        log(
+            f"[tinyllama-benchmark] {label}: prefill={prefill_seconds:.6f}s, "
+            f"decode={decode_seconds:.6f}s, total={total_seconds:.6f}s"
+        )
+        if not is_warmup:
+            rows.append(
+                {
+                    "iteration": measured_iteration,
+                    "csd_target": args.csd_target,
+                    "batch_size": args.batch_size,
+                    "gpu_batch_size": args.gpu_batch_size or args.batch_size,
+                    "prompt_tokens": prompt_length,
+                    "decode_steps": args.decode_steps,
+                    "prefill_seconds": prefill_seconds,
+                    "decode_seconds": decode_seconds,
+                    "total_seconds": total_seconds,
+                    "decode_ms_per_step": decode_seconds * 1000.0 / args.decode_steps,
+                    "decode_ms_per_token": decode_seconds * 1000.0 / generated_tokens,
+                    "decode_tokens_per_second": generated_tokens / decode_seconds,
+                }
+            )
+
+    output_path = args.benchmark_output.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=tuple(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    for metric in ("prefill_seconds", "decode_seconds", "total_seconds"):
+        values = [row[metric] for row in rows]
+        log(
+            f"[tinyllama-benchmark] {metric}: median={statistics.median(values):.6f}s, "
+            f"min={min(values):.6f}s, max={max(values):.6f}s"
+        )
+    throughput = [row["decode_tokens_per_second"] for row in rows]
+    log(
+        "[tinyllama-benchmark] decode throughput: "
+        f"median={statistics.median(throughput):.3f} token/s; CSV={output_path}"
+    )
 
 
 def require_directory(name, path):
@@ -203,16 +394,25 @@ def preload_weights(loader, config, device):
     return elapsed
 
 
-def cache_to_numpy(value, layout, token_count):
+def cache_to_numpy(
+    value,
+    layout,
+    token_count,
+    total_batch_size=None,
+    batch_start=0,
+):
+    total_batch_size = total_batch_size or layout.config.batch_size
+    batch_end = batch_start + layout.config.batch_size
     return (
         value.detach()
         .cpu()
         .reshape(
             token_count,
-            layout.config.batch_size,
+            total_batch_size,
             layout.config.num_kv_heads,
             layout.config.head_dim,
-        )
+        )[:, batch_start:batch_end]
+        .contiguous()
         .numpy()
     )
 
@@ -237,90 +437,109 @@ def assert_tensor_close(name, actual, expected, atol, rtol):
     return maximum, mean
 
 
-def verify_prefill_storage(layout, cache_path, value_path, prefill_result):
+def verify_prefill_storage(
+    layouts,
+    cache_paths,
+    prefill_result,
+    total_batch_size,
+):
+    layout = layouts[0]
     if prefill_result.kv_cache is None:
         raise AssertionError("Prefill did not return a KV cache for validation")
     if len(prefill_result.kv_cache) != layout.config.num_layers:
         raise AssertionError("Prefill KV layer count does not match the CEMU layout")
     layers = sorted({0, layout.config.num_layers - 1})
     token_count = prefill_result.kv_cache[0][0].shape[0]
-    with KvCacheStore(layout, cache_path, value_path) as store:
-        for layer in layers:
-            stored_keys, stored_values = store.read_tokens(layer, 0, token_count)
-            expected_keys = cache_to_numpy(
-                prefill_result.kv_cache[layer][0],
-                layout,
-                token_count,
-            )
-            expected_values = cache_to_numpy(
-                prefill_result.kv_cache[layer][1],
-                layout,
-                token_count,
-            )
-            np.testing.assert_array_equal(stored_keys, expected_keys)
-            np.testing.assert_array_equal(stored_values, expected_values)
-            log(
-                f"[tinyllama-cemu] NVM Prefill layer={layer:02d} OK, "
-                f"K/V={stored_keys.shape}, K[:4]={stored_keys.reshape(-1)[:4].tolist()}"
-            )
+    for microbatch, (microbatch_layout, paths) in enumerate(
+        zip(layouts, cache_paths)
+    ):
+        batch_start = microbatch * microbatch_layout.config.batch_size
+        with KvCacheStore(microbatch_layout, *paths) as store:
+            for layer in layers:
+                stored_keys, stored_values = store.read_tokens(layer, 0, token_count)
+                expected_keys = cache_to_numpy(
+                    prefill_result.kv_cache[layer][0],
+                    microbatch_layout,
+                    token_count,
+                    total_batch_size,
+                    batch_start,
+                )
+                expected_values = cache_to_numpy(
+                    prefill_result.kv_cache[layer][1],
+                    microbatch_layout,
+                    token_count,
+                    total_batch_size,
+                    batch_start,
+                )
+                np.testing.assert_array_equal(stored_keys, expected_keys)
+                np.testing.assert_array_equal(stored_values, expected_values)
+                log(
+                    f"[tinyllama-cemu] NVM Prefill microbatch={microbatch}, "
+                    f"layer={layer:02d} OK, K/V={stored_keys.shape}, "
+                    f"K[:4]={stored_keys.reshape(-1)[:4].tolist()}"
+                )
 
 
 def verify_decode_storage(
-    layout,
-    cache_path,
-    value_path,
+    layouts,
+    cache_paths,
     generation,
     prompt_length,
+    total_batch_size,
 ):
+    layout = layouts[0]
     layers = sorted({0, layout.config.num_layers - 1})
     decode_steps = len(generation.steps)
-    with KvCacheStore(layout, cache_path, value_path) as store:
-        for layer in layers:
-            stored_keys, stored_values = store.read_tokens(
-                layer,
-                prompt_length,
-                decode_steps,
-            )
-            expected_keys = np.concatenate(
-                [
-                    cache_to_numpy(
-                        step.decode_result.layer_outputs[layer].key,
-                        layout,
-                        1,
-                    )
-                    for step in generation.steps
-                ],
-                axis=0,
-            )
-            expected_values = np.concatenate(
-                [
-                    cache_to_numpy(
-                        step.decode_result.layer_outputs[layer].value,
-                        layout,
-                        1,
-                    )
-                    for step in generation.steps
-                ],
-                axis=0,
-            )
-            np.testing.assert_array_equal(stored_keys, expected_keys)
-            np.testing.assert_array_equal(stored_values, expected_values)
-            log(
-                f"[tinyllama-cemu] NVM Decode layer={layer:02d} OK, "
-                f"tokens=[{prompt_length}, {prompt_length + decode_steps}), "
-                f"K[:4]={stored_keys.reshape(-1)[:4].tolist()}"
-            )
+    for microbatch, (microbatch_layout, paths) in enumerate(
+        zip(layouts, cache_paths)
+    ):
+        batch_start = microbatch * microbatch_layout.config.batch_size
+        with KvCacheStore(microbatch_layout, *paths) as store:
+            for layer in layers:
+                stored_keys, stored_values = store.read_tokens(
+                    layer,
+                    prompt_length,
+                    decode_steps,
+                )
+                expected_keys = np.concatenate(
+                    [
+                        cache_to_numpy(
+                            step.decode_result.layer_outputs[layer].key,
+                            microbatch_layout,
+                            1,
+                            total_batch_size,
+                            batch_start,
+                        )
+                        for step in generation.steps
+                    ],
+                    axis=0,
+                )
+                expected_values = np.concatenate(
+                    [
+                        cache_to_numpy(
+                            step.decode_result.layer_outputs[layer].value,
+                            microbatch_layout,
+                            1,
+                            total_batch_size,
+                            batch_start,
+                        )
+                        for step in generation.steps
+                    ],
+                    axis=0,
+                )
+                np.testing.assert_array_equal(stored_keys, expected_keys)
+                np.testing.assert_array_equal(stored_values, expected_values)
+                log(
+                    f"[tinyllama-cemu] NVM Decode microbatch={microbatch}, "
+                    f"layer={layer:02d} OK, tokens=[{prompt_length}, "
+                    f"{prompt_length + decode_steps}), "
+                    f"K[:4]={stored_keys.reshape(-1)[:4].tolist()}"
+                )
 
 
 def compare_generations(cemu_generation, reference_generation, atol, rtol):
     if len(cemu_generation.steps) != len(reference_generation.steps):
         raise AssertionError("Decode step count mismatch")
-    if not torch.equal(cemu_generation.token_ids, reference_generation.token_ids):
-        raise AssertionError(
-            "generated token sequence mismatch: "
-            f"CEMU={cemu_generation.token_ids.detach().cpu().tolist()}, "
-            f"reference={reference_generation.token_ids.detach().cpu().tolist()}"
-        )
 
     for cemu_step, reference_step in zip(
         cemu_generation.steps,
@@ -392,11 +611,22 @@ def compare_generations(cemu_generation, reference_generation, atol, rtol):
             f"next_tokens={cemu_result.next_token_ids.detach().cpu().reshape(-1).tolist()}"
         )
 
+    if not torch.equal(cemu_generation.token_ids, reference_generation.token_ids):
+        raise AssertionError(
+            "generated token sequence mismatch: "
+            f"CEMU={cemu_generation.token_ids.detach().cpu().tolist()}, "
+            f"reference={reference_generation.token_ids.detach().cpu().tolist()}"
+        )
+
 
 def main():
     args = parse_args()
+    if args.benchmark and args.trace_file is not None:
+        raise ValueError("--benchmark and --trace-file are separate measurement modes")
     if not torch.cuda.is_available():
         raise RuntimeError("PyTorch cannot access the Guest GPU")
+    if args.attention_slots < 2:
+        raise ValueError("the slot-scheduled CEMU path requires at least two slots")
 
     model_directory = require_directory("model directory", args.model_dir)
     nvm_root = require_directory("NVM directory", args.nvm_dir)
@@ -431,23 +661,40 @@ def main():
         )
         prompt_length = token_ids.shape[1]
     max_seq_len = prompt_length + args.decode_steps
+    gpu_batch_size = args.gpu_batch_size or args.batch_size
+    if gpu_batch_size > args.batch_size:
+        raise ValueError("gpu batch size cannot exceed the total batch size")
+    if args.batch_size % gpu_batch_size != 0:
+        raise ValueError("batch size must be divisible by gpu batch size")
+    num_gpu_batches = args.batch_size // gpu_batch_size
+    trace = PipelineTrace() if args.trace_file is not None else None
+    detail_logger = None if args.benchmark else (trace or log)
 
-    layout = KvCacheLayout(
-        KvLayoutConfig(
-            num_layers=config.num_hidden_layers,
-            max_seq_len=max_seq_len,
-            batch_size=args.batch_size,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            dtype=np.float32,
+    layouts = tuple(
+        KvCacheLayout(
+            KvLayoutConfig(
+                num_layers=config.num_hidden_layers,
+                max_seq_len=max_seq_len,
+                batch_size=gpu_batch_size,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                dtype=np.float32,
+            )
         )
+        for _ in range(num_gpu_batches)
     )
+    layout = layouts[0]
     staging_tokens = args.staging_tokens or max_seq_len
     if staging_tokens > max_seq_len:
         raise ValueError("staging tokens cannot exceed the configured sequence length")
+    if staging_tokens < max_seq_len:
+        raise ValueError(
+            "the current double-slot runtime requires one Attention chunk; "
+            "use --staging-tokens 0 or at least the full configured sequence length"
+        )
     staging_bytes = staging_tokens * layout.token_stride
     query_shape = (
-        args.batch_size,
+        gpu_batch_size,
         config.num_attention_heads,
         config.head_dim,
     )
@@ -462,13 +709,16 @@ def main():
         f"[tinyllama-cemu] layers={config.num_hidden_layers}, "
         f"hidden={config.hidden_size}, q_heads={config.num_attention_heads}, "
         f"kv_heads={config.num_key_value_heads}, head_dim={config.head_dim}, "
-        f"batch={args.batch_size}, prompt={prompt_length}, "
-        f"decode_steps={args.decode_steps}"
+        f"batch={args.batch_size}, gpu_batch_size={gpu_batch_size}, "
+        f"gpu_batches={num_gpu_batches}, prompt={prompt_length}, "
+        f"decode_steps={args.decode_steps}, attention_slots={args.attention_slots}"
     )
     log(
         f"[tinyllama-cemu] KV token_bytes={layout.token_bytes}, "
         f"token_stride={layout.token_stride}, layer_stride={layout.layer_stride}, "
-        f"K_file={layout.file_size}, V_file={layout.file_size}, "
+        f"K_file_per_gpu_batch={layout.file_size}, "
+        f"V_file_per_gpu_batch={layout.file_size}, "
+        f"KV_files={2 * num_gpu_batches}, "
         f"staging_tokens={staging_tokens}, staging_bytes={staging_bytes}"
     )
     if args.prompt_text is not None:
@@ -484,50 +734,86 @@ def main():
     ) as fdm_directory:
         nvm_path = Path(nvm_directory)
         fdm_path = Path(fdm_directory)
-        k_cache_path = nvm_path / "k_cache"
-        v_cache_path = nvm_path / "v_cache"
-        buffers = AttentionBufferConfig(
-            query_bytes=align_up(query_elements * np.dtype(np.float32).itemsize, 512),
-            staging_bytes=staging_bytes,
-            state_bytes=align_up(
-                args.batch_size
-                * config.num_attention_heads
-                * (config.head_dim + 2)
-                * np.dtype(np.float32).itemsize,
-                512,
-            ),
-            output_bytes=align_up(
-                query_elements * np.dtype(np.float32).itemsize,
-                512,
-            ),
-            query_path=fdm_path / "attention_query",
-            k_staging_path=fdm_path / "k_staging_0",
-            v_staging_path=fdm_path / "v_staging_0",
-            state_path=fdm_path / "attention_state",
-            output_path=fdm_path / "attention_output",
+        cache_paths = tuple(
+            (
+                nvm_path / f"k_cache_{microbatch}",
+                nvm_path / f"v_cache_{microbatch}",
+            )
+            for microbatch in range(num_gpu_batches)
         )
-        attention_device = CemuAttentionDevice(
-            layout=layout,
-            buffers=buffers,
-            program_name=f"tinyllama_cemu_attention_{args.csd_target}",
-            program_path=program_reference,
-            function_name="dense_attention",
-            k_cache_path=k_cache_path,
-            v_cache_path=v_cache_path,
-            control_path=args.control,
-            namespace_path=args.namespace,
-            cuda_target=args.csd_target == "cuda",
-            replace_program=True,
-            replace_staging_files=True,
-            logger=log,
+        query_bytes = align_up(
+            query_elements * np.dtype(np.float32).itemsize,
+            512,
         )
-        cemu_backend = FlexGenAttentionBackend(
-            layout=layout,
-            k_cache_path=k_cache_path,
-            v_cache_path=v_cache_path,
-            attention_device=attention_device,
-            replace_existing=True,
-            logger=log,
+        state_bytes = align_up(
+            gpu_batch_size
+            * config.num_attention_heads
+            * (config.head_dim + 2)
+            * np.dtype(np.float32).itemsize,
+            512,
+        )
+        attention_slots_by_batch = tuple(
+            tuple(
+                CemuAttentionDevice(
+                    layout=layouts[microbatch],
+                    buffers=AttentionBufferConfig(
+                        query_bytes=query_bytes,
+                        staging_bytes=staging_bytes,
+                        state_bytes=state_bytes,
+                        output_bytes=query_bytes,
+                        query_path=fdm_path
+                        / f"mb_{microbatch}_slot_{slot}_query",
+                        k_staging_path=fdm_path
+                        / f"mb_{microbatch}_slot_{slot}_k_staging",
+                        v_staging_path=fdm_path
+                        / f"mb_{microbatch}_slot_{slot}_v_staging",
+                        state_path=fdm_path
+                        / f"mb_{microbatch}_slot_{slot}_state",
+                        output_path=fdm_path
+                        / f"mb_{microbatch}_slot_{slot}_output",
+                    ),
+                    program_name=(
+                        f"cemu_attention_{args.csd_target}_mb_{microbatch}_"
+                        f"slot_{slot}"
+                    ),
+                    program_path=program_reference,
+                    function_name="dense_attention",
+                    k_cache_path=cache_paths[microbatch][0],
+                    v_cache_path=cache_paths[microbatch][1],
+                    control_path=args.control,
+                    namespace_path=args.namespace,
+                    cuda_target=args.csd_target == "cuda",
+                    replace_program=True,
+                    replace_staging_files=True,
+                    logger=detail_logger,
+                )
+                for slot in range(args.attention_slots)
+            )
+            for microbatch in range(num_gpu_batches)
+        )
+        shared_csd_workers = CemuAttentionSharedWorkers(logger=detail_logger)
+        attention_schedulers = tuple(
+            CemuAttentionSlotScheduler(
+                slots,
+                workers=shared_csd_workers,
+                logger=detail_logger,
+            )
+            for slots in attention_slots_by_batch
+        )
+        cemu_backends = tuple(
+            FlexGenAttentionBackend(
+                layout=layouts[microbatch],
+                k_cache_path=cache_paths[microbatch][0],
+                v_cache_path=cache_paths[microbatch][1],
+                attention_scheduler=attention_schedulers[microbatch],
+                replace_existing=True,
+                logger=detail_logger,
+            )
+            for microbatch in range(num_gpu_batches)
+        )
+        kv_writer = FlexGenMicrobatchKvWriter(
+            cemu_backends,
+            logger=detail_logger,
         )
 
         with torch.inference_mode(), FlexGenHfCheckpointLoader(
@@ -535,25 +821,54 @@ def main():
             model_directory,
             device=device,
             cache_layers=True,
-        ) as loader, cemu_backend:
+        ) as loader, ExitStack() as backend_stack, kv_writer:
+            for backend in cemu_backends:
+                backend_stack.enter_context(backend)
             preload_weights(loader, config, device)
+
+            prefill_runner = FlexGenPrefillRunner(
+                config,
+                loader,
+                kv_writer=kv_writer,
+                logger=detail_logger,
+            )
+            cemu_runner = make_cemu_decode_runner(
+                config,
+                loader,
+                cemu_backends,
+                gpu_batch_size,
+                detail_logger,
+            )
+
+            if args.benchmark:
+                with ExitStack() as scheduler_stack:
+                    open_attention_schedulers(
+                        scheduler_stack,
+                        attention_schedulers,
+                        attention_slots_by_batch,
+                        num_gpu_batches,
+                    )
+                    run_pipeline_benchmark(
+                        args,
+                        token_ids,
+                        prompt_length,
+                        prefill_runner,
+                        cemu_runner,
+                        kv_writer,
+                        device,
+                    )
+                return
 
             log(
                 "[tinyllama-cemu] step 2/8: Guest GPU Prefill and persist all "
                 "layer K/V to CEMU NVM"
-            )
-            prefill_runner = FlexGenPrefillRunner(
-                config,
-                loader,
-                kv_writer=cemu_backend,
-                logger=log,
             )
             synchronize(device)
             start = time.perf_counter()
             prefill_result = prefill_runner.run(token_ids, collect_kv_cache=True)
             synchronize(device)
             prefill_elapsed = time.perf_counter() - start
-            cemu_backend.flush()
+            kv_writer.flush()
             log(
                 f"[tinyllama-cemu] Prefill complete in {prefill_elapsed:.6f}s, "
                 f"next_tokens={prefill_result.next_token_ids.detach().cpu().reshape(-1).tolist()}"
@@ -561,10 +876,10 @@ def main():
 
             log("[tinyllama-cemu] step 3/8: verify Prefill KV in CEMU NVM")
             verify_prefill_storage(
-                layout,
-                k_cache_path,
-                v_cache_path,
+                layouts,
+                cache_paths,
                 prefill_result,
+                args.batch_size,
             )
 
             log(
@@ -574,20 +889,20 @@ def main():
             reference_backend = FlexGenTorchAttentionBackend(
                 config,
                 prefill_result.kv_cache,
-                logger=log,
+                logger=(log if trace is None else None),
                 copy_cache=True,
             )
             reference_runner = FlexGenDecodeRunner(
                 config,
                 loader,
                 reference_backend,
-                logger=log,
+                logger=(log if trace is None else None),
             )
             synchronize(device)
             start = time.perf_counter()
             reference_generation = FlexGenGenerationRunner(
                 reference_runner,
-                logger=log,
+                logger=(log if trace is None else None),
             ).run(
                 prefill_result.next_token_ids,
                 start_position=prompt_length,
@@ -615,20 +930,20 @@ def main():
 
             log(
                 "[tinyllama-cemu] step 5/8: Prefill token -> QKV/RoPE -> append "
-                "NVM -> FDM -> 5 MRS -> CSD CUDA Attention"
-            )
-            cemu_runner = FlexGenDecodeRunner(
-                config,
-                loader,
-                cemu_backend,
-                logger=log,
+                "NVM -> double-slot FDM/MRS -> CSD Attention"
             )
             synchronize(device)
             start = time.perf_counter()
-            with attention_device:
+            with ExitStack() as scheduler_stack:
+                open_attention_schedulers(
+                    scheduler_stack,
+                    attention_schedulers,
+                    attention_slots_by_batch,
+                    num_gpu_batches,
+                )
                 cemu_generation = FlexGenGenerationRunner(
                     cemu_runner,
-                    logger=log,
+                    logger=(log if trace is None else None),
                 ).run(
                     prefill_result.next_token_ids,
                     start_position=prompt_length,
@@ -636,8 +951,6 @@ def main():
                     collect_layer_outputs=True,
                 )
                 synchronize(device)
-                if attention_device.memory_range_count != 5:
-                    raise AssertionError("CEMU Attention must create exactly five MRS")
             cemu_elapsed = time.perf_counter() - start
             log(
                 f"[tinyllama-cemu] CEMU Decode={cemu_elapsed:.6f}s, "
@@ -645,13 +958,13 @@ def main():
             )
 
             log("[tinyllama-cemu] step 6/8: verify appended Decode KV in CEMU NVM")
-            cemu_backend.flush()
+            kv_writer.flush()
             verify_decode_storage(
-                layout,
-                k_cache_path,
-                v_cache_path,
+                layouts,
+                cache_paths,
                 cemu_generation,
                 prompt_length,
+                args.batch_size,
             )
 
             log(
@@ -674,6 +987,15 @@ def main():
                 f"head; csd_target={args.csd_target}, "
                 f"tokens={format_token_ids(cemu_generation.token_ids)}"
             )
+            if trace is not None:
+                event_path, overlap_path = trace.write(args.trace_file)
+                log(
+                    f"[pipeline-trace] events={len(trace.events)}, "
+                    f"event_csv={event_path.resolve()}, "
+                    f"overlap_csv={overlap_path.resolve()}"
+                )
+                for summary_line in trace.summary():
+                    log(f"[pipeline-trace] {summary_line}")
 
 
 if __name__ == "__main__":

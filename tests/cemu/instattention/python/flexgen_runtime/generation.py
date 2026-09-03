@@ -63,19 +63,21 @@ class FlexGenGenerationRunner:
         )
         token_sequence = [current_token_ids.detach().clone()]
         steps = []
-        self._log(
-            f"start position={start_position}, decode_steps={decode_steps}, "
-            f"initial_tokens={current_token_ids.detach().cpu().reshape(-1).tolist()}"
-        )
+        if self.logger is not None:
+            self._log(
+                f"start position={start_position}, decode_steps={decode_steps}, "
+                f"initial_tokens={current_token_ids.detach().cpu().reshape(-1).tolist()}"
+            )
 
         for step in range(decode_steps):
             token_position = start_position + step
             input_token_ids = current_token_ids.detach().clone()
-            self._log(
-                f"step={step}, position={token_position}, "
-                f"valid_tokens={token_position + 1}, "
-                f"input={input_token_ids.cpu().reshape(-1).tolist()}"
-            )
+            if self.logger is not None:
+                self._log(
+                    f"step={step}, position={token_position}, "
+                    f"valid_tokens={token_position + 1}, "
+                    f"input={input_token_ids.cpu().reshape(-1).tolist()}"
+                )
             decode_result = self.decode_runner.run(
                 input_token_ids,
                 token_position=token_position,
@@ -93,16 +95,18 @@ class FlexGenGenerationRunner:
                     decode_result=decode_result,
                 )
             )
-            self._log(
-                f"step={step} output="
-                f"{current_token_ids.detach().cpu().reshape(-1).tolist()}"
-            )
+            if self.logger is not None:
+                self._log(
+                    f"step={step} output="
+                    f"{current_token_ids.detach().cpu().reshape(-1).tolist()}"
+                )
 
         generated = torch.cat(token_sequence, dim=1)
-        self._log(
-            f"complete token_ids={tuple(generated.shape)}, "
-            f"last_tokens={generated[:, -1].detach().cpu().tolist()}"
-        )
+        if self.logger is not None:
+            self._log(
+                f"complete token_ids={tuple(generated.shape)}, "
+                f"last_tokens={generated[:, -1].detach().cpu().tolist()}"
+            )
         return FlexGenGenerationResult(
             token_ids=generated,
             steps=tuple(steps),

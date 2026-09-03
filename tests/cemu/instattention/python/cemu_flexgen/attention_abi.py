@@ -9,6 +9,7 @@ from .kv_layout import KvCacheLayout, KvChunk
 
 ATTENTION_ABI_VERSION = 1
 ATTENTION_DTYPE_FLOAT32 = 1
+ATTENTION_DTYPE_FLOAT16 = 2
 ATTENTION_FLAG_RESET_STATE = 1 << 0
 ATTENTION_FLAG_FINALIZE = 1 << 1
 _ATTENTION_METADATA = struct.Struct("<8IfI")
@@ -23,6 +24,7 @@ class DenseAttentionMetadata:
     token_count: int
     token_stride: int
     scale: float
+    dtype: object = np.float32
     reset_state: bool = True
     finalize: bool = True
 
@@ -49,6 +51,10 @@ class DenseAttentionMetadata:
             raise ValueError("token_stride must be a multiple of 512")
         if not math.isfinite(self.scale) or self.scale <= 0:
             raise ValueError("scale must be finite and positive")
+        normalized_dtype = np.dtype(self.dtype)
+        if normalized_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+            raise TypeError("dense Attention dtype must be float16 or float32")
+        object.__setattr__(self, "dtype", normalized_dtype)
         if not isinstance(self.reset_state, bool):
             raise TypeError("reset_state must be a bool")
         if not isinstance(self.finalize, bool):
@@ -66,8 +72,8 @@ class DenseAttentionMetadata:
     ):
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
-        if layout.config.dtype != np.dtype(np.float32):
-            raise TypeError("the first dense Attention ABI supports only float32")
+        if layout.config.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+            raise TypeError("dense Attention supports only float16 or float32")
         if scale is None:
             scale = 1.0 / math.sqrt(layout.config.head_dim)
         return cls(
@@ -78,6 +84,7 @@ class DenseAttentionMetadata:
             token_count=token_count,
             token_stride=layout.token_stride,
             scale=float(scale),
+            dtype=layout.config.dtype,
             reset_state=reset_state,
             finalize=finalize,
         )
@@ -90,13 +97,17 @@ class DenseAttentionMetadata:
     def output_shape(self):
         return self.query_shape
 
+    @property
+    def element_size(self):
+        return self.dtype.itemsize
+
     def validate_chunk(self, layout: KvCacheLayout, chunk: KvChunk) -> None:
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
         if not isinstance(chunk, KvChunk):
             raise TypeError("chunk must be a KvChunk")
-        if layout.config.dtype != np.dtype(np.float32):
-            raise TypeError("the first dense Attention ABI supports only float32")
+        if layout.config.dtype != self.dtype:
+            raise TypeError("Attention metadata dtype does not match the KV layout")
         expected = (
             layout.config.batch_size,
             layout.config.num_kv_heads,
@@ -115,9 +126,14 @@ class DenseAttentionMetadata:
             raise ValueError("Attention metadata does not match the KV chunk layout")
 
     def pack(self) -> bytes:
+        dtype_code = (
+            ATTENTION_DTYPE_FLOAT16
+            if self.dtype == np.dtype(np.float16)
+            else ATTENTION_DTYPE_FLOAT32
+        )
         return _ATTENTION_METADATA.pack(
             ATTENTION_ABI_VERSION,
-            ATTENTION_DTYPE_FLOAT32,
+            dtype_code,
             self.batch_size,
             self.num_query_heads,
             self.num_kv_heads,

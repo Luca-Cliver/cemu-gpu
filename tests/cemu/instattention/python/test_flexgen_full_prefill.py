@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -38,6 +39,19 @@ class RecordingKvWriter:
                 values.detach().cpu().clone(),
             )
         )
+
+
+class OrderedAsyncKvWriter:
+    def __init__(self, events):
+        self.events = events
+
+    def submit_prefill(self, layer, keys, values):
+        self.events.append(("submit_store", layer))
+        return SimpleNamespace(layer=layer)
+
+    def wait_prefill(self, request):
+        self.events.append(("wait_store", request.layer))
+        return 1
 
 
 class FlexGenFullPrefillTest(unittest.TestCase):
@@ -134,6 +148,38 @@ class FlexGenFullPrefillTest(unittest.TestCase):
 
         self.assertIsNone(result.kv_cache)
         self.assertEqual(result.next_token_ids.shape, (1, 1))
+
+    def test_prefill_overlaps_previous_kv_store_with_next_layer(self):
+        events = []
+        runner = FlexGenPrefillRunner(
+            config=self.config,
+            weight_loader=FlexGenWeightLoader(
+                self.config,
+                self.weight_directory,
+                device=self.device,
+            ),
+            kv_writer=OrderedAsyncKvWriter(events),
+            logger=lambda message: events.append(("log", message)),
+        )
+
+        runner.run(torch.tensor([[1, 2, 3]], dtype=torch.long))
+
+        layer_one_compute = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "log" and "layer=1 Attention-complete" in event[1]
+        )
+        layer_zero_store_wait = events.index(("wait_store", 0))
+        self.assertLess(layer_one_compute, layer_zero_store_wait)
+        self.assertEqual(
+            [event for event in events if event[0] != "log"],
+            [
+                ("submit_store", 0),
+                ("submit_store", 1),
+                ("wait_store", 0),
+                ("wait_store", 1),
+            ],
+        )
 
     def test_complete_prefill_writes_real_cemu_kv_store(self):
         layout = KvCacheLayout(

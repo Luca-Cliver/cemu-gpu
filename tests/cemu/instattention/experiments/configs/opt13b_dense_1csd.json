@@ -1,0 +1,41 @@
+{
+  "source": {
+    "paper": "InstAttention: In-Storage Attention Offloading for Cost-Effective Long-Context LLM Inference",
+    "component_calibration": "Table I",
+    "throughput_experiment": "Figure 14"
+  },
+  "model": {
+    "name": "opt-13b",
+    "num_layers": 40,
+    "hidden_size": 5120,
+    "num_query_heads": 40,
+    "num_kv_heads": 40,
+    "head_dim": 128,
+    "intermediate_size": 20480,
+    "max_sequence_length": 2048,
+    "dtype": "float16"
+  },
+  "workload": {
+    "prompt_length": 1024,
+    "decode_length": 1024,
+    "batch_sizes": [4, 8, 16, 32, 64, 128, 256],
+    "attention_mode": "dense"
+  },
+  "instcsd": {
+    "count": 1,
+    "flash_channels": 8,
+    "channel_bandwidth_gbps": 1.4,
+    "aggregate_bandwidth_gbps": 11.2,
+    "external_pcie_gbps": 7.0,
+    "gemv_gflops": 12.7,
+    "softmax_mflops": 14.2,
+    "filter_gbps": 1.85,
+    "softmax_anchor_heads": 1,
+    "softmax_anchor_tokens": 16,
+    "softmax_anchor_latency_us": 164.0
+  },
+  "measurement": {
+    "warmup_iterations": 10,
+    "iterations": 100
+  }
+}

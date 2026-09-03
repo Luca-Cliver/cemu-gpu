@@ -19,6 +19,8 @@ typedef struct CudaSyncApi
 
 static CudaSyncApi cuda_api = {0};
 
+static bool backend_cuda_valid_range(SsdBackend *b, void *ptr, uint64_t len);
+
 typedef enum CudaRangeState {
     CUDA_RANGE_UNINITIALIZED,
     CUDA_RANGE_CLEAN,
@@ -192,6 +194,15 @@ static CudaMirrorRange *cuda_mirror_ensure_locked(SsdBackend *b,
     entry->next = cuda_mirror_head(b);
     cuda_mirror_set_head(b, entry);
     return entry;
+}
+
+static void cuda_mirror_free(CudaMirrorRange *entry)
+{
+    if (entry->device_ptr) {
+        cuda_api.free(entry->device_ptr);
+    }
+    g_free(entry->segments);
+    g_free(entry);
 }
 
 static int cuda_mirror_sync_segment(CudaMirrorRange *entry,
@@ -373,11 +384,7 @@ void backend_cuda_sync_fini(SsdBackend *b)
         CudaMirrorRange *cur = cuda_mirror_head(b);
         while (cur) {
             CudaMirrorRange *next = cur->next;
-            if (cur->device_ptr) {
-                cuda_api.free(cur->device_ptr);
-            }
-            g_free(cur->segments);
-            g_free(cur);
+            cuda_mirror_free(cur);
             cur = next;
         }
         cuda_mirror_set_head(b, NULL);
@@ -427,6 +434,44 @@ void *backend_cuda_ensure_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len
     }
 
     return entry->device_ptr;
+}
+
+int backend_cuda_drop_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len)
+{
+    CudaMirrorRange *previous = NULL;
+    CudaMirrorRange *entry;
+    int rc;
+
+    if (!b || !b->cuda_sync || !host_ptr || len == 0 || !cuda_api.memcpy) {
+        return 0;
+    }
+    if (!backend_cuda_valid_range(b, host_ptr, len)) {
+        return -1;
+    }
+
+    qemu_mutex_lock(&b->cuda_mirror_lock);
+    entry = cuda_mirror_head(b);
+    while (entry && (entry->host_ptr != host_ptr || entry->len != len)) {
+        previous = entry;
+        entry = entry->next;
+    }
+    if (!entry) {
+        qemu_mutex_unlock(&b->cuda_mirror_lock);
+        return 0;
+    }
+
+    rc = cuda_mirror_prepare_locked(b, host_ptr, len, false);
+    if (rc == 0) {
+        if (previous) {
+            previous->next = entry->next;
+        } else {
+            cuda_mirror_set_head(b, entry->next);
+        }
+        cuda_mirror_free(entry);
+        femu_debug("Dropped CUDA mirror for host %p len %lu\n", host_ptr, len);
+    }
+    qemu_mutex_unlock(&b->cuda_mirror_lock);
+    return rc;
 }
 
 static bool backend_cuda_valid_range(SsdBackend *b, void *ptr, uint64_t len)

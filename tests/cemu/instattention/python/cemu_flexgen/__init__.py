@@ -2,11 +2,21 @@ from .kv_layout import KvCacheLayout, KvChunk, KvLayoutConfig, align_up
 from .kv_staging import KvStagingManager
 from .kv_store import KvCacheStore
 from .attention_abi import DenseAttentionMetadata
+from .cemu_attention_slot_scheduler import (
+    CemuAttentionSharedWorkers,
+    CemuAttentionPrefetchRequest,
+    CemuAttentionSlotRequest,
+    CemuAttentionSlotScheduler,
+)
 
 __all__ = [
     "AttentionBufferConfig",
     "AttentionRange",
     "CemuAttentionDevice",
+    "CemuAttentionPrefetchRequest",
+    "CemuAttentionSharedWorkers",
+    "CemuAttentionSlotRequest",
+    "CemuAttentionSlotScheduler",
     "DenseAttentionMetadata",
     "CemuDevice",
     "RangeSpec",

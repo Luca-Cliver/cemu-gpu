@@ -143,6 +143,11 @@ class KvStagingManager:
             self._unpack_tokens(value_storage, token_count),
         )
 
+    def record_staged_chunk(self, chunk: KvChunk) -> None:
+        self._require_open()
+        self._validate_chunk(chunk)
+        self._last_chunk = chunk
+
     def close(self) -> None:
         for attribute_name in (
             "_k_cache_fd",

@@ -168,12 +168,7 @@ def main():
         )
 
         with device:
-            output = device.run_decode(
-                query,
-                layer=0,
-                valid_tokens=token_count,
-            )
-            for chunk in chunks:
+            for chunk_index, chunk in enumerate(chunks):
                 device.stage_chunk(chunk)
                 staged_keys, staged_values = device.staging.read_staged_tokens(
                     chunk.token_count
@@ -186,6 +181,20 @@ def main():
                     staged_values,
                     values[chunk.start_token : chunk.end_token],
                 )
+                metadata = DenseAttentionMetadata.from_layout(
+                    layout,
+                    num_query_heads=query.shape[1],
+                    token_count=chunk.token_count,
+                    reset_state=chunk_index == 0,
+                    finalize=chunk_index == len(chunks) - 1,
+                )
+                device.execute_staged_chunk(
+                    query,
+                    chunk,
+                    metadata,
+                    write_query=chunk_index == 0,
+                )
+            output = device.collect_output(metadata)
             assert device.memory_range_count == 5
 
         np.testing.assert_allclose(output, expected, rtol=2e-5, atol=2e-5)
@@ -200,6 +209,7 @@ def main():
         print(f"[attention] query[0,0,:4]={query[0, 0, :4].tolist()}")
         print(f"[attention] output[0,0,:4]={output[0, 0, :4].tolist()}")
         print(f"[attention] reference[0,0,:4]={expected[0, 0, :4].tolist()}")
+        print("[attention] stages=load(NVM->FDM) -> compute(CEMU) -> collect(output)")
         print("Serial multi-chunk dense Attention test passed")
 
 

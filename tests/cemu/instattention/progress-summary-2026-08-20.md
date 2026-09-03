@@ -614,3 +614,58 @@ Prefill 真实预测 token
 ```
 
 下一阶段的核心不再是继续补小型流程，而是把当前确定性小模型替换为真实模型配置、真实 tokenizer 和真实权重，同时保持现有 PyTorch reference 与 CEMU 路径的逐层校验能力。
+
+## 15. 流水验证与性能测量模式
+
+完整 TinyLlama+CEMU 流程现在拆成两个互不混用的模式：
+
+- 流水追踪模式保留 PyTorch reference、逐层结果和 NVM KV 校验，并把热路径事件先写入内存，运行结束后再生成事件 CSV 与重叠区间 CSV；
+- 性能模式关闭逐事件日志、reference 和逐层 tensor 收集，权重与 CEMU Program/MRS 只初始化一次，预热后重复测量 Prefill、Decode 和端到端 Guest 应用可见时间。
+
+流水追踪命令：
+
+```bash
+make instattention-tinyllama-cemu-trace-test \
+  MODEL_DIR=/root/models/TinyLlama-1.1B \
+  NVM_TEST_DIR=/mnt/nvme0 \
+  FDM_TEST_DIR=/mnt/fdm0 \
+  CSD_TARGET=cuda \
+  BATCH_SIZE=1 \
+  PROMPT_LENGTH=128 \
+  DECODE_STEPS=4 \
+  TRACE_FILE=/root/cemu-logs/tinyllama-pipeline.csv
+```
+
+该命令同时生成 `/root/cemu-logs/tinyllama-pipeline-overlap.csv`，自动统计 Prefill Store 与 MLP/下一层 Attention，以及 Decode Load/Compute/Store/QKV 的 Guest 软件流水重叠区间。
+
+性能测量命令：
+
+```bash
+make instattention-tinyllama-cemu-benchmark \
+  MODEL_DIR=/root/models/TinyLlama-1.1B \
+  NVM_TEST_DIR=/mnt/nvme0 \
+  FDM_TEST_DIR=/mnt/fdm0 \
+  CSD_TARGET=cuda \
+  BATCH_SIZE=1 \
+  PROMPT_LENGTH=128 \
+  DECODE_STEPS=4 \
+  WARMUP_ITERATIONS=1 \
+  ITERATIONS=5 \
+  BENCHMARK_OUTPUT=/root/cemu-logs/tinyllama-benchmark.csv
+```
+
+性能 CSV 记录每轮 Prefill、Decode、总时间、每步 Decode 时间与 token 吞吐率；不包含 checkpoint 加载和 CEMU Program/MRS 初始化时间，但包含 KV 持久化完成等待。
+
+设备端逐算子统计由宿主机启动 QEMU 时的 `CEMU_COMPUTE_LOG` 控制。调试运行保留默认值：
+
+```bash
+./run-csd.sh
+```
+
+纯性能运行应先用下面的命令启动 QEMU：
+
+```bash
+CEMU_COMPUTE_LOG=0 ./run-csd.sh
+```
+
+关闭后不再打印每次 `CEMU_COMPUTE` 和每 100 个任务一次的 `CSD baseline`，同时跳过仅服务于这些日志的额外 `clock_gettime` 与原子计数；CEMU 功能执行、冻结和 `set_sched_runtime()` 不受影响。该变量属于宿主机 QEMU 进程环境，不能由已经启动的 Guest 性能命令临时修改。

@@ -36,6 +36,24 @@ static atomic_uint_fast64_t csd_total_job_ns = 0;
 static atomic_uint_fast64_t csd_job_count = 0;
 static const int CSD_BASELINE_PRINT_FREQ = 100;
 
+static bool cemu_compute_log_enabled(void)
+{
+    static gsize initialized;
+    static bool enabled;
+
+    if (g_once_init_enter(&initialized)) {
+        const char *value = g_getenv("CEMU_COMPUTE_LOG");
+
+        enabled = value == NULL ||
+                  (value[0] && g_ascii_strcasecmp(value, "0") &&
+                   g_ascii_strcasecmp(value, "false") &&
+                   g_ascii_strcasecmp(value, "no") &&
+                   g_ascii_strcasecmp(value, "off"));
+        g_once_init_leave(&initialized, 1);
+    }
+    return enabled;
+}
+
 struct ProgramInitArgs {
     uint32_t nsid;
     uint16_t pind;
@@ -164,22 +182,34 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
         }
         pthread_spin_lock(&memory_range_set_slab(ns)->lock);
         MemoryRangeSet *mrs = memory_range_set_get(ns, rsid);
-        femu_debug("free mrs rsid %d, mrs %p, numr %d\n", rsid, mrs, mrs->numr);
         if (mrs == NULL || mrs->numr == 0) {
             pthread_spin_unlock(&memory_range_set_slab(ns)->lock);
             femu_err("memory_range_set_management: rsid %u not found!\n", rsid);
             return NVME_INVALID_FIELD;
         }
+        femu_debug("free mrs rsid %d, mrs %p, numr %d\n", rsid, mrs, mrs->numr);
         if (mrs->in_use) {
             pthread_spin_unlock(&memory_range_set_slab(ns)->lock);
             return NVME_MR_SET_IN_USE;
         }
+        uint16_t released_numr = mrs->numr;
         mrs->numr = 0;
         pthread_spin_unlock(&memory_range_set_slab(ns)->lock);
+        int sync_status = 0;
+        for (uint32_t i = 0; i < released_numr; i++) {
+            if (backend_cuda_drop_device_ptr(mrs->mr[i].backend,
+                                             mrs->mr[i].addr,
+                                             mrs->mr[i].len) != 0) {
+                sync_status = -1;
+            }
+        }
         free(mrs->mr);
         free(mrs->mr_addr);
         free(mrs->mr_len);
         slab_free(memory_range_set_slab(ns), mrs, 1);
+        if (sync_status != 0) {
+            return NVME_DNR;
+        }
         cqe->n.result = 0;
     } else {
         femu_err("memory_range_set_management: sel %u not supported!\n", sel);
@@ -1034,13 +1064,17 @@ static uint64_t run_program_by_target(ComputeJob *job)
 static uint64_t run_functional_modeling(ComputeJob *job)
 {
     Program *program = job->program;
+    bool collect_compute_stats = cemu_compute_log_enabled();
     uint64_t res = 0;
     uint64_t realtime;
     uint64_t runtime = job->user_runtime;
+    const uint64_t requested_runtime = runtime;
+    uint64_t freeze_entry_ns = 0;
     struct timespec t0, t1;
 
-    /* job start timestamp for baseline measurement */
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (collect_compute_stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+    }
 
     femu_debug("run_functional_modeling: program %u, runtime %lu, size %llu\n", program->pind, runtime, job->args.mr_len[0]);
 
@@ -1052,11 +1086,11 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         clock_gettime(CLOCK_MONOTONIC, &cs);
         enter_compute_section();
         clock_gettime(CLOCK_MONOTONIC, &ce);
-        uint64_t time_cost = (ce.tv_sec-cs.tv_sec)* 1000000000LL + (ce.tv_nsec-cs.tv_nsec);
-        if(runtime < time_cost)
+        freeze_entry_ns = (ce.tv_sec-cs.tv_sec)* 1000000000LL + (ce.tv_nsec-cs.tv_nsec);
+        if(runtime < freeze_entry_ns)
             runtime = 0;
         else
-            runtime -= time_cost;
+            runtime -= freeze_entry_ns;
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
         res = run_program_by_target(job);
@@ -1072,23 +1106,36 @@ static uint64_t run_functional_modeling(ComputeJob *job)
 
         femu_debug("run_on_host: program %u, runtime %lu, realtime: %lu, size %llu\n", program->pind, runtime, realtime,job->args.mr_len[0]);
 
-        /* Print realtime and runtime to stdout for quick inspection */
-        printf("CEMU_COMPUTE: program %u, realtime=%lu ns, runtime=%lu ns\n",
-            program->pind, (unsigned long)realtime, (unsigned long)runtime);
+        if (collect_compute_stats) {
+            printf("CEMU_COMPUTE: program %u, realtime=%lu ns, runtime=%lu ns, "
+                   "requested_runtime=%lu ns, freeze_entry=%lu ns\n",
+                program->pind, (unsigned long)realtime, (unsigned long)runtime,
+                (unsigned long)requested_runtime, (unsigned long)freeze_entry_ns);
+        }
 
         set_sched_runtime(job, runtime);
 
-    /* record baseline counters */
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    uint64_t job_ns = (t1.tv_sec - t0.tv_sec) * 1000000000ULL + (t1.tv_nsec - t0.tv_nsec);
-    atomic_fetch_add_explicit(&csd_total_compute_ns, (uint_fast64_t)realtime, memory_order_relaxed);
-    atomic_fetch_add_explicit(&csd_total_job_ns, (uint_fast64_t)job_ns, memory_order_relaxed);
-    uint64_t jobs = atomic_fetch_add_explicit(&csd_job_count, 1, memory_order_relaxed) + 1;
-    if (jobs % CSD_BASELINE_PRINT_FREQ == 0) {
-        uint64_t total_c = atomic_load_explicit(&csd_total_compute_ns, memory_order_relaxed);
-        uint64_t total_j = atomic_load_explicit(&csd_total_job_ns, memory_order_relaxed);
-        double frac = total_j ? ((double)total_c / (double)total_j) : 0.0;
-        femu_log("CSD baseline: jobs=%lu, compute_ns=%lu, total_ns=%lu, compute_fraction=%.4f\n", jobs, total_c, total_j, frac);
+    if (collect_compute_stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t job_ns = (t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+                          (t1.tv_nsec - t0.tv_nsec);
+        atomic_fetch_add_explicit(&csd_total_compute_ns,
+                                  (uint_fast64_t)realtime,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&csd_total_job_ns,
+                                  (uint_fast64_t)job_ns,
+                                  memory_order_relaxed);
+        uint64_t jobs = atomic_fetch_add_explicit(&csd_job_count, 1,
+                                                   memory_order_relaxed) + 1;
+        if (jobs % CSD_BASELINE_PRINT_FREQ == 0) {
+            uint64_t total_c = atomic_load_explicit(&csd_total_compute_ns,
+                                                    memory_order_relaxed);
+            uint64_t total_j = atomic_load_explicit(&csd_total_job_ns,
+                                                    memory_order_relaxed);
+            double frac = total_j ? ((double)total_c / (double)total_j) : 0.0;
+            femu_log("CSD baseline: jobs=%lu, compute_ns=%lu, total_ns=%lu, "
+                     "compute_fraction=%.4f\n", jobs, total_c, total_j, frac);
+        }
     }
     return res;
 }

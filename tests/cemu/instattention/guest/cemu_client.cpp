@@ -420,8 +420,14 @@ std::uint32_t CemuClient::execute(const ExecuteOptions &options,
         metadata_size == 0 ? nullptr : metadata_buffer.data(),
         static_cast<std::uint32_t>(metadata_size));
 
-    if (ioctl(namespace_fd_, NVME_IOCTL_IO_CMD, &command) < 0) {
+    const int status = ioctl(namespace_fd_, NVME_IOCTL_IO_CMD, &command);
+    if (status < 0) {
         throw_system_error("execute CEMU program " + program_name_);
+    }
+    if (status != 0) {
+        throw std::runtime_error(
+            "execute CEMU program " + program_name_ +
+            ": NVMe status " + std::to_string(status));
     }
     return command.result;
 }
