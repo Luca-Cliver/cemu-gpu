@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional, Sequence
 class FlexGenPrefillWriteRequest:
     layer: int
     future: Future
+    microbatch: Optional[int] = None
 
     def result(self, timeout=None) -> int:
         return self.future.result(timeout=timeout)
@@ -82,6 +83,21 @@ class FlexGenMicrobatchKvWriter:
         )
         return token_count
 
+    def write_prefill_microbatch(
+        self,
+        microbatch: int,
+        layer: int,
+        keys: Any,
+        values: Any,
+    ) -> int:
+        backend = self._backend(microbatch)
+        token_count = backend.write_prefill(layer, keys, values)
+        self._log(
+            f"store-complete layer={layer}, microbatch={microbatch}, "
+            f"tokens={token_count}"
+        )
+        return token_count
+
     def open(self):
         with self._lock:
             if self._executor is None:
@@ -109,6 +125,35 @@ class FlexGenMicrobatchKvWriter:
                 ),
             )
             self._requests.append(request)
+        return request
+
+    def submit_prefill_microbatch(
+        self,
+        microbatch: int,
+        layer: int,
+        keys: Any,
+        values: Any,
+    ) -> FlexGenPrefillWriteRequest:
+        self.open()
+        backend = self._backend(microbatch)
+        del backend
+        with self._lock:
+            request = FlexGenPrefillWriteRequest(
+                layer=layer,
+                microbatch=microbatch,
+                future=self._executor.submit(
+                    self.write_prefill_microbatch,
+                    microbatch,
+                    layer,
+                    keys,
+                    values,
+                ),
+            )
+            self._requests.append(request)
+        self._log(
+            f"store-submit layer={layer}, microbatch={microbatch}, "
+            f"tokens={keys.shape[0]}"
+        )
         return request
 
     def wait_prefill(self, request: FlexGenPrefillWriteRequest) -> int:
@@ -147,3 +192,10 @@ class FlexGenMicrobatchKvWriter:
     def _log(self, message: str) -> None:
         if self.logger is not None:
             self.logger(f"[prefill-kv-writer] {message}")
+
+    def _backend(self, microbatch: int):
+        if not isinstance(microbatch, int) or isinstance(microbatch, bool):
+            raise TypeError("microbatch must be an integer")
+        if microbatch < 0 or microbatch >= len(self.backends):
+            raise IndexError("microbatch is out of range")
+        return self.backends[microbatch]

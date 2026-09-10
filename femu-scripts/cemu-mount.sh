@@ -2,6 +2,12 @@
 
 nr_dev=$(ls /sys/class/nvme | wc -l)
 echo "Found $nr_dev NVMe Drives"
+CEMU_NVM_BENCHMARK="${CEMU_NVM_BENCHMARK:-1}"
+
+if [[ "$CEMU_NVM_BENCHMARK" != "0" && "$CEMU_NVM_BENCHMARK" != "1" ]]; then
+	echo "CEMU_NVM_BENCHMARK must be 0 or 1" >&2
+	exit 1
+fi
 
 ### NVMe Mount
 pids=()
@@ -15,9 +21,13 @@ for ((i=0; i<$nr_dev; i++)); do
 		mkdir -p $dir
 		mount $nvm $dir
 		echo "Mount $nvm to $dir"
-		fio --name=write --rw=write --bs=128k --filename=$dir/test --size=16G --iodepth=128 --ioengine=io_uring --direct=1 &
-        pids+=($!)
-		fallocate -l 16G $dir/output
+			if [[ "$CEMU_NVM_BENCHMARK" == "1" ]]; then
+				fio --name=write --rw=write --bs=128k --filename=$dir/test --size=16G --iodepth=128 --ioengine=io_uring --direct=1 &
+				pids+=($!)
+				fallocate -l 16G $dir/output
+			else
+				echo "Skip NVM benchmark files for $nvm"
+			fi
 	fi
 done
 for pid in ${pids[@]}; do

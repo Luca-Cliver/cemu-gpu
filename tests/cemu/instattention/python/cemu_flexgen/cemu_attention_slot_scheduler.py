@@ -2,6 +2,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue
 from threading import Lock
+from time import perf_counter_ns
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
@@ -94,6 +95,8 @@ class CemuAttentionSlotRequest:
     layer: int
     valid_tokens: int
     future: Future
+    k_cache_path: Any = None
+    v_cache_path: Any = None
 
     def result(self, timeout: Optional[float] = None) -> np.ndarray:
         return self.future.result(timeout=timeout)
@@ -108,6 +111,8 @@ class CemuAttentionPrefetchRequest:
     layer: int
     history_tokens: int
     future: Future
+    k_cache_path: Any = None
+    v_cache_path: Any = None
 
     def result(self, timeout: Optional[float] = None) -> Any:
         return self.future.result(timeout=timeout)
@@ -127,6 +132,7 @@ class CemuAttentionSlotScheduler:
         slots: Sequence[Any],
         workers: Optional[CemuAttentionSharedWorkers] = None,
         logger: Optional[Callable[[str], None]] = None,
+        profiler: Any = None,
     ):
         normalized_slots = tuple(slots)
         if len(normalized_slots) < 2:
@@ -158,6 +164,7 @@ class CemuAttentionSlotScheduler:
         self.layout = first_layout
         self.staging_bytes = first_staging_bytes
         self.logger = logger
+        self.profiler = profiler
         self.workers = workers or CemuAttentionSharedWorkers(logger=logger)
         if not isinstance(self.workers, CemuAttentionSharedWorkers):
             raise TypeError("workers must be CemuAttentionSharedWorkers")
@@ -199,6 +206,8 @@ class CemuAttentionSlotScheduler:
         query: Any,
         layer: int,
         valid_tokens: int,
+        k_cache_path: Any = None,
+        v_cache_path: Any = None,
     ) -> CemuAttentionSlotRequest:
         query_array = self._normalize_query(query)
         if not isinstance(layer, int) or isinstance(layer, bool):
@@ -209,6 +218,7 @@ class CemuAttentionSlotScheduler:
             raise ValueError("layer must be non-negative")
         if valid_tokens <= 0:
             raise ValueError("valid_tokens must be positive")
+        self._validate_cache_paths(k_cache_path, v_cache_path)
 
         with self._request_lock:
             if not self._accepting:
@@ -221,6 +231,8 @@ class CemuAttentionSlotScheduler:
                 layer=layer,
                 valid_tokens=valid_tokens,
                 future=result_future,
+                k_cache_path=k_cache_path,
+                v_cache_path=v_cache_path,
             )
             self._requests.append(request)
             self.workers.submit_load(
@@ -235,10 +247,28 @@ class CemuAttentionSlotScheduler:
         )
         return request
 
+    def submit_decode_from_cache(
+        self,
+        query: Any,
+        layer: int,
+        valid_tokens: int,
+        k_cache_path: Any,
+        v_cache_path: Any,
+    ) -> CemuAttentionSlotRequest:
+        return self.submit_decode(
+            query,
+            layer,
+            valid_tokens,
+            k_cache_path=k_cache_path,
+            v_cache_path=v_cache_path,
+        )
+
     def prefetch_decode(
         self,
         layer: int,
         history_tokens: int,
+        k_cache_path: Any = None,
+        v_cache_path: Any = None,
     ) -> CemuAttentionPrefetchRequest:
         if not isinstance(layer, int) or isinstance(layer, bool):
             raise TypeError("layer must be an integer")
@@ -248,6 +278,7 @@ class CemuAttentionSlotScheduler:
             raise ValueError("layer must be non-negative")
         if history_tokens <= 0:
             raise ValueError("history_tokens must be positive")
+        self._validate_cache_paths(k_cache_path, v_cache_path)
 
         with self._request_lock:
             if not self._accepting:
@@ -259,6 +290,8 @@ class CemuAttentionSlotScheduler:
                 layer=layer,
                 history_tokens=history_tokens,
                 future=Future(),
+                k_cache_path=k_cache_path,
+                v_cache_path=v_cache_path,
             )
             self._prefetches.append(request)
             self.workers.submit_load(self._load_prefetch, request)
@@ -268,6 +301,20 @@ class CemuAttentionSlotScheduler:
             f"history_tokens={history_tokens}"
         )
         return request
+
+    def prefetch_decode_from_cache(
+        self,
+        layer: int,
+        history_tokens: int,
+        k_cache_path: Any,
+        v_cache_path: Any,
+    ) -> CemuAttentionPrefetchRequest:
+        return self.prefetch_decode(
+            layer,
+            history_tokens,
+            k_cache_path=k_cache_path,
+            v_cache_path=v_cache_path,
+        )
 
     def submit_prefetched_decode(
         self,
@@ -281,7 +328,9 @@ class CemuAttentionSlotScheduler:
         query_array = self._normalize_query(query)
         key_array = self._normalize_cache_token("key", key)
         value_array = self._normalize_cache_token("value", value)
+        wait_start_ns = perf_counter_ns()
         prefetched_slot = prefetch.result()
+        self._record("decode.prefetch_wait", wait_start_ns)
         result = CemuAttentionSlotRequest(
             request_id=prefetch.request_id,
             layer=prefetch.layer,
@@ -363,7 +412,9 @@ class CemuAttentionSlotScheduler:
         request: CemuAttentionSlotRequest,
         query: np.ndarray,
     ) -> None:
+        wait_start_ns = perf_counter_ns()
         slot_index = self._available_slots.get()
+        self._record("decode.slot_wait", wait_start_ns)
         handed_to_compute = False
         try:
             slot = self.slots[slot_index]
@@ -384,6 +435,7 @@ class CemuAttentionSlotScheduler:
                 self.layout,
                 num_query_heads=query.shape[1],
                 token_count=chunk.token_count,
+                scale=slot.attention_scale,
                 reset_state=True,
                 finalize=True,
             )
@@ -391,7 +443,7 @@ class CemuAttentionSlotScheduler:
                 f"load-start request={request.request_id}, slot={slot_index}, "
                 f"layer={request.layer}, tokens={chunk.token_count}"
             )
-            slot.stage_chunk(chunk)
+            self._stage_chunk(slot, chunk, request)
             self._log(
                 f"load-complete request={request.request_id}, slot={slot_index}, "
                 f"layer={request.layer}, tokens={chunk.token_count}"
@@ -413,7 +465,9 @@ class CemuAttentionSlotScheduler:
                 self._available_slots.put(slot_index)
 
     def _load_prefetch(self, request: CemuAttentionPrefetchRequest) -> None:
+        wait_start_ns = perf_counter_ns()
         slot_index = self._available_slots.get()
+        self._record("decode.slot_wait", wait_start_ns)
         handed_to_caller = False
         try:
             chunks = tuple(
@@ -433,7 +487,7 @@ class CemuAttentionSlotScheduler:
                 f"prefetch-start request={request.request_id}, slot={slot_index}, "
                 f"layer={request.layer}, tokens={chunk.token_count}"
             )
-            self.slots[slot_index].stage_chunk(chunk)
+            self._stage_chunk(self.slots[slot_index], chunk, request)
             request.future.set_result(_PrefetchedSlot(slot_index, chunk))
             handed_to_caller = True
             self._log(
@@ -455,6 +509,7 @@ class CemuAttentionSlotScheduler:
         chunk: Any,
         metadata: DenseAttentionMetadata,
     ) -> None:
+        compute_start_ns = perf_counter_ns()
         try:
             slot = self.slots[slot_index]
             self._log(
@@ -472,6 +527,7 @@ class CemuAttentionSlotScheduler:
             if not request.future.done():
                 request.future.set_exception(error)
         finally:
+            self._record("decode.csd_worker", compute_start_ns)
             self._available_slots.put(slot_index)
 
     def _compute_prefetched_request(
@@ -483,6 +539,7 @@ class CemuAttentionSlotScheduler:
         prefetched_slot: _PrefetchedSlot,
     ) -> None:
         slot_index = prefetched_slot.slot_index
+        compute_start_ns = perf_counter_ns()
         try:
             slot = self.slots[slot_index]
             chunk = slot.append_staged_token(key, value)
@@ -490,6 +547,7 @@ class CemuAttentionSlotScheduler:
                 self.layout,
                 num_query_heads=query.shape[1],
                 token_count=chunk.token_count,
+                scale=slot.attention_scale,
                 reset_state=True,
                 finalize=True,
             )
@@ -508,6 +566,7 @@ class CemuAttentionSlotScheduler:
             if not request.future.done():
                 request.future.set_exception(error)
         finally:
+            self._record("decode.csd_worker", compute_start_ns)
             self._available_slots.put(slot_index)
 
     def _normalize_query(self, query: Any) -> np.ndarray:
@@ -534,6 +593,22 @@ class CemuAttentionSlotScheduler:
         return array
 
     @staticmethod
+    def _validate_cache_paths(k_cache_path: Any, v_cache_path: Any) -> None:
+        if (k_cache_path is None) != (v_cache_path is None):
+            raise ValueError("K and V cache paths must be provided together")
+
+    @staticmethod
+    def _stage_chunk(slot: Any, chunk: Any, request: Any) -> None:
+        if request.k_cache_path is None:
+            slot.stage_chunk(chunk)
+        else:
+            slot.stage_chunk(
+                chunk,
+                request.k_cache_path,
+                request.v_cache_path,
+            )
+
+    @staticmethod
     def _staging_bytes(slot: Any) -> int:
         buffers = getattr(slot, "buffers", None)
         staging_bytes = getattr(buffers, "staging_bytes", None)
@@ -544,3 +619,7 @@ class CemuAttentionSlotScheduler:
     def _log(self, message: str) -> None:
         if self.logger is not None:
             self.logger(f"[cemu-attention-slot-scheduler] {message}")
+
+    def _record(self, name: str, start_ns: int) -> None:
+        if self.profiler is not None:
+            self.profiler.record(name, perf_counter_ns() - start_ns)

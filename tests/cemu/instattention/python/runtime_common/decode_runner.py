@@ -1,43 +1,44 @@
+"""Model-independent Decode orchestration."""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple
 
 import torch
 
-from .decode import (
-    FlexGenDecodeAttentionOutput,
-    finish_flexgen_decode_attention,
-    prepare_flexgen_decode_attention,
-)
-from .embedding import run_flexgen_embedding
-from .mlp import run_flexgen_mlp
-from .model_config import FlexGenLlamaConfig
-from .output import run_flexgen_output_head
-from .weights import FlexGenWeightLoader
-from .weight_prefetch import FlexGenWeightPrefetcher
+from .model_ops import ModelOperations, validate_model_operations
+from .weight_prefetch import ModelWeightPrefetcher
 
 
 @dataclass(frozen=True)
-class FlexGenDecodeResult:
+class ModelDecodeResult:
     hidden_states: torch.Tensor
     logits: torch.Tensor
     next_token_ids: torch.Tensor
-    layer_outputs: Optional[Tuple[FlexGenDecodeAttentionOutput, ...]]
+    layer_outputs: Optional[Tuple[Any, ...]]
 
 
-class FlexGenDecodeRunner:
+class ModelDecodeRunner:
     def __init__(
         self,
-        config: FlexGenLlamaConfig,
-        weight_loader: FlexGenWeightLoader,
+        config: Any,
+        weight_loader: Any,
+        operations: ModelOperations,
         attention_backend: Any,
         logger: Optional[Callable[[str], None]] = None,
     ):
-        if not isinstance(config, FlexGenLlamaConfig):
-            raise TypeError("config must be a FlexGenLlamaConfig")
-        if not isinstance(weight_loader, FlexGenWeightLoader):
-            raise TypeError("weight_loader must be a FlexGenWeightLoader")
+        if not hasattr(config, "num_hidden_layers"):
+            raise TypeError("config must provide num_hidden_layers")
+        for method_name in (
+            "load_embedding",
+            "load_layer",
+            "load_final_norm",
+            "load_lm_head",
+        ):
+            if not callable(getattr(weight_loader, method_name, None)):
+                raise TypeError(f"weight_loader must provide {method_name}()")
         if weight_loader.config != config:
             raise ValueError("weight loader configuration does not match the runner")
+        validate_model_operations(operations)
         for method_name in ("append_decode", "decode"):
             if not hasattr(attention_backend, method_name):
                 raise TypeError(
@@ -48,6 +49,7 @@ class FlexGenDecodeRunner:
 
         self.config = config
         self.weight_loader = weight_loader
+        self.operations = operations
         self.attention_backend = attention_backend
         self.logger = logger
 
@@ -58,7 +60,7 @@ class FlexGenDecodeRunner:
         do_sample: bool = False,
         temperature: float = 1.0,
         collect_layer_outputs: bool = False,
-    ) -> FlexGenDecodeResult:
+    ) -> ModelDecodeResult:
         if token_ids.ndim != 2 or token_ids.shape[1] != 1:
             raise ValueError("Decode token_ids must have shape [batch, 1]")
         if not isinstance(token_position, int) or isinstance(token_position, bool):
@@ -76,14 +78,15 @@ class FlexGenDecodeRunner:
                 f"{token_ids.detach().cpu().reshape(-1).tolist()}"
             )
         self._log(start_message)
-        embedding_weight = self.weight_loader.load_embedding()
-        hidden_states, _, _ = run_flexgen_embedding(
+        embedding_weights = self.weight_loader.load_embedding()
+        embedding = self.operations.embed(
             token_ids,
-            embedding_weight,
-            self.config.pad_token_id,
+            embedding_weights,
+            token_position=token_position,
         )
+        hidden_states = embedding.hidden_states
         self._log(f"embedding hidden={tuple(hidden_states.shape)}")
-        del embedding_weight
+        del embedding_weights, embedding
 
         collected_outputs = [] if collect_layer_outputs else None
         valid_tokens = token_position + 1
@@ -99,7 +102,7 @@ class FlexGenDecodeRunner:
             self._log(
                 f"pipeline prefetch layer=0, history_tokens={token_position}"
             )
-        with FlexGenWeightPrefetcher(
+        with ModelWeightPrefetcher(
             self.weight_loader,
             logger=self.logger,
         ) as weight_prefetcher:
@@ -127,14 +130,10 @@ class FlexGenDecodeRunner:
                         f"Compute(current) layer={layer}"
                     )
                 self._log(f"QKV-start position={token_position}, layer={layer}")
-                projection = prepare_flexgen_decode_attention(
-                    inputs=hidden_states,
-                    weights=weights.attention,
-                    num_heads=self.config.num_attention_heads,
-                    num_key_value_heads=self.config.num_key_value_heads,
-                    token_position=token_position,
-                    rope_theta=self.config.rope_theta,
-                    epsilon=self.config.rms_norm_epsilon,
+                projection = self.operations.prepare_decode_attention(
+                    hidden_states,
+                    weights,
+                    token_position,
                 )
                 self._log(f"QKV-complete position={token_position}, layer={layer}")
                 self._log(
@@ -168,12 +167,11 @@ class FlexGenDecodeRunner:
                         query=projection.query,
                         valid_tokens=valid_tokens,
                     )
-                attention_result = finish_flexgen_decode_attention(
-                    inputs=hidden_states,
-                    projection=projection,
-                    attention_output=attention_output,
-                    weights=weights.attention,
-                    epsilon=self.config.rms_norm_epsilon,
+                attention_result = self.operations.finish_decode_attention(
+                    hidden_states,
+                    projection,
+                    attention_output,
+                    weights,
                 )
                 self._log(
                     f"layer={layer} attention="
@@ -183,7 +181,7 @@ class FlexGenDecodeRunner:
                 if collected_outputs is not None:
                     collected_outputs.append(attention_result)
                 self._log(f"MLP-start position={token_position}, layer={layer}")
-                hidden_states = run_flexgen_mlp(
+                hidden_states = self.operations.run_mlp(
                     attention_result.mlp_inputs,
                     weights.mlp,
                     residual=attention_result.hidden_states,
@@ -195,13 +193,12 @@ class FlexGenDecodeRunner:
                 del attention_result, projection, weights
                 weight_request = next_weight_request
 
-        output = run_flexgen_output_head(
-            hidden_states=hidden_states,
-            final_norm_weight=self.weight_loader.load_final_norm(),
-            lm_head_weight=self.weight_loader.load_lm_head(),
-            epsilon=self.config.rms_norm_epsilon,
-            do_sample=do_sample,
-            temperature=temperature,
+        output = self.operations.run_output_head(
+            hidden_states,
+            self.weight_loader.load_final_norm(),
+            self.weight_loader.load_lm_head(),
+            do_sample,
+            temperature,
         )
         output_message = f"output logits={tuple(output.logits.shape)}"
         if not self._low_overhead_logging:
@@ -210,7 +207,7 @@ class FlexGenDecodeRunner:
                 f"{output.next_token_ids.detach().cpu().reshape(-1).tolist()}"
             )
         self._log(output_message)
-        return FlexGenDecodeResult(
+        return ModelDecodeResult(
             hidden_states=hidden_states,
             logits=output.logits,
             next_token_ids=output.next_token_ids,

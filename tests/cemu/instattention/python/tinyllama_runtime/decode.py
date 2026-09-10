@@ -1,3 +1,5 @@
+"""TinyLlama decode attention operations."""
+
 from dataclasses import dataclass
 
 import torch

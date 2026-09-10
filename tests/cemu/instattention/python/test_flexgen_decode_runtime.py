@@ -16,7 +16,7 @@ import torch
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR / "python"))
 
-from flexgen_runtime import (
+from tinyllama_runtime import (
     FlexGenDecodeRunner,
     FlexGenGenerationRunner,
     FlexGenLlamaConfig,

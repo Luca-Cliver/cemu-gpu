@@ -36,22 +36,54 @@ static atomic_uint_fast64_t csd_total_job_ns = 0;
 static atomic_uint_fast64_t csd_job_count = 0;
 static const int CSD_BASELINE_PRINT_FREQ = 100;
 
-static bool cemu_compute_log_enabled(void)
+typedef enum CemuComputeLogMode {
+    CEMU_COMPUTE_LOG_OFF,
+    CEMU_COMPUTE_LOG_PROGRESS,
+    CEMU_COMPUTE_LOG_DETAIL,
+} CemuComputeLogMode;
+
+static CemuComputeLogMode cemu_compute_log_mode(void)
 {
     static gsize initialized;
-    static bool enabled;
+    static CemuComputeLogMode mode;
 
     if (g_once_init_enter(&initialized)) {
         const char *value = g_getenv("CEMU_COMPUTE_LOG");
 
-        enabled = value == NULL ||
-                  (value[0] && g_ascii_strcasecmp(value, "0") &&
-                   g_ascii_strcasecmp(value, "false") &&
-                   g_ascii_strcasecmp(value, "no") &&
-                   g_ascii_strcasecmp(value, "off"));
+        if (value != NULL &&
+            (!value[0] || !g_ascii_strcasecmp(value, "0") ||
+             !g_ascii_strcasecmp(value, "false") ||
+             !g_ascii_strcasecmp(value, "no") ||
+             !g_ascii_strcasecmp(value, "off"))) {
+            mode = CEMU_COMPUTE_LOG_OFF;
+        } else if (value != NULL &&
+                   (!g_ascii_strcasecmp(value, "progress") ||
+                    !g_ascii_strcasecmp(value, "summary"))) {
+            mode = CEMU_COMPUTE_LOG_PROGRESS;
+        } else {
+            mode = CEMU_COMPUTE_LOG_DETAIL;
+        }
         g_once_init_leave(&initialized, 1);
     }
-    return enabled;
+    return mode;
+}
+
+static uint64_t cemu_compute_progress_interval(void)
+{
+    static gsize initialized;
+    static uint64_t interval;
+
+    if (g_once_init_enter(&initialized)) {
+        const char *value = g_getenv("CEMU_COMPUTE_LOG_INTERVAL");
+        char *end = NULL;
+
+        interval = value ? g_ascii_strtoull(value, &end, 10) : 10000;
+        if (interval == 0 || (value && (!end || *end))) {
+            interval = 10000;
+        }
+        g_once_init_leave(&initialized, 1);
+    }
+    return interval;
 }
 
 struct ProgramInitArgs {
@@ -1064,7 +1096,9 @@ static uint64_t run_program_by_target(ComputeJob *job)
 static uint64_t run_functional_modeling(ComputeJob *job)
 {
     Program *program = job->program;
-    bool collect_compute_stats = cemu_compute_log_enabled();
+    CemuComputeLogMode log_mode = cemu_compute_log_mode();
+    bool collect_compute_stats = log_mode != CEMU_COMPUTE_LOG_OFF;
+    bool detailed_compute_log = log_mode == CEMU_COMPUTE_LOG_DETAIL;
     uint64_t res = 0;
     uint64_t realtime;
     uint64_t runtime = job->user_runtime;
@@ -1072,7 +1106,7 @@ static uint64_t run_functional_modeling(ComputeJob *job)
     uint64_t freeze_entry_ns = 0;
     struct timespec t0, t1;
 
-    if (collect_compute_stats) {
+    if (detailed_compute_log) {
         clock_gettime(CLOCK_MONOTONIC, &t0);
     }
 
@@ -1106,7 +1140,7 @@ static uint64_t run_functional_modeling(ComputeJob *job)
 
         femu_debug("run_on_host: program %u, runtime %lu, realtime: %lu, size %llu\n", program->pind, runtime, realtime,job->args.mr_len[0]);
 
-        if (collect_compute_stats) {
+        if (detailed_compute_log) {
             printf("CEMU_COMPUTE: program %u, realtime=%lu ns, runtime=%lu ns, "
                    "requested_runtime=%lu ns, freeze_entry=%lu ns\n",
                 program->pind, (unsigned long)realtime, (unsigned long)runtime,
@@ -1116,18 +1150,20 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         set_sched_runtime(job, runtime);
 
     if (collect_compute_stats) {
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        uint64_t job_ns = (t1.tv_sec - t0.tv_sec) * 1000000000ULL +
-                          (t1.tv_nsec - t0.tv_nsec);
         atomic_fetch_add_explicit(&csd_total_compute_ns,
                                   (uint_fast64_t)realtime,
                                   memory_order_relaxed);
-        atomic_fetch_add_explicit(&csd_total_job_ns,
-                                  (uint_fast64_t)job_ns,
-                                  memory_order_relaxed);
         uint64_t jobs = atomic_fetch_add_explicit(&csd_job_count, 1,
                                                    memory_order_relaxed) + 1;
-        if (jobs % CSD_BASELINE_PRINT_FREQ == 0) {
+        if (detailed_compute_log) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            uint64_t job_ns = (t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+                              (t1.tv_nsec - t0.tv_nsec);
+            atomic_fetch_add_explicit(&csd_total_job_ns,
+                                      (uint_fast64_t)job_ns,
+                                      memory_order_relaxed);
+        }
+        if (detailed_compute_log && jobs % CSD_BASELINE_PRINT_FREQ == 0) {
             uint64_t total_c = atomic_load_explicit(&csd_total_compute_ns,
                                                     memory_order_relaxed);
             uint64_t total_j = atomic_load_explicit(&csd_total_job_ns,
@@ -1135,6 +1171,14 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             double frac = total_j ? ((double)total_c / (double)total_j) : 0.0;
             femu_log("CSD baseline: jobs=%lu, compute_ns=%lu, total_ns=%lu, "
                      "compute_fraction=%.4f\n", jobs, total_c, total_j, frac);
+        } else if (log_mode == CEMU_COMPUTE_LOG_PROGRESS &&
+                   jobs % cemu_compute_progress_interval() == 0) {
+            uint64_t total_c = atomic_load_explicit(&csd_total_compute_ns,
+                                                    memory_order_relaxed);
+            femu_log("CEMU compute progress: jobs=%lu, last_program=%u, "
+                     "last_realtime_ns=%lu, avg_realtime_ns=%lu\n",
+                     jobs, program->pind, (unsigned long)realtime,
+                     (unsigned long)(total_c / jobs));
         }
     }
     return res;

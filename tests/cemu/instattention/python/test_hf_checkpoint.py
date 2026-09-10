@@ -6,8 +6,8 @@ from unittest import mock
 
 import torch
 
-from flexgen_runtime import FlexGenLlamaConfig
-from flexgen_runtime.hf_checkpoint import FlexGenHfCheckpointLoader
+from tinyllama_runtime import FlexGenLlamaConfig
+from tinyllama_runtime.hf_checkpoint import FlexGenHfCheckpointLoader
 
 
 class _FakeSafeTensorHandle:
@@ -74,7 +74,7 @@ class FlexGenHfCheckpointLoaderTest(unittest.TestCase):
         fake_safe_open = _FakeSafeOpen({str(shard_path.resolve()): tensors})
 
         with mock.patch(
-            "flexgen_runtime.hf_checkpoint._safe_open",
+            "tinyllama_runtime.hf_checkpoint._safe_open",
             fake_safe_open,
         ):
             with FlexGenHfCheckpointLoader(
@@ -126,7 +126,7 @@ class FlexGenHfCheckpointLoaderTest(unittest.TestCase):
 
         fake_safe_open = _FakeSafeOpen(tensors_by_path)
         with mock.patch(
-            "flexgen_runtime.hf_checkpoint._safe_open",
+            "tinyllama_runtime.hf_checkpoint._safe_open",
             fake_safe_open,
         ):
             with FlexGenHfCheckpointLoader(
@@ -150,7 +150,7 @@ class FlexGenHfCheckpointLoaderTest(unittest.TestCase):
         fake_safe_open = _FakeSafeOpen({str(shard_path.resolve()): tensors})
 
         with mock.patch(
-            "flexgen_runtime.hf_checkpoint._safe_open",
+            "tinyllama_runtime.hf_checkpoint._safe_open",
             fake_safe_open,
         ):
             with FlexGenHfCheckpointLoader(
@@ -167,7 +167,7 @@ class FlexGenHfCheckpointLoaderTest(unittest.TestCase):
         fake_safe_open = _FakeSafeOpen({str(shard_path.resolve()): tensors})
 
         with mock.patch(
-            "flexgen_runtime.hf_checkpoint._safe_open",
+            "tinyllama_runtime.hf_checkpoint._safe_open",
             fake_safe_open,
         ):
             with FlexGenHfCheckpointLoader(

@@ -17,7 +17,7 @@ sys.path.insert(0, str(PROJECT_DIR / "python"))
 
 from cemu_flexgen import KvCacheLayout, KvCacheStore, KvLayoutConfig
 from flexgen_adapter import FlexGenAttentionBackend
-from flexgen_runtime import (
+from tinyllama_runtime import (
     FlexGenLlamaConfig,
     FlexGenPrefillRunner,
     FlexGenWeightLoader,

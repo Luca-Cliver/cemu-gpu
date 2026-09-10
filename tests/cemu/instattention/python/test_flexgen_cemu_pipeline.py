@@ -23,7 +23,7 @@ from cemu_flexgen import (
     align_up,
 )
 from flexgen_adapter import FlexGenAttentionBackend
-from flexgen_runtime import (
+from tinyllama_runtime import (
     FlexGenDecodeRunner,
     FlexGenGenerationRunner,
     FlexGenLlamaConfig,

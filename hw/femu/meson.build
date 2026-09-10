@@ -1,7 +1,8 @@
 softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files(
   'dma.c', 'intr.c', 'nvme-util.c', 'nvme-admin.c', 'nvme-io.c', 'femu.c',
   'param.c','lib/pqueue.c', 'lib/rte_ring.c', 'lib/slab.c',
-  'backend/backend.c', 'backend/dram.c', 'timing-model/timing.c',
+  'backend/backend.c', 'backend/dram.c', 'backend/file.c',
+  'timing-model/timing.c',
   'nossd/nop.c', 'nand/nand.c',
   # TODO: open-channel support is dropped
   # 'ocssd/oc12.c', 'ocssd/oc20.c',

@@ -70,6 +70,11 @@ def parse_args():
     parser.add_argument("--fdm-dir", default="/mnt/fdm0")
     parser.add_argument("--program")
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument(
+        "--dtype",
+        choices=("float16", "float32"),
+        default="float32",
+    )
     parser.add_argument("--token-count", type=positive_integer, default=17)
     parser.add_argument(
         "--cuda-shared-memory-bytes",
@@ -90,14 +95,18 @@ def attention_reference(query, keys, values, num_kv_heads, scale):
             kv_head = query_head * num_kv_heads // num_query_heads
             scores = np.empty(token_count, dtype=np.float32)
             for token in range(token_count):
-                scores[token] = (
-                    np.dot(query[batch, query_head], keys[token, batch, kv_head])
-                    * scale
+                score = (
+                    np.dot(
+                        query[batch, query_head].astype(np.float32),
+                        keys[token, batch, kv_head].astype(np.float32),
+                    ) * scale
                 )
+                scores[token] = score
             probabilities = np.exp(scores - np.max(scores))
             probabilities /= np.sum(probabilities)
             output[batch, query_head] = np.sum(
-                probabilities[:, np.newaxis] * values[:, batch, kv_head],
+                probabilities[:, np.newaxis]
+                * values[:, batch, kv_head].astype(np.float32),
                 axis=0,
             )
     return output
@@ -168,6 +177,7 @@ def main():
     num_kv_heads = 2
     head_dim = 8
     token_count = args.token_count
+    dtype = np.dtype(args.dtype)
     required_shared_bytes = token_count * np.dtype(np.float32).itemsize
     if args.cuda and required_shared_bytes > args.cuda_shared_memory_bytes:
         max_tokens = args.cuda_shared_memory_bytes // np.dtype(np.float32).itemsize
@@ -178,19 +188,19 @@ def main():
         )
     rng = np.random.default_rng(20260902)
     queries = [
-        rng.normal(size=(batch_size, num_query_heads, head_dim)).astype(np.float32)
+        rng.normal(size=(batch_size, num_query_heads, head_dim)).astype(dtype)
         for _ in range(num_layers)
     ]
     keys = [
         rng.normal(
             size=(token_count, batch_size, num_kv_heads, head_dim)
-        ).astype(np.float32)
+        ).astype(dtype)
         for _ in range(num_layers)
     ]
     values = [
         rng.normal(
             size=(token_count, batch_size, num_kv_heads, head_dim)
-        ).astype(np.float32)
+        ).astype(dtype)
         for _ in range(num_layers)
     ]
 
@@ -201,7 +211,7 @@ def main():
             batch_size=batch_size,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            dtype=np.float32,
+            dtype=dtype,
         )
     )
     staging_bytes = token_count * layout.token_stride
@@ -285,7 +295,13 @@ def main():
             assert not set(range_paths[0]).intersection(range_paths[1])
 
         for layer, output in enumerate(outputs):
-            np.testing.assert_allclose(output, expected[layer], rtol=2e-5, atol=2e-5)
+            tolerance = 3e-3 if dtype == np.dtype(np.float16) else 2e-5
+            np.testing.assert_allclose(
+                output,
+                expected[layer],
+                rtol=tolerance,
+                atol=tolerance,
+            )
 
         second_load_start = timeline.event_time("load-start request=1")
         second_load_complete = timeline.event_time("load-complete request=1")
@@ -304,7 +320,10 @@ def main():
         overlap_us = max(0.0, overlap_end - overlap_start)
         overlap_observed = overlap_us > 0.0
         mode = "CUDA device-pointer" if args.cuda else "CPU host"
-        print(f"[slot-device] mode={mode}, programs={program_ids}, MRS={mrs_ids}")
+        print(
+            f"[slot-device] mode={mode}, dtype={dtype.name}, "
+            f"programs={program_ids}, MRS={mrs_ids}"
+        )
         print(
             "[slot-device] shared NVM: "
             f"K={k_cache_path}, V={v_cache_path}, layers={num_layers}"

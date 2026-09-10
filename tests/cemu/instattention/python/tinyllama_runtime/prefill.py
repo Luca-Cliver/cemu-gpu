@@ -1,3 +1,5 @@
+"""TinyLlama prefill attention operations."""
+
 import math
 from dataclasses import dataclass
 from typing import Optional

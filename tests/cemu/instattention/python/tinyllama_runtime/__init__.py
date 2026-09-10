@@ -1,3 +1,5 @@
+"""TinyLlama/Llama runtime used by the CEMU integration tests."""
+
 from .decode import (
     FlexGenDecodeAttentionOutput,
     FlexGenDecodeProjection,

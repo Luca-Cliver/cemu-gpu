@@ -420,11 +420,21 @@ static void nvme_ns_init_identify_cs_indep(FemuCtrl *n, NvmeIdNsCsIndep *id_ns)
     id_ns->nstat |= NVME_NSTAT_NRDY;
 }
 
-static SsdBackend *init_nvm_backend(FemuCtrl *n, size_t size)
+static SsdBackend *init_nvm_backend(FemuCtrl *n, NvmeNamespace *ns)
 {
     SsdBackend *mbe;
+    BackendType type = FEMU_DRAM_BACKEND;
+    char *path = NULL;
 
-    init_backend(&mbe, FEMU_DRAM_BACKEND, NULL, size);
+    if (ns->csi == NVME_CSI_NVM && n->nvm_backend_file &&
+        n->nvm_backend_file[0]) {
+        type = FEMU_FILE_BACKEND;
+        path = n->nvm_backend_file;
+    }
+    if (init_backend(&mbe, type, path, ns->size) != 0) {
+        femu_err("Failed to initialize namespace %u backend\n", ns->id);
+        abort();
+    }
 
     mbe->femu_mode = n->femu_mode;
     return mbe;
@@ -454,7 +464,7 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
         ns->ns_blks = ns_blks(ns, lba_index);
         ns->util = bitmap_new(num_blks);
         ns->uncorrectable = bitmap_new(num_blks);
-        ns->backend = init_nvm_backend(n, ns->size);
+        ns->backend = init_nvm_backend(n, ns);
     }
 
     // TODO: different ns impl, open-channel, fpga...
@@ -700,6 +710,7 @@ static void femu_exit(PCIDevice *pci_dev)
 
 static Property femu_props[] = {
     DEFINE_PROP_STRING("config_file", FemuCtrl, config_file),
+    DEFINE_PROP_STRING("nvm_backend_file", FemuCtrl, nvm_backend_file),
     DEFINE_PROP_END_OF_LIST(),
 };
 

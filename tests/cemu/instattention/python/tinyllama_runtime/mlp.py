@@ -1,3 +1,5 @@
+"""TinyLlama SwiGLU MLP operations."""
+
 import torch
 import torch.nn.functional as F
 

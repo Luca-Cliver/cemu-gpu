@@ -1,37 +1,39 @@
+"""Model-independent autoregressive generation loop."""
+
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import torch
 
-from .decode_runner import FlexGenDecodeResult, FlexGenDecodeRunner
+from .decode_runner import ModelDecodeResult, ModelDecodeRunner
 
 
 @dataclass(frozen=True)
-class FlexGenGenerationStep:
+class ModelGenerationStep:
     step: int
     token_position: int
     input_token_ids: torch.Tensor
-    decode_result: FlexGenDecodeResult
+    decode_result: ModelDecodeResult
 
 
 @dataclass(frozen=True)
-class FlexGenGenerationResult:
+class ModelGenerationResult:
     token_ids: torch.Tensor
-    steps: Tuple[FlexGenGenerationStep, ...]
+    steps: Tuple[ModelGenerationStep, ...]
 
     @property
     def next_token_ids(self) -> torch.Tensor:
         return self.token_ids[:, -1:]
 
 
-class FlexGenGenerationRunner:
+class ModelGenerationRunner:
     def __init__(
         self,
-        decode_runner: FlexGenDecodeRunner,
+        decode_runner: ModelDecodeRunner,
         logger: Optional[Callable[[str], None]] = None,
     ):
-        if not isinstance(decode_runner, FlexGenDecodeRunner):
-            raise TypeError("decode_runner must be a FlexGenDecodeRunner")
+        if not isinstance(decode_runner, ModelDecodeRunner):
+            raise TypeError("decode_runner must be a ModelDecodeRunner")
         if logger is not None and not callable(logger):
             raise TypeError("logger must be callable")
 
@@ -46,7 +48,8 @@ class FlexGenGenerationRunner:
         do_sample: bool = False,
         temperature: float = 1.0,
         collect_layer_outputs: bool = False,
-    ) -> FlexGenGenerationResult:
+        collect_steps: bool = True,
+    ) -> ModelGenerationResult:
         if initial_token_ids.ndim != 2 or initial_token_ids.shape[1] != 1:
             raise ValueError("initial_token_ids must have shape [batch, 1]")
         if not isinstance(start_position, int) or isinstance(start_position, bool):
@@ -87,19 +90,22 @@ class FlexGenGenerationRunner:
             )
             current_token_ids = decode_result.next_token_ids
             token_sequence.append(current_token_ids.detach().clone())
-            steps.append(
-                FlexGenGenerationStep(
-                    step=step,
-                    token_position=token_position,
-                    input_token_ids=input_token_ids,
-                    decode_result=decode_result,
+            if collect_steps:
+                steps.append(
+                    ModelGenerationStep(
+                        step=step,
+                        token_position=token_position,
+                        input_token_ids=input_token_ids,
+                        decode_result=decode_result,
+                    )
                 )
-            )
             if self.logger is not None:
                 self._log(
                     f"step={step} output="
                     f"{current_token_ids.detach().cpu().reshape(-1).tolist()}"
                 )
+            if not collect_steps:
+                del decode_result
 
         generated = torch.cat(token_sequence, dim=1)
         if self.logger is not None:
@@ -107,7 +113,7 @@ class FlexGenGenerationRunner:
                 f"complete token_ids={tuple(generated.shape)}, "
                 f"last_tokens={generated[:, -1].detach().cpu().tolist()}"
             )
-        return FlexGenGenerationResult(
+        return ModelGenerationResult(
             token_ids=generated,
             steps=tuple(steps),
         )

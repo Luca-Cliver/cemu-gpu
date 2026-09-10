@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdint>
@@ -10,6 +11,11 @@
 #include "cemu_def.h"
 
 namespace {
+
+uint32_t element_size(uint32_t dtype)
+{
+    return dtype == CEMU_ATTENTION_DTYPE_FLOAT16 ? sizeof(__half) : sizeof(float);
+}
 
 bool cuda_ok(cudaError_t error, const char *operation)
 {
@@ -56,14 +62,15 @@ bool load_metadata(const cemu_args *args, cemu_attention_metadata *metadata)
     }
     std::memcpy(metadata, args->data_buffer, sizeof(*metadata));
     if (metadata->version != CEMU_ATTENTION_ABI_VERSION ||
-        metadata->dtype != CEMU_ATTENTION_DTYPE_FLOAT32 ||
+        (metadata->dtype != CEMU_ATTENTION_DTYPE_FLOAT32 &&
+         metadata->dtype != CEMU_ATTENTION_DTYPE_FLOAT16) ||
         metadata->batch_size == 0 || metadata->num_query_heads == 0 ||
         metadata->num_kv_heads == 0 || metadata->head_dim == 0 ||
         metadata->token_count == 0 ||
         metadata->num_query_heads % metadata->num_kv_heads != 0 ||
         metadata->token_stride % 512 != 0 ||
         metadata->token_stride < metadata->batch_size * metadata->num_kv_heads *
-                                     metadata->head_dim * sizeof(float) ||
+                                     metadata->head_dim * element_size(metadata->dtype) ||
         !std::isfinite(metadata->scale) || metadata->scale <= 0.0f ||
         (metadata->flags & ~(CEMU_ATTENTION_FLAG_RESET_STATE |
                              CEMU_ATTENTION_FLAG_FINALIZE)) != 0 ||
@@ -88,12 +95,13 @@ bool validate_ranges(const cemu_args *args, const cemu_attention_metadata &metad
         }
     }
 
+    const uint64_t storage_element_size = element_size(metadata.dtype);
     const uint64_t query_bytes =
         static_cast<uint64_t>(metadata.batch_size) * metadata.num_query_heads *
-        metadata.head_dim * sizeof(float);
+        metadata.head_dim * storage_element_size;
     const uint64_t token_payload_bytes =
         static_cast<uint64_t>(metadata.batch_size) * metadata.num_kv_heads *
-        metadata.head_dim * sizeof(float);
+        metadata.head_dim * storage_element_size;
     const uint64_t kv_bytes =
         static_cast<uint64_t>(metadata.token_count - 1) * metadata.token_stride +
         token_payload_bytes;
@@ -106,26 +114,48 @@ bool validate_ranges(const cemu_args *args, const cemu_attention_metadata &metad
            query_bytes <= static_cast<uint64_t>(args->mr_len[4]);
 }
 
-__device__ const float *kv_head(const uint8_t *base,
-                                uint32_t token_stride,
-                                uint32_t num_kv_heads,
-                                uint32_t head_dim,
-                                uint32_t token,
-                                uint32_t batch,
-                                uint32_t head)
+__device__ float storage_to_float(float value)
+{
+    return value;
+}
+
+__device__ float storage_to_float(__half value)
+{
+    return __half2float(value);
+}
+
+__device__ void store_from_float(float *base, uint64_t index, float value)
+{
+    base[index] = value;
+}
+
+__device__ void store_from_float(__half *base, uint64_t index, float value)
+{
+    base[index] = __float2half_rn(value);
+}
+
+template <typename Storage>
+__device__ const Storage *kv_head(const uint8_t *base,
+                                  uint32_t token_stride,
+                                  uint32_t num_kv_heads,
+                                  uint32_t head_dim,
+                                  uint32_t token,
+                                  uint32_t batch,
+                                  uint32_t head)
 {
     const uint8_t *token_base =
         base + static_cast<uint64_t>(token) * token_stride;
     const uint64_t head_index =
         static_cast<uint64_t>(batch) * num_kv_heads + head;
-    return reinterpret_cast<const float *>(token_base) + head_index * head_dim;
+    return reinterpret_cast<const Storage *>(token_base) + head_index * head_dim;
 }
 
-__global__ void dense_attention_kernel(const float *query,
+template <typename Storage>
+__global__ void dense_attention_kernel(const Storage *query,
                                        const uint8_t *key_staging,
                                        const uint8_t *value_staging,
                                        float *state,
-                                       float *output,
+                                       Storage *output,
                                        uint32_t batch_size,
                                        uint32_t num_query_heads,
                                        uint32_t num_kv_heads,
@@ -146,18 +176,19 @@ __global__ void dense_attention_kernel(const float *query,
         query_head * num_kv_heads / num_query_heads;
     const uint64_t query_offset =
         static_cast<uint64_t>(query_vector_index) * head_dim;
-    const float *query_vector = query + query_offset;
+    const Storage *query_vector = query + query_offset;
     extern __shared__ float probabilities[];
 
     if (threadIdx.x == 0) {
         float chunk_maximum = -INFINITY;
         for (uint32_t token = 0; token < token_count; ++token) {
-            const float *key_vector = kv_head(
+            const Storage *key_vector = kv_head<Storage>(
                 key_staging, token_stride, num_kv_heads, head_dim,
                 token, batch, kv_head_index);
             float score = 0.0f;
             for (uint32_t dimension = 0; dimension < head_dim; ++dimension) {
-                score += query_vector[dimension] * key_vector[dimension];
+                score += storage_to_float(query_vector[dimension]) *
+                         storage_to_float(key_vector[dimension]);
             }
             score *= scale;
             probabilities[token] = score;
@@ -193,10 +224,11 @@ __global__ void dense_attention_kernel(const float *query,
         for (uint32_t dimension = 0; dimension < head_dim; ++dimension) {
             float chunk_weighted_sum = 0.0f;
             for (uint32_t token = 0; token < token_count; ++token) {
-                const float *value_vector = kv_head(
+                const Storage *value_vector = kv_head<Storage>(
                     value_staging, token_stride, num_kv_heads, head_dim,
                     token, batch, kv_head_index);
-                chunk_weighted_sum += probabilities[token] * value_vector[dimension];
+                chunk_weighted_sum +=
+                    probabilities[token] * storage_to_float(value_vector[dimension]);
             }
             state_record[2 + dimension] =
                 state_record[2 + dimension] * previous_scale +
@@ -206,10 +238,11 @@ __global__ void dense_attention_kernel(const float *query,
         state_record[1] = new_denominator;
 
         if (flags & CEMU_ATTENTION_FLAG_FINALIZE) {
-            float *output_vector = output + query_offset;
             for (uint32_t dimension = 0; dimension < head_dim; ++dimension) {
-                output_vector[dimension] =
-                    state_record[2 + dimension] / state_record[1];
+                store_from_float(
+                    output,
+                    query_offset + dimension,
+                    state_record[2 + dimension] / state_record[1]);
             }
         }
     }
@@ -240,20 +273,37 @@ extern "C" long long dense_attention(struct cemu_args *args)
 
     const uint32_t block_count = metadata.batch_size * metadata.num_query_heads;
     constexpr uint32_t threads_per_block = 256;
-    dense_attention_kernel<<<block_count, threads_per_block, shared_bytes>>>(
-        static_cast<const float *>(args->mr_dev_addr[0]),
-        static_cast<const uint8_t *>(args->mr_dev_addr[1]),
-        static_cast<const uint8_t *>(args->mr_dev_addr[2]),
-        static_cast<float *>(args->mr_dev_addr[3]),
-        static_cast<float *>(args->mr_dev_addr[4]),
-        metadata.batch_size,
-        metadata.num_query_heads,
-        metadata.num_kv_heads,
-        metadata.head_dim,
-        metadata.token_count,
-        metadata.token_stride,
-        metadata.scale,
-        metadata.flags);
+    if (metadata.dtype == CEMU_ATTENTION_DTYPE_FLOAT16) {
+        dense_attention_kernel<<<block_count, threads_per_block, shared_bytes>>>(
+            static_cast<const __half *>(args->mr_dev_addr[0]),
+            static_cast<const uint8_t *>(args->mr_dev_addr[1]),
+            static_cast<const uint8_t *>(args->mr_dev_addr[2]),
+            static_cast<float *>(args->mr_dev_addr[3]),
+            static_cast<__half *>(args->mr_dev_addr[4]),
+            metadata.batch_size,
+            metadata.num_query_heads,
+            metadata.num_kv_heads,
+            metadata.head_dim,
+            metadata.token_count,
+            metadata.token_stride,
+            metadata.scale,
+            metadata.flags);
+    } else {
+        dense_attention_kernel<<<block_count, threads_per_block, shared_bytes>>>(
+            static_cast<const float *>(args->mr_dev_addr[0]),
+            static_cast<const uint8_t *>(args->mr_dev_addr[1]),
+            static_cast<const uint8_t *>(args->mr_dev_addr[2]),
+            static_cast<float *>(args->mr_dev_addr[3]),
+            static_cast<float *>(args->mr_dev_addr[4]),
+            metadata.batch_size,
+            metadata.num_query_heads,
+            metadata.num_kv_heads,
+            metadata.head_dim,
+            metadata.token_count,
+            metadata.token_stride,
+            metadata.scale,
+            metadata.flags);
+    }
     if (!cuda_ok(cudaGetLastError(), "dense_attention_kernel launch") ||
         !cuda_ok(cudaDeviceSynchronize(), "cudaDeviceSynchronize")) {
         return -1;

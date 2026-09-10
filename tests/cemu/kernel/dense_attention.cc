@@ -9,6 +9,99 @@
 
 namespace {
 
+uint32_t element_size(uint32_t dtype)
+{
+    return dtype == CEMU_ATTENTION_DTYPE_FLOAT16 ? sizeof(uint16_t) : sizeof(float);
+}
+
+float half_to_float(uint16_t value)
+{
+    const uint32_t sign = static_cast<uint32_t>(value & 0x8000U) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fU;
+    uint32_t mantissa = value & 0x03ffU;
+    uint32_t bits = 0;
+
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            exponent = 127 - 15 + 1;
+            while ((mantissa & 0x0400U) == 0) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            mantissa &= 0x03ffU;
+            bits = sign | (exponent << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1fU) {
+        bits = sign | 0x7f800000U | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+    }
+
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+uint16_t float_to_half(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000U);
+    const uint32_t source_exponent = (bits >> 23) & 0xffU;
+    uint32_t mantissa = bits & 0x007fffffU;
+
+    if (source_exponent == 0xffU) {
+        if (mantissa == 0) {
+            return static_cast<uint16_t>(sign | 0x7c00U);
+        }
+        return static_cast<uint16_t>(sign | 0x7c00U | (mantissa >> 13) | 1U);
+    }
+
+    int exponent = static_cast<int>(source_exponent) - 127 + 15;
+    if (exponent >= 31) {
+        return static_cast<uint16_t>(sign | 0x7c00U);
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) {
+            return sign;
+        }
+        mantissa |= 0x00800000U;
+        const uint32_t shift = static_cast<uint32_t>(14 - exponent);
+        const uint32_t rounded = mantissa + (1U << (shift - 1));
+        return static_cast<uint16_t>(sign | (rounded >> shift));
+    }
+
+    mantissa += 0x00001000U;
+    if (mantissa & 0x00800000U) {
+        mantissa = 0;
+        ++exponent;
+        if (exponent >= 31) {
+            return static_cast<uint16_t>(sign | 0x7c00U);
+        }
+    }
+    return static_cast<uint16_t>(
+        sign | (static_cast<uint16_t>(exponent) << 10) | (mantissa >> 13));
+}
+
+float load_value(const void *base, uint64_t index, uint32_t dtype)
+{
+    if (dtype == CEMU_ATTENTION_DTYPE_FLOAT16) {
+        return half_to_float(static_cast<const uint16_t *>(base)[index]);
+    }
+    return static_cast<const float *>(base)[index];
+}
+
+void store_value(void *base, uint64_t index, uint32_t dtype, float value)
+{
+    if (dtype == CEMU_ATTENTION_DTYPE_FLOAT16) {
+        static_cast<uint16_t *>(base)[index] = float_to_half(value);
+    } else {
+        static_cast<float *>(base)[index] = value;
+    }
+}
+
 bool load_metadata(const cemu_args *args, cemu_attention_metadata *metadata)
 {
     if (!args || !metadata || !args->data_buffer ||
@@ -19,14 +112,15 @@ bool load_metadata(const cemu_args *args, cemu_attention_metadata *metadata)
 
     std::memcpy(metadata, args->data_buffer, sizeof(*metadata));
     if (metadata->version != CEMU_ATTENTION_ABI_VERSION ||
-        metadata->dtype != CEMU_ATTENTION_DTYPE_FLOAT32 ||
+        (metadata->dtype != CEMU_ATTENTION_DTYPE_FLOAT32 &&
+         metadata->dtype != CEMU_ATTENTION_DTYPE_FLOAT16) ||
         metadata->batch_size == 0 || metadata->num_query_heads == 0 ||
         metadata->num_kv_heads == 0 || metadata->head_dim == 0 ||
         metadata->token_count == 0 ||
         metadata->num_query_heads % metadata->num_kv_heads != 0 ||
         metadata->token_stride % 512 != 0 ||
         metadata->token_stride < metadata->batch_size * metadata->num_kv_heads *
-                                     metadata->head_dim * sizeof(float) ||
+                                     metadata->head_dim * element_size(metadata->dtype) ||
         !std::isfinite(metadata->scale) || metadata->scale <= 0.0f ||
         (metadata->flags & ~(CEMU_ATTENTION_FLAG_RESET_STATE |
                              CEMU_ATTENTION_FLAG_FINALIZE)) != 0) {
@@ -49,12 +143,13 @@ bool validate_ranges(const cemu_args *args, const cemu_attention_metadata &metad
         }
     }
 
+    const uint64_t storage_element_size = element_size(metadata.dtype);
     const uint64_t query_bytes =
         static_cast<uint64_t>(metadata.batch_size) * metadata.num_query_heads *
-        metadata.head_dim * sizeof(float);
+        metadata.head_dim * storage_element_size;
     const uint64_t token_payload_bytes =
         static_cast<uint64_t>(metadata.batch_size) * metadata.num_kv_heads *
-        metadata.head_dim * sizeof(float);
+        metadata.head_dim * storage_element_size;
     const uint64_t kv_bytes =
         static_cast<uint64_t>(metadata.token_count - 1) * metadata.token_stride +
         token_payload_bytes;
@@ -72,18 +167,17 @@ bool validate_ranges(const cemu_args *args, const cemu_attention_metadata &metad
     return true;
 }
 
-const float *kv_head(const void *base,
-                     const cemu_attention_metadata &metadata,
-                     uint32_t token,
-                     uint32_t batch,
-                     uint32_t head)
+const void *kv_head(const void *base,
+                    const cemu_attention_metadata &metadata,
+                    uint32_t token,
+                    uint32_t batch,
+                    uint32_t head)
 {
     const uint8_t *token_base = static_cast<const uint8_t *>(base) +
                                 static_cast<uint64_t>(token) * metadata.token_stride;
     const uint64_t head_index =
         static_cast<uint64_t>(batch) * metadata.num_kv_heads + head;
-    return reinterpret_cast<const float *>(token_base) +
-           head_index * metadata.head_dim;
+    return token_base + head_index * metadata.head_dim * element_size(metadata.dtype);
 }
 
 }  // namespace
@@ -95,12 +189,14 @@ extern "C" long long dense_attention(struct cemu_args *args)
         return -1;
     }
 
-    const float *query = static_cast<const float *>(args->mr_addr[0]);
+    const void *query = args->mr_addr[0];
     const void *key_staging = args->mr_addr[1];
     const void *value_staging = args->mr_addr[2];
     float *state = static_cast<float *>(args->mr_addr[3]);
-    float *output = static_cast<float *>(args->mr_addr[4]);
+    void *output = args->mr_addr[4];
     const uint64_t state_stride = metadata.head_dim + 2;
+    std::vector<float> scores(metadata.token_count);
+    std::vector<float> weighted_sum(metadata.head_dim);
 
     for (uint32_t batch = 0; batch < metadata.batch_size; ++batch) {
         for (uint32_t query_head = 0;
@@ -111,7 +207,6 @@ extern "C" long long dense_attention(struct cemu_args *args)
             const uint64_t query_index =
                 (static_cast<uint64_t>(batch) * metadata.num_query_heads + query_head) *
                 metadata.head_dim;
-            const float *query_vector = query + query_index;
             float *state_record = state +
                 (static_cast<uint64_t>(batch) * metadata.num_query_heads +
                  query_head) * state_stride;
@@ -127,15 +222,15 @@ extern "C" long long dense_attention(struct cemu_args *args)
             }
 
             float chunk_maximum = -INFINITY;
-            std::vector<float> scores(metadata.token_count);
             for (uint32_t token = 0; token < metadata.token_count; ++token) {
-                const float *key_vector =
+                const void *key_vector =
                     kv_head(key_staging, metadata, token, batch, kv_head_index);
                 float score = 0.0f;
                 for (uint32_t dimension = 0;
                      dimension < metadata.head_dim;
                      ++dimension) {
-                    score += query_vector[dimension] * key_vector[dimension];
+                    score += load_value(query, query_index + dimension, metadata.dtype) *
+                             load_value(key_vector, dimension, metadata.dtype);
                 }
                 score *= metadata.scale;
                 scores[token] = score;
@@ -157,15 +252,15 @@ extern "C" long long dense_attention(struct cemu_args *args)
             const float new_denominator =
                 state_record[1] * previous_scale + chunk_denominator * chunk_scale;
 
-            std::vector<float> weighted_sum(metadata.head_dim, 0.0f);
             for (uint32_t dimension = 0;
                  dimension < metadata.head_dim;
                  ++dimension) {
                 float chunk_weighted_sum = 0.0f;
                 for (uint32_t token = 0; token < metadata.token_count; ++token) {
-                    const float *value_vector =
+                    const void *value_vector =
                         kv_head(value_staging, metadata, token, batch, kv_head_index);
-                    chunk_weighted_sum += scores[token] * value_vector[dimension];
+                    chunk_weighted_sum +=
+                        scores[token] * load_value(value_vector, dimension, metadata.dtype);
                 }
                 weighted_sum[dimension] =
                     state_record[2 + dimension] * previous_scale +
@@ -181,12 +276,11 @@ extern "C" long long dense_attention(struct cemu_args *args)
             }
 
             if (metadata.flags & CEMU_ATTENTION_FLAG_FINALIZE) {
-                float *output_vector = output + query_index;
                 for (uint32_t dimension = 0;
                      dimension < metadata.head_dim;
                      ++dimension) {
-                    output_vector[dimension] =
-                        state_record[2 + dimension] / state_record[1];
+                    store_value(output, query_index + dimension, metadata.dtype,
+                                state_record[2 + dimension] / state_record[1]);
                 }
             }
         }

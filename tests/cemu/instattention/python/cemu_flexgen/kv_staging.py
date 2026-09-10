@@ -5,6 +5,8 @@ from typing import Any, Tuple
 
 import numpy as np
 
+from phase_profiler import profile_scope
+
 from .kv_layout import (
     BLOCK_ALIGNMENT,
     LAYER_ALIGNMENT,
@@ -24,6 +26,7 @@ class KvStagingManager:
         v_staging_path: Any = "/mnt/fdm0/v_staging_0",
         staging_bytes: int = 64 * 1024 * 1024,
         replace_existing: bool = False,
+        profiler: Any = None,
     ):
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
@@ -48,6 +51,7 @@ class KvStagingManager:
         self.staging_bytes = staging_bytes
         self.allocation_bytes = align_up(staging_bytes, LAYER_ALIGNMENT)
         self.replace_existing = bool(replace_existing)
+        self.profiler = profiler
         self._k_cache_fd = -1
         self._v_cache_fd = -1
         self._k_staging_fd = -1
@@ -101,22 +105,64 @@ class KvStagingManager:
         self._require_open()
         self._validate_chunk(chunk)
 
-        self._copy_file_range_all(
-            self._k_cache_fd,
-            self._k_staging_fd,
-            chunk.copy_size,
-            chunk.nvm_offset,
-            0,
-        )
-        self._copy_file_range_all(
-            self._v_cache_fd,
-            self._v_staging_fd,
-            chunk.copy_size,
-            chunk.nvm_offset,
-            0,
-        )
+        with profile_scope(
+            self.profiler,
+            "decode.nvm_to_fdm.total",
+            2 * chunk.copy_size,
+        ):
+            with profile_scope(
+                self.profiler,
+                "decode.nvm_to_fdm.key",
+                chunk.copy_size,
+            ):
+                self._copy_file_range_all(
+                    self._k_cache_fd,
+                    self._k_staging_fd,
+                    chunk.copy_size,
+                    chunk.nvm_offset,
+                    0,
+                )
+            with profile_scope(
+                self.profiler,
+                "decode.nvm_to_fdm.value",
+                chunk.copy_size,
+            ):
+                self._copy_file_range_all(
+                    self._v_cache_fd,
+                    self._v_staging_fd,
+                    chunk.copy_size,
+                    chunk.nvm_offset,
+                    0,
+                )
         self._last_chunk = chunk
         return chunk.copy_size
+
+    def bind_cache_paths(self, k_cache_path: Any, v_cache_path: Any) -> None:
+        self._require_open()
+        key_path = Path(k_cache_path)
+        value_path = Path(v_cache_path)
+        if key_path == value_path:
+            raise ValueError("K and V cache paths must be different")
+        if key_path == self.k_cache_path and value_path == self.v_cache_path:
+            return
+
+        self._validate_source_file(key_path)
+        self._validate_source_file(value_path)
+        source_flags = os.O_RDONLY | getattr(os, "O_DIRECT", 0)
+        key_fd = os.open(key_path, source_flags)
+        try:
+            value_fd = os.open(value_path, source_flags)
+        except Exception:
+            os.close(key_fd)
+            raise
+
+        os.close(self._k_cache_fd)
+        os.close(self._v_cache_fd)
+        self._k_cache_fd = key_fd
+        self._v_cache_fd = value_fd
+        self.k_cache_path = key_path
+        self.v_cache_path = value_path
+        self._last_chunk = None
 
     def read_staged_tokens(
         self,

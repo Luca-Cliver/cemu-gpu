@@ -1364,6 +1364,7 @@ typedef struct FemuCtrl {
 
     // config file path
     char*            config_file;
+    char*            nvm_backend_file;
 } FemuCtrl;
 
 typedef struct NvmePollerThreadArgument {

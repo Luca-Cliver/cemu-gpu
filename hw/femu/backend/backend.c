@@ -554,6 +554,8 @@ void backend_cuda_mark_device_dirty(SsdBackend *b, void *ptr, uint64_t len)
 int init_backend(SsdBackend **mbe, BackendType type, char *path, int64_t nbytes)
 {
     SsdBackend *b = *mbe = g_malloc0(sizeof(SsdBackend));
+    int ret;
+
     if (b == NULL) {
         femu_err("Failed to allocate memory for ssd backend!\n");
         return -1;
@@ -561,15 +563,26 @@ int init_backend(SsdBackend **mbe, BackendType type, char *path, int64_t nbytes)
 
     b->type = type;
     b->size = nbytes;
+    b->fd = -1;
 
     switch(b->type) {
     case FEMU_DRAM_BACKEND:
-        return init_dram_backend(b);
+        ret = init_dram_backend(b);
+        break;
+    case FEMU_FILE_BACKEND:
+        ret = init_file_backend(b, path);
+        break;
     default:
         femu_err("Unknown backend type!\n");
         abort();
         return -1;
     }
+
+    if (ret != 0) {
+        g_free(b);
+        *mbe = NULL;
+    }
+    return ret;
 }
 
 void free_backend(SsdBackend *b)
@@ -577,6 +590,9 @@ void free_backend(SsdBackend *b)
     switch(b->type) {
     case FEMU_DRAM_BACKEND:
         free_dram_backend(b);
+        break;
+    case FEMU_FILE_BACKEND:
+        free_file_backend(b);
         break;
     default:
         femu_err("Unknown backend type!\n");

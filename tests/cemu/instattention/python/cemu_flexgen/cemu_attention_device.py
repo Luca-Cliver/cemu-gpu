@@ -1,9 +1,12 @@
+import math
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
+
+from phase_profiler import profile_scope
 
 from .attention_abi import DenseAttentionMetadata
 from .cemu_device import CemuDevice, RangeSpec
@@ -93,6 +96,8 @@ class CemuAttentionDevice:
         replace_staging_files: bool = False,
         runtime_model: Optional[Any] = None,
         logger: Optional[Callable[[str], None]] = None,
+        attention_scale: Optional[float] = None,
+        profiler: Any = None,
     ):
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
@@ -104,11 +109,19 @@ class CemuAttentionDevice:
             getattr(runtime_model, "estimate", None)
         ):
             raise TypeError("runtime_model must provide an estimate method")
+        if attention_scale is not None and (
+            not math.isfinite(attention_scale) or attention_scale <= 0
+        ):
+            raise ValueError("attention_scale must be finite and positive")
 
         self.layout = layout
         self.buffers = buffers
         self.runtime_model = runtime_model
         self.logger = logger
+        self.profiler = profiler
+        self.attention_scale = (
+            None if attention_scale is None else float(attention_scale)
+        )
         self.ranges = buffers.range_specs()
         self.staging = KvStagingManager(
             layout=layout,
@@ -118,6 +131,7 @@ class CemuAttentionDevice:
             v_staging_path=buffers.v_staging_path,
             staging_bytes=buffers.staging_bytes,
             replace_existing=replace_staging_files,
+            profiler=profiler,
         )
         self._device_config = {
             "program_name": program_name,
@@ -179,8 +193,17 @@ class CemuAttentionDevice:
         )
         return self
 
-    def stage_chunk(self, chunk: KvChunk) -> int:
+    def stage_chunk(
+        self,
+        chunk: KvChunk,
+        k_cache_path: Any = None,
+        v_cache_path: Any = None,
+    ) -> int:
         self._require_device()
+        if (k_cache_path is None) != (v_cache_path is None):
+            raise ValueError("K and V cache paths must be provided together")
+        if k_cache_path is not None:
+            self.staging.bind_cache_paths(k_cache_path, v_cache_path)
         copied = self.staging.stage_chunk(chunk)
         self._log(
             f"stage layer={chunk.layer}, tokens=[{chunk.start_token}, "
@@ -235,9 +258,15 @@ class CemuAttentionDevice:
             )
 
         if write_query:
-            device.write_tensor(AttentionRange.QUERY, query_array)
+            with profile_scope(
+                self.profiler,
+                "decode.fdm_query_write",
+                query_array.nbytes,
+            ):
+                device.write_tensor(AttentionRange.QUERY, query_array)
         runtime_ns = self._estimate_runtime_ns(metadata)
-        device.execute(runtime=runtime_ns, metadata=metadata.pack())
+        with profile_scope(self.profiler, "decode.cemu_execute"):
+            device.execute(runtime=runtime_ns, metadata=metadata.pack())
         self._log(
             f"execute chunk_tokens={chunk.token_count}, "
             f"reset={metadata.reset_state}, finalize={metadata.finalize}, "
@@ -258,16 +287,21 @@ class CemuAttentionDevice:
         key_array = self._normalize_cache_token("key", key)
         value_array = self._normalize_cache_token("value", value)
         range_offset = chunk.token_count * self.layout.token_stride
-        device.write_tensor(
-            AttentionRange.KEY_STAGING,
-            self._pack_cache_token(key_array),
-            range_offset=range_offset,
-        )
-        device.write_tensor(
-            AttentionRange.VALUE_STAGING,
-            self._pack_cache_token(value_array),
-            range_offset=range_offset,
-        )
+        with profile_scope(
+            self.profiler,
+            "decode.fdm_append_kv",
+            2 * self.layout.token_stride,
+        ):
+            device.write_tensor(
+                AttentionRange.KEY_STAGING,
+                self._pack_cache_token(key_array),
+                range_offset=range_offset,
+            )
+            device.write_tensor(
+                AttentionRange.VALUE_STAGING,
+                self._pack_cache_token(value_array),
+                range_offset=range_offset,
+            )
 
         extended_chunk = KvChunk(
             layer=chunk.layer,
@@ -287,11 +321,17 @@ class CemuAttentionDevice:
         """Collect the finalized Attention output from the CEMU output range."""
         if not isinstance(metadata, DenseAttentionMetadata):
             raise TypeError("metadata must be DenseAttentionMetadata")
-        output = self._require_device().read_tensor(
-            AttentionRange.OUTPUT,
-            metadata.output_shape,
-            metadata.dtype,
-        )
+        output_bytes = int(np.prod(metadata.output_shape)) * metadata.dtype.itemsize
+        with profile_scope(
+            self.profiler,
+            "decode.fdm_output_read",
+            output_bytes,
+        ):
+            output = self._require_device().read_tensor(
+                AttentionRange.OUTPUT,
+                metadata.output_shape,
+                metadata.dtype,
+            )
         self._log(f"collect output={output.shape}")
         return output
 
@@ -331,6 +371,7 @@ class CemuAttentionDevice:
                 self.layout,
                 num_query_heads=query_array.shape[1],
                 token_count=chunk.token_count,
+                scale=self.attention_scale,
                 reset_state=chunk_index == 0,
                 finalize=chunk_index == len(chunks) - 1,
             )

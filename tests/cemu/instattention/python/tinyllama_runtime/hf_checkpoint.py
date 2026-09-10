@@ -1,3 +1,5 @@
+"""Hugging Face checkpoint loading for TinyLlama/Llama."""
+
 import json
 from contextlib import ExitStack
 from pathlib import Path

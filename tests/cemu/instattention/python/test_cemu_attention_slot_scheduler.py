@@ -34,6 +34,7 @@ class FakeAttentionSlot:
         self.layout = layout
         self.buffers = SimpleNamespace(staging_bytes=staging_bytes)
         self.control = control
+        self.attention_scale = 1.0
         self.is_open = False
         self.staged_chunk = None
         self.query = None

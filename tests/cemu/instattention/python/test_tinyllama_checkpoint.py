@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from flexgen_runtime import FlexGenHfCheckpointLoader, FlexGenLlamaConfig
+from tinyllama_runtime import FlexGenHfCheckpointLoader, FlexGenLlamaConfig
 
 
 def parse_args():

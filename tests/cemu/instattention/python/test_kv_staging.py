@@ -145,6 +145,38 @@ class KvStagingManagerTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 manager.read_staged_tokens()
 
+    def test_bind_cache_paths_reuses_the_same_staging_files(self):
+        second_k_path = self.nvm_path / "k_cache_second"
+        second_v_path = self.nvm_path / "v_cache_second"
+        second_keys = self.keys + np.float16(1000)
+        second_values = self.values + np.float16(2000)
+        with KvCacheStore(
+            self.layout,
+            second_k_path,
+            second_v_path,
+        ) as store:
+            store.write_tokens(1, 0, second_keys, second_values)
+            store.flush()
+
+        chunk = next(
+            self.layout.iter_chunks(
+                layer=1,
+                valid_tokens=2,
+                k_staging_bytes=self.staging_bytes,
+                v_staging_bytes=self.staging_bytes,
+            )
+        )
+        with self._new_manager() as manager:
+            manager.stage_chunk(chunk)
+            first_staged, _ = manager.read_staged_tokens()
+            manager.bind_cache_paths(second_k_path, second_v_path)
+            manager.stage_chunk(chunk)
+            second_staged, second_staged_values = manager.read_staged_tokens()
+
+        np.testing.assert_array_equal(first_staged, self.keys[:2])
+        np.testing.assert_array_equal(second_staged, second_keys[:2])
+        np.testing.assert_array_equal(second_staged_values, second_values[:2])
+
     def test_wrong_source_file_size_is_rejected(self):
         os.truncate(self.k_cache_path, 512)
 

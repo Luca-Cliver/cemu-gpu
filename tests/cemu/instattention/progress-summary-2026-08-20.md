@@ -68,11 +68,20 @@ instattention/
 │   │   └── kv_staging.py
 │   ├── flexgen_adapter/
 │   │   └── cemu_attention.py
-│   ├── flexgen_runtime/
+│   ├── runtime_common/
+│   │   ├── model_ops.py
+│   │   ├── prefill_runner.py
+│   │   ├── decode_runner.py
+│   │   ├── multi_batch_decode.py
+│   │   ├── generation.py
+│   │   ├── torch_attention.py
+│   │   └── weight_prefetch.py
+│   ├── tinyllama_runtime/
 │   │   ├── model_config.py
 │   │   ├── weights.py
 │   │   ├── embedding.py
 │   │   ├── prefill.py
+│   │   ├── ops.py
 │   │   ├── prefill_runner.py
 │   │   ├── decode.py
 │   │   ├── decode_runner.py
@@ -80,6 +89,16 @@ instattention/
 │   │   ├── reference.py
 │   │   ├── mlp.py
 │   │   └── output.py
+│   ├── opt_runtime/
+│   │   ├── config.py
+│   │   ├── checkpoint.py
+│   │   ├── weights.py
+│   │   ├── ops.py
+│   │   ├── prefill_runner.py
+│   │   ├── decode_runner.py
+│   │   ├── multi_batch_decode.py
+│   │   ├── reference.py
+│   │   └── generation.py
 │   └── test_*.py
 └── scripts/
     └── build_guest.sh
@@ -87,13 +106,25 @@ instattention/
 
 分层原则是：
 
-- `flexgen_runtime`：只负责 Llama/FlexGen 风格张量计算，不依赖 CEMU；
+- `runtime_common`：实现模型无关的逐层、microbatch、预取和自回归调度；
+- `tinyllama_runtime`：提供 TinyLlama/Llama 权重和模型操作适配；
+- `opt_runtime`：提供 OPT 权重和模型操作适配；
 - `cemu_flexgen`：封装 CEMU 设备、NVM、FDM、MRS 和 Attention ABI；
 - `flexgen_adapter`：把 FlexGen 风格的 Q/K/V 张量转换成 CEMU 所需布局；
 - `guest`：把 Python 调用转换为 CEMU ioctl 和 NVMe passthrough 命令；
 - `tests/cemu/kernel`：CSD 内实际加载的 CPU/CUDA `.so` 算子。
 
 这种分层使同一套 Prefill/Decode runtime 可以切换两种 Attention backend：纯 PyTorch reference 或 CEMU Attention。
+
+其中逐层循环、权重预取、KV Store 提交/等待、microbatch 流水和自回归循环只在
+`runtime_common` 中实现一次。TinyLlama 与 OPT 的 wrapper 仅注入各自的
+`ModelOperations`：前者实现 RMSNorm、RoPE、GQA 和 SwiGLU，后者实现 LayerNorm、
+可学习绝对位置编码、带 bias 的 MHA 和 ReLU FFN。
+
+PyTorch Dense Attention reference 也由 `runtime_common/torch_attention.py` 统一实现，
+TinyLlama 和 OPT 仅保留各自的类型检查与兼容类名。OPT 的真实模型对照测试使用
+同一段文本分别运行自定义 Prefill/Decode 和 Hugging Face `OPTForCausalLM`，比较
+Prefill KV、Prefill logits、逐步 Decode logits、最终 KV 和生成 token 序列。
 
 ## 4. 已完成的基础工作
 
@@ -263,14 +294,14 @@ Python 侧 ABI 位于 [`python/cemu_flexgen/attention_abi.py`](python/cemu_flexg
 
 ### 7.1 模型配置和权重
 
-- [`python/flexgen_runtime/model_config.py`](python/flexgen_runtime/model_config.py)：读取简化的 Llama `config.json`；
-- [`python/flexgen_runtime/weights.py`](python/flexgen_runtime/weights.py)：从独立 `.npy` 文件加载 embedding、RMSNorm、Q/K/V/O 和 MLP 权重。
+- [`python/tinyllama_runtime/model_config.py`](python/tinyllama_runtime/model_config.py)：读取简化的 Llama `config.json`；
+- [`python/tinyllama_runtime/weights.py`](python/tinyllama_runtime/weights.py)：从独立 `.npy` 文件加载 embedding、RMSNorm、Q/K/V/O 和 MLP 权重。
 
 权重被加载到 `FlexGenWeightLoader.device`，当前全流程测试中该设备是 Guest 的 `cuda:0`。
 
 ### 7.2 Prefill
 
-[`python/flexgen_runtime/prefill_runner.py`](python/flexgen_runtime/prefill_runner.py) 的执行顺序是：
+[`python/tinyllama_runtime/prefill_runner.py`](python/tinyllama_runtime/prefill_runner.py) 的执行顺序是：
 
 ```text
 token_ids
@@ -293,7 +324,7 @@ Prefill 当前全部在 Guest GPU 上完成。每层产生的 KV 按 FlexGen 形
 
 ### 7.3 单步 Decode
 
-[`python/flexgen_runtime/decode_runner.py`](python/flexgen_runtime/decode_runner.py) 接收形状为 `[batch, 1]` 的当前 token，并对每一层执行：
+[`python/tinyllama_runtime/decode_runner.py`](python/tinyllama_runtime/decode_runner.py) 接收形状为 `[batch, 1]` 的当前 token，并对每一层执行：
 
 ```text
 embedding
@@ -309,7 +340,7 @@ embedding
 
 所有 layer 完成后，执行 final norm 和 LM Head，使用 argmax 或 sampling 得到下一 token。
 
-其中 [`python/flexgen_runtime/decode.py`](python/flexgen_runtime/decode.py) 将 Attention 前后的 Guest GPU 计算拆成：
+其中 [`python/tinyllama_runtime/decode.py`](python/tinyllama_runtime/decode.py) 将 Attention 前后的 Guest GPU 计算拆成：
 
 - `prepare_flexgen_decode_attention()`：RMSNorm、Q/K/V、RoPE；
 - `finish_flexgen_decode_attention()`：接收 CEMU Attention 输出，执行 Wo、残差和后续 RMSNorm。
@@ -318,7 +349,7 @@ embedding
 
 ### 7.4 多步自回归 Decode
 
-[`python/flexgen_runtime/generation.py`](python/flexgen_runtime/generation.py) 实现真正的 token 反馈循环：
+[`python/tinyllama_runtime/generation.py`](python/tinyllama_runtime/generation.py) 实现真正的 token 反馈循环：
 
 ```text
 Prefill next token
@@ -332,7 +363,7 @@ Prefill next token
 
 ### 7.5 PyTorch reference backend
 
-[`python/flexgen_runtime/reference.py`](python/flexgen_runtime/reference.py) 在 Guest GPU 上维护一份独立 KV Cache，并使用 `einsum + softmax` 执行 Dense Attention。
+[`python/tinyllama_runtime/reference.py`](python/tinyllama_runtime/reference.py) 在 Guest GPU 上维护一份独立 KV Cache，并使用 `einsum + softmax` 执行 Dense Attention。
 
 `FlexGenDecodeRunner` 不需要知道后端是 PyTorch 还是 CEMU。因此可以用完全相同的权重、token 和非 Attention 计算，分别运行：
 
@@ -534,10 +565,10 @@ GQA runtime 已经具备，因此可以选择 TinyLlama 这类较小的 GQA 模�
 
 ### 第二步：增加真实权重 loader
 
-建议在 `flexgen_runtime` 中增加独立 loader，而不是破坏现有 `.npy` 测试 loader：
+建议在 `tinyllama_runtime` 中增加独立 loader，而不是破坏现有 `.npy` 测试 loader：
 
 ```text
-flexgen_runtime/
+tinyllama_runtime/
 ├── weights.py                 # 保留确定性单元测试 loader
 └── hf_weight_loader.py        # 新增真实模型 loader
 ```
@@ -662,10 +693,16 @@ make instattention-tinyllama-cemu-benchmark \
 ./run-csd.sh
 ```
 
-纯性能运行应先用下面的命令启动 QEMU：
+大规模功能实验可以关闭逐算子日志，只按任务数周期输出进度：
+
+```bash
+CEMU_COMPUTE_LOG=progress CEMU_COMPUTE_LOG_INTERVAL=10000 ./run-csd.sh
+```
+
+该模式每完成 `10000` 个 CSD 任务输出一次累计任务数、最近一次算子时间和平均算子时间。Figure 14 专用启动脚本默认使用这一模式。纯性能运行如果连周期统计也不需要，可以完全关闭：
 
 ```bash
 CEMU_COMPUTE_LOG=0 ./run-csd.sh
 ```
 
-关闭后不再打印每次 `CEMU_COMPUTE` 和每 100 个任务一次的 `CSD baseline`，同时跳过仅服务于这些日志的额外 `clock_gettime` 与原子计数；CEMU 功能执行、冻结和 `set_sched_runtime()` 不受影响。该变量属于宿主机 QEMU 进程环境，不能由已经启动的 Guest 性能命令临时修改。
+关闭后不再打印每次 `CEMU_COMPUTE`、周期进度和每 100 个任务一次的 `CSD baseline`，同时跳过仅服务于这些日志的额外统计；CEMU 功能执行、冻结和 `set_sched_runtime()` 不受影响。该变量属于宿主机 QEMU 进程环境，不能由已经启动的 Guest 性能命令临时修改。

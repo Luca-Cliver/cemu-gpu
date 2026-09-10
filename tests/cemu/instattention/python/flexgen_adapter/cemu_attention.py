@@ -9,6 +9,7 @@ import numpy as np
 
 from cemu_flexgen.kv_layout import KvCacheLayout
 from cemu_flexgen.kv_store import KvCacheStore
+from phase_profiler import profile_scope
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class FlexGenAttentionBackend:
         attention_scheduler: Optional[Any] = None,
         replace_existing: bool = False,
         logger: Optional[Callable[[str], None]] = None,
+        profiler: Any = None,
     ):
         if not isinstance(layout, KvCacheLayout):
             raise TypeError("layout must be a KvCacheLayout")
@@ -62,6 +64,7 @@ class FlexGenAttentionBackend:
         self.attention_device = attention_device
         self.attention_scheduler = attention_scheduler
         self.logger = logger
+        self.profiler = profiler
         self.store = KvCacheStore(
             layout=layout,
             k_path=self.k_cache_path,
@@ -166,12 +169,18 @@ class FlexGenAttentionBackend:
     def write_prefill(self, layer: int, keys: Any, values: Any) -> int:
         """Write FlexGen Prefill caches shaped [seq, batch * heads, dim]."""
         self._require_open()
-        key_array = self._normalize_cache_tokens("keys", keys)
-        value_array = self._normalize_cache_tokens("values", values)
+        with profile_scope(self.profiler, "prefill.kv_materialize"):
+            key_array = self._normalize_cache_tokens("keys", keys)
+            value_array = self._normalize_cache_tokens("values", values)
         if key_array.shape[0] != value_array.shape[0]:
             raise ValueError("keys and values must contain the same number of tokens")
 
-        self.store.write_tokens(layer, 0, key_array, value_array)
+        with profile_scope(
+            self.profiler,
+            "prefill.nvm_kv_store",
+            key_array.nbytes + value_array.nbytes,
+        ):
+            self.store.write_tokens(layer, 0, key_array, value_array)
         self._log(
             f"write layer={layer}, tokens={key_array.shape[0]}, "
             f"shape={key_array.shape}, bytes={key_array.nbytes + value_array.nbytes}"
@@ -204,11 +213,25 @@ class FlexGenAttentionBackend:
             f"query={query_array.shape}"
         )
         if self.attention_scheduler is not None:
-            request = self.attention_scheduler.submit_decode(
-                query_array,
-                layer=layer,
-                valid_tokens=valid_tokens,
+            submit_from_cache = getattr(
+                self.attention_scheduler,
+                "submit_decode_from_cache",
+                None,
             )
+            if callable(submit_from_cache):
+                request = submit_from_cache(
+                    query_array,
+                    layer=layer,
+                    valid_tokens=valid_tokens,
+                    k_cache_path=self.k_cache_path,
+                    v_cache_path=self.v_cache_path,
+                )
+            else:
+                request = self.attention_scheduler.submit_decode(
+                    query_array,
+                    layer=layer,
+                    valid_tokens=valid_tokens,
+                )
             wait_request = getattr(self.attention_scheduler, "wait_request", None)
             output = (
                 wait_request(request)
@@ -243,6 +266,18 @@ class FlexGenAttentionBackend:
         if not self.supports_pipelined_decode:
             raise RuntimeError("the configured Attention engine has no prefetch pipeline")
         self._wait_store(layer)
+        prefetch_from_cache = getattr(
+            self.attention_scheduler,
+            "prefetch_decode_from_cache",
+            None,
+        )
+        if callable(prefetch_from_cache):
+            return prefetch_from_cache(
+                layer,
+                history_tokens,
+                k_cache_path=self.k_cache_path,
+                v_cache_path=self.v_cache_path,
+            )
         return self.attention_scheduler.prefetch_decode(layer, history_tokens)
 
     def submit_prefetched_decode(
@@ -263,9 +298,10 @@ class FlexGenAttentionBackend:
         if token != prefetch.history_tokens or valid_tokens != token + 1:
             raise ValueError("prefetched history does not match the Decode token position")
 
-        query_array = self._normalize_query(query)
-        key_array = self._normalize_cache_tokens("key", key)
-        value_array = self._normalize_cache_tokens("value", value)
+        with profile_scope(self.profiler, "decode.qkv_materialize"):
+            query_array = self._normalize_query(query)
+            key_array = self._normalize_cache_tokens("key", key)
+            value_array = self._normalize_cache_tokens("value", value)
         if key_array.shape[0] != 1 or value_array.shape[0] != 1:
             raise ValueError("Decode key and value must each contain exactly one token")
         request = self.attention_scheduler.submit_prefetched_decode(
@@ -296,12 +332,14 @@ class FlexGenAttentionBackend:
     def wait_decode(self, request) -> np.ndarray:
         if not self.supports_pipelined_decode:
             raise RuntimeError("the configured Attention engine has no prefetch pipeline")
-        return self.attention_scheduler.wait_request(request)
+        with profile_scope(self.profiler, "decode.attention_wait"):
+            return self.attention_scheduler.wait_request(request)
 
     def flush(self) -> None:
         self.wait_all()
         self._wait_all_stores()
-        self.store.flush()
+        with profile_scope(self.profiler, "storage.fsync"):
+            self.store.flush()
         self._log("flushed KV files")
 
     def close(self) -> None:
@@ -469,7 +507,12 @@ class FlexGenAttentionBackend:
         self._log(
             f"store-start request={request_id}, layer={layer}, token={token}"
         )
-        self.store.write_token(layer, token, key, value)
+        with profile_scope(
+            self.profiler,
+            "decode.nvm_kv_store",
+            key.nbytes + value.nbytes,
+        ):
+            self.store.write_token(layer, token, key, value)
         self._log(
             f"store-complete request={request_id}, layer={layer}, token={token}"
         )
@@ -480,7 +523,8 @@ class FlexGenAttentionBackend:
         if future is None:
             return
         self._log(f"store-read-barrier layer={layer}")
-        future.result()
+        with profile_scope(self.profiler, "decode.store_read_barrier_wait"):
+            future.result()
         with self._request_lock:
             if self._store_futures.get(layer) is future:
                 del self._store_futures[layer]

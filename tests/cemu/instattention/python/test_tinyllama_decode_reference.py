@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from flexgen_runtime import (
+from tinyllama_runtime import (
     FlexGenDecodeRunner,
     FlexGenHfCheckpointLoader,
     FlexGenLlamaConfig,

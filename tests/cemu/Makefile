@@ -18,7 +18,7 @@ PYTHON_EXECUTABLE := $(shell command -v $(PYTHON))
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-decode-test instattention-flexgen-decode-gpu-test instattention-flexgen-cemu-gpu-test instattention-flexgen-attention-async-test instattention-attention-slot-scheduler-test instattention-attention-slot-device-test instattention-attention-slot-device-gpu-test instattention-hf-checkpoint-test instattention-tinyllama-checkpoint-test instattention-tinyllama-prefill-test instattention-tinyllama-reference-test instattention-tinyllama-decode-reference-test instattention-tinyllama-cemu-gpu-test instattention-tinyllama-cemu-trace-test instattention-tinyllama-cemu-benchmark instattention-pipeline-trace-test instattention-attention-test instattention-attention-gpu-test instattention-table1-test instattention-table1-cemu-test
+.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-decode-test instattention-flexgen-decode-gpu-test instattention-flexgen-cemu-gpu-test instattention-flexgen-attention-async-test instattention-attention-slot-scheduler-test instattention-attention-slot-device-test instattention-attention-slot-device-gpu-test instattention-hf-checkpoint-test instattention-tinyllama-checkpoint-test instattention-opt-checkpoint-test instattention-opt-runtime-test instattention-opt-reference-test instattention-opt-cemu-gpu-test instattention-opt-cemu-functional instattention-opt-cemu-benchmark instattention-figure14-config-test instattention-figure14-functional instattention-tinyllama-prefill-test instattention-tinyllama-reference-test instattention-tinyllama-decode-reference-test instattention-tinyllama-cemu-gpu-test instattention-tinyllama-cemu-trace-test instattention-tinyllama-cemu-benchmark instattention-pipeline-trace-test instattention-attention-test instattention-attention-gpu-test instattention-table1-test instattention-table1-cemu-test
 
 all: $(BUILD_DIR) $(TARGETS) instattention
 
@@ -88,6 +88,7 @@ instattention-attention-slot-device-test: instattention
 		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
 		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
 		--token-count "$(if $(TOKEN_COUNT),$(TOKEN_COUNT),17)" \
+		--dtype "$(if $(DTYPE),$(DTYPE),float32)" \
 		--cuda-shared-memory-bytes "$(if $(CUDA_SHARED_MEMORY_BYTES),$(CUDA_SHARED_MEMORY_BYTES),49152)" \
 		$(if $(filter 1 true yes,$(REQUIRE_OVERLAP)),--require-overlap) \
 		$(if $(PROGRAM),--program "$(PROGRAM)")
@@ -98,6 +99,7 @@ instattention-attention-slot-device-gpu-test: instattention
 		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
 		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
 		--token-count "$(if $(TOKEN_COUNT),$(TOKEN_COUNT),17)" \
+		--dtype "$(if $(DTYPE),$(DTYPE),float32)" \
 		--cuda-shared-memory-bytes "$(if $(CUDA_SHARED_MEMORY_BYTES),$(CUDA_SHARED_MEMORY_BYTES),49152)" \
 		$(if $(filter 1 true yes,$(REQUIRE_OVERLAP)),--require-overlap) \
 		$(if $(PROGRAM),--program "$(PROGRAM)")
@@ -110,6 +112,83 @@ instattention-tinyllama-checkpoint-test:
 		--model-dir "$(MODEL_DIR)" \
 		$(if $(CUDA),--cuda) \
 		$(if $(ALL_LAYERS),--all-layers)
+
+instattention-opt-checkpoint-test:
+	python3 $(INSTATTENTION_DIR)/python/test_opt_checkpoint_loader.py
+	python3 $(INSTATTENTION_DIR)/python/test_opt_checkpoint.py \
+		--model-dir "$(MODEL_DIR)" \
+		$(if $(CUDA),--cuda) \
+		$(if $(ALL_LAYERS),--all-layers)
+
+instattention-opt-runtime-test:
+	python3 $(INSTATTENTION_DIR)/python/test_opt_runtime.py \
+		$(if $(CUDA),--cuda)
+
+instattention-opt-reference-test:
+	python3 $(INSTATTENTION_DIR)/python/test_opt_reference.py \
+		--model-dir "$(MODEL_DIR)" \
+		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
+		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),2)" \
+		--atol "$(if $(ATOL),$(ATOL),2e-3)" \
+		--rtol "$(if $(RTOL),$(RTOL),2e-3)" \
+		$(if $(PROMPT_TEXT),--prompt-text "$(PROMPT_TEXT)") \
+		$(if $(CUDA),--cuda)
+
+instattention-opt-cemu-gpu-test: instattention
+	python3 $(INSTATTENTION_DIR)/python/test_opt_cemu_pipeline.py \
+		--model-dir "$(MODEL_DIR)" \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--csd-target "$(if $(CSD_TARGET),$(CSD_TARGET),cuda)" \
+		--program "$(if $(PROGRAM),$(PROGRAM),$(if $(filter cpu,$(CSD_TARGET)),./build/dense_attention.so,./build/dense_attention_devptr.so))" \
+		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
+		$(if $(GPU_BATCH_SIZE),--gpu-batch-size "$(GPU_BATCH_SIZE)") \
+		--prompt-length "$(if $(PROMPT_LENGTH),$(PROMPT_LENGTH),8)" \
+		$(if $(PROMPT_TEXT),--prompt-text "$(PROMPT_TEXT)") \
+		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),1)" \
+		--staging-tokens "$(if $(STAGING_TOKENS),$(STAGING_TOKENS),0)" \
+		--attention-slots "$(if $(ATTENTION_SLOTS),$(ATTENTION_SLOTS),2)" \
+		--atol "$(if $(ATOL),$(ATOL),5e-3)" \
+		--rtol "$(if $(RTOL),$(RTOL),2e-3)" \
+		--qkv-atol "$(if $(QKV_ATOL),$(QKV_ATOL),5e-3)" \
+		--qkv-rtol "$(if $(QKV_RTOL),$(QKV_RTOL),2e-3)" \
+		--logits-atol "$(if $(LOGITS_ATOL),$(LOGITS_ATOL),2e-2)" \
+		--logits-rtol "$(if $(LOGITS_RTOL),$(LOGITS_RTOL),2e-3)" \
+		$(if $(DIAGNOSE_ERRORS),--diagnose-errors) \
+		$(if $(TRACE_FILE),--trace-file "$(TRACE_FILE)") \
+		$(if $(filter 1 true yes,$(FUNCTIONAL)),--functional) \
+		$(if $(filter 1 true yes,$(BENCHMARK)),--benchmark) \
+		$(if $(WARMUP_ITERATIONS),--warmup-iterations "$(WARMUP_ITERATIONS)") \
+		$(if $(ITERATIONS),--iterations "$(ITERATIONS)") \
+		$(if $(BENCHMARK_OUTPUT),--benchmark-output "$(BENCHMARK_OUTPUT)") \
+		$(if $(PROFILE_OUTPUT),--profile-output "$(PROFILE_OUTPUT)")
+
+instattention-opt-cemu-functional: PROGRAM=./build/dense_attention_parallel_devptr.so
+instattention-opt-cemu-functional: FUNCTIONAL=1
+instattention-opt-cemu-functional: instattention-opt-cemu-gpu-test
+
+instattention-opt-cemu-benchmark: BENCHMARK=1
+instattention-opt-cemu-benchmark: instattention-opt-cemu-gpu-test
+
+instattention-figure14-config-test:
+	python3 $(INSTATTENTION_DIR)/python/test_instattention_figure14.py
+
+instattention-figure14-functional: instattention
+	python3 $(INSTATTENTION_DIR)/experiments/run_figure14_functional.py \
+		--config "$(if $(EXPERIMENT_CONFIG),$(EXPERIMENT_CONFIG),$(INSTATTENTION_DIR)/experiments/configs/opt13b_dense_1csd.json)" \
+		--model-dir "$(MODEL_DIR)" \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--csd-target "$(if $(CSD_TARGET),$(CSD_TARGET),cuda)" \
+		--program "$(if $(PROGRAM),$(PROGRAM),./build/dense_attention_parallel_devptr.so)" \
+		--gpu-batch-size "$(if $(GPU_BATCH_SIZE),$(GPU_BATCH_SIZE),4)" \
+		--attention-slots "$(if $(ATTENTION_SLOTS),$(ATTENTION_SLOTS),2)" \
+		--fdm-capacity-gib "$(if $(FDM_CAPACITY_GIB),$(FDM_CAPACITY_GIB),2)" \
+		$(if $(BATCH_SIZES),--batch-sizes $(BATCH_SIZES)) \
+		$(if $(OUTPUT_LENGTH),--output-length "$(OUTPUT_LENGTH)") \
+		$(if $(PROFILE_DIR),--profile-dir "$(PROFILE_DIR)") \
+		$(if $(filter 1 true yes,$(SKIP_CAPACITY_CHECK)),--skip-capacity-check) \
+		$(if $(filter 1 true yes,$(DRY_RUN)),--dry-run)
 
 instattention-tinyllama-prefill-test:
 	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_prefill.py \

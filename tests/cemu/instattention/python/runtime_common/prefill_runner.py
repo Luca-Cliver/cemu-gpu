@@ -1,54 +1,68 @@
+"""Model-independent Prefill orchestration."""
+
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple
 
 import torch
 
-from .embedding import run_flexgen_embedding
-from .mlp import run_flexgen_mlp
-from .model_config import FlexGenLlamaConfig
-from .output import run_flexgen_output_head
-from .prefill import run_flexgen_prefill
-from .weights import FlexGenWeightLoader
+from .model_ops import ModelOperations, validate_model_operations
 
 
 @dataclass(frozen=True)
-class FlexGenFullPrefillResult:
+class ModelPrefillResult:
     hidden_states: torch.Tensor
     logits: torch.Tensor
     next_token_ids: torch.Tensor
     kv_cache: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]
 
 
-class FlexGenPrefillRunner:
+class ModelPrefillRunner:
     def __init__(
         self,
-        config: FlexGenLlamaConfig,
-        weight_loader: FlexGenWeightLoader,
+        config: Any,
+        weight_loader: Any,
+        operations: ModelOperations,
         kv_writer: Optional[Any] = None,
         logger: Optional[Callable[[str], None]] = None,
     ):
-        if not isinstance(config, FlexGenLlamaConfig):
-            raise TypeError("config must be a FlexGenLlamaConfig")
-        if not isinstance(weight_loader, FlexGenWeightLoader):
-            raise TypeError("weight_loader must be a FlexGenWeightLoader")
+        if not hasattr(config, "num_hidden_layers"):
+            raise TypeError("config must provide num_hidden_layers")
+        for method_name in (
+            "load_embedding",
+            "load_layer",
+            "load_final_norm",
+            "load_lm_head",
+        ):
+            if not callable(getattr(weight_loader, method_name, None)):
+                raise TypeError(f"weight_loader must provide {method_name}()")
         if weight_loader.config != config:
             raise ValueError("weight loader configuration does not match the runner")
+        validate_model_operations(operations)
         if kv_writer is not None:
             synchronous_writer = callable(getattr(kv_writer, "write_prefill", None))
             asynchronous_writer = all(
                 callable(getattr(kv_writer, method_name, None))
                 for method_name in ("submit_prefill", "wait_prefill")
             )
-            if not synchronous_writer and not asynchronous_writer:
+            microbatch_writer = all(
+                callable(getattr(kv_writer, method_name, None))
+                for method_name in (
+                    "submit_prefill_microbatch",
+                    "wait_prefill",
+                )
+            )
+            if not synchronous_writer and not asynchronous_writer and not microbatch_writer:
                 raise TypeError(
                     "kv_writer must provide write_prefill() or "
-                    "submit_prefill()/wait_prefill()"
+                    "submit_prefill()/wait_prefill() or "
+                    "submit_prefill_microbatch()/wait_prefill()"
                 )
         if logger is not None and not callable(logger):
             raise TypeError("logger must be callable")
 
         self.config = config
         self.weight_loader = weight_loader
+        self.operations = operations
         self.kv_writer = kv_writer
         self.logger = logger
 
@@ -58,47 +72,40 @@ class FlexGenPrefillRunner:
         do_sample: bool = False,
         temperature: float = 1.0,
         collect_kv_cache: bool = False,
-    ) -> FlexGenFullPrefillResult:
+        last_token_only: bool = False,
+    ) -> ModelPrefillResult:
         token_ids = token_ids.to(self.weight_loader.device)
         self._log(
             f"start device={self.weight_loader.device}, "
             f"token_ids={tuple(token_ids.shape)}"
         )
-        embedding_weight = self.weight_loader.load_embedding()
-        hidden_states, attention_mask, position_ids = run_flexgen_embedding(
+        embedding_weights = self.weight_loader.load_embedding()
+        embedding = self.operations.embed(
             token_ids,
-            embedding_weight,
-            self.config.pad_token_id,
+            embedding_weights,
         )
+        hidden_states = embedding.hidden_states
+        attention_mask = embedding.attention_mask
+        position_ids = embedding.position_ids
         embedding_message = f"embedding hidden={tuple(hidden_states.shape)}"
         if self.logger is not None and not self._low_overhead_logging:
             embedding_message += (
                 f", valid_tokens={int(attention_mask.sum().item())}"
             )
         self._log(embedding_message)
-        del embedding_weight
+        del embedding_weights, embedding
 
         collected_cache = [] if collect_kv_cache else None
         pending_write = None
         for layer in range(self.config.num_hidden_layers):
             self._log(f"layer={layer} load weights")
             weights = self.weight_loader.load_layer(layer)
-            attention = weights.attention
             self._log(f"layer={layer} Attention-start")
-            attention_result = run_flexgen_prefill(
-                inputs=hidden_states,
-                attention_mask=attention_mask,
-                query_weight=attention.query,
-                key_weight=attention.key,
-                value_weight=attention.value,
-                output_weight=attention.output,
-                input_norm_weight=attention.input_norm,
-                post_attention_norm_weight=attention.post_attention_norm,
-                num_heads=self.config.num_attention_heads,
-                num_key_value_heads=self.config.num_key_value_heads,
-                position_ids=position_ids,
-                rope_theta=self.config.rope_theta,
-                epsilon=self.config.rms_norm_epsilon,
+            attention_result = self.operations.prefill_attention(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                weights,
             )
             self._log(
                 f"layer={layer} Attention-complete hidden="
@@ -135,7 +142,7 @@ class FlexGenPrefillRunner:
                     (attention_result.keys, attention_result.values)
                 )
             self._log(f"layer={layer} MLP-start")
-            hidden_states = run_flexgen_mlp(
+            hidden_states = self.operations.run_mlp(
                 attention_result.mlp_inputs,
                 weights.mlp,
                 residual=attention_result.hidden_states,
@@ -143,15 +150,16 @@ class FlexGenPrefillRunner:
             self._log(
                 f"layer={layer} MLP-complete hidden={tuple(hidden_states.shape)}"
             )
-            del attention, attention_result, weights
+            del attention_result, weights
 
-        output = run_flexgen_output_head(
-            hidden_states=hidden_states,
-            final_norm_weight=self.weight_loader.load_final_norm(),
-            lm_head_weight=self.weight_loader.load_lm_head(),
-            epsilon=self.config.rms_norm_epsilon,
-            do_sample=do_sample,
-            temperature=temperature,
+        if last_token_only:
+            hidden_states = hidden_states[:, -1:, :]
+        output = self.operations.run_output_head(
+            hidden_states,
+            self.weight_loader.load_final_norm(),
+            self.weight_loader.load_lm_head(),
+            do_sample,
+            temperature,
         )
         if pending_write is not None:
             completed_layer = pending_write.layer
@@ -164,7 +172,7 @@ class FlexGenPrefillRunner:
                 f"{output.next_token_ids.detach().cpu().reshape(-1).tolist()}"
             )
         self._log(output_message)
-        return FlexGenFullPrefillResult(
+        return ModelPrefillResult(
             hidden_states=hidden_states,
             logits=output.logits,
             next_token_ids=output.next_token_ids,

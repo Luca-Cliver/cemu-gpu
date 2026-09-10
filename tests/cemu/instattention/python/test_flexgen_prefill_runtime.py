@@ -12,7 +12,7 @@ import torch.nn.functional as F
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIR / "python"))
 
-from flexgen_runtime import run_flexgen_prefill
+from tinyllama_runtime import run_flexgen_prefill
 
 
 TEST_DEVICE = torch.device("cpu")

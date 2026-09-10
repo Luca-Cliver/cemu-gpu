@@ -1,3 +1,5 @@
+"""TinyLlama output projection and token selection."""
+
 from dataclasses import dataclass
 
 import torch

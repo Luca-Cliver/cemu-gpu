@@ -10,6 +10,7 @@ typedef struct QEMUSGList QEMUSGList;
 
 typedef enum BackendType{
     FEMU_DRAM_BACKEND,
+    FEMU_FILE_BACKEND,
 } BackendType;
 
 /* SSD Backend */
@@ -21,10 +22,13 @@ typedef struct SsdBackend {
     BackendType type;
     bool        cuda_sync;
     QemuMutex   cuda_mirror_lock;
+    int         fd;
 } SsdBackend;
 
 int init_dram_backend(SsdBackend *b);
 void free_dram_backend(SsdBackend *b);
+int init_file_backend(SsdBackend *b, const char *path);
+void free_file_backend(SsdBackend *b);
 
 int backend_cuda_sync_init(SsdBackend *b);
 void backend_cuda_sync_fini(SsdBackend *b);
