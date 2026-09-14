@@ -15,7 +15,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(PROJECT_DIR / "python"))
 
 from cemu_flexgen import DenseAttentionMetadata, KvCacheLayout, KvLayoutConfig
-from experiments import DenseAttentionRuntimeModel, load_experiment_config
+from experiments import DenseAttentionRuntimeModel, SparfAttentionRuntimeModel, load_experiment_config
 
 
 CONFIG_PATH = (
@@ -56,6 +56,13 @@ class InstAttentionRuntimeModelTest(unittest.TestCase):
     def test_filter_bandwidth_model(self):
         self.assertEqual(self.model.estimate_filter_ns(0), 0)
         self.assertEqual(self.model.estimate_filter_ns(1850), 1000)
+
+    def test_sparf_runtime_breakdown(self):
+        model = SparfAttentionRuntimeModel(self.config.instcsd)
+        result = model.estimate(1, 40, 128, 1024, 16, 128, 2)
+        self.assertGreater(result.approximate_ns, 0)
+        self.assertGreater(result.exact_qk_ns, result.pv_ns)
+        self.assertLess(result.pv_ns, self.model.estimate(1, 40, 128, 1024).av_ns)
 
     def test_float16_attention_metadata(self):
         layout = KvCacheLayout(

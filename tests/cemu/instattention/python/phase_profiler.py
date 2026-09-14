@@ -1,5 +1,6 @@
 import csv
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,25 @@ class PhaseProfiler:
     def __init__(self):
         self._lock = Lock()
         self._metrics = {}
+        self._cuda_events = deque()
+        self._cuda_lock = Lock()
+
+    def defer_cuda(self, name, start, end):
+        # Harvest completed events without synchronizing the inference stream.
+        with self._cuda_lock:
+            self._cuda_events.append((name, start, end))
+        self.collect_cuda()
+
+    def collect_cuda(self, wait=False):
+        with self._cuda_lock:
+            while self._cuda_events:
+                name, start, end = self._cuda_events[0]
+                if wait:
+                    end.synchronize()
+                elif not end.query():
+                    break
+                self.record(name, round(start.elapsed_time(end) * 1_000_000))
+                self._cuda_events.popleft()
 
     @contextmanager
     def measure(self, name: str, byte_count: int = 0):
@@ -59,6 +79,7 @@ class PhaseProfiler:
             )
 
     def snapshot(self):
+        self.collect_cuda(wait=True)
         with self._lock:
             metrics = dict(self._metrics)
         return tuple(
@@ -131,3 +152,31 @@ def profile_scope(
         return
     with profiler.measure(name, byte_count):
         yield
+
+
+@contextmanager
+def profile_tensor_scope(profiler, name, device):
+    """Caller wall time and deferred CUDA stream time; no per-phase sync.
+
+    CUDA intervals include stream stalls, not just kernel execution. Wall time
+    can include blocking copies; the two metrics must not be added together.
+    Use on the inference thread; call snapshot after workers have joined.
+    """
+    if profiler is None:
+        yield
+        return
+    import torch
+    device = torch.device(device)
+    start = end = None
+    if device.type == "cuda":
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        stream = torch.cuda.current_stream(device)
+        start.record(stream)
+    try:
+        with profiler.measure(name + ".host_wall"):
+            yield
+    finally:
+        if end is not None:
+            end.record(stream)
+            profiler.defer_cuda(name + ".cuda_stream", start, end)

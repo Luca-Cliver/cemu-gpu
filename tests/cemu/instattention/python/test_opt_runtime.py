@@ -20,6 +20,7 @@ from opt_runtime import (
     OptTorchAttentionBackend,
 )
 from runtime_common import partition_kv_cache_by_batch
+from phase_profiler import PhaseProfiler
 
 
 TEST_DEVICE = torch.device("cpu")
@@ -147,6 +148,7 @@ class OptRuntimeTest(unittest.TestCase):
             collect_kv_cache=True,
         )
         backend = OptTorchAttentionBackend(self.config, prefill.kv_cache)
+        backend.profiler = PhaseProfiler()
         decode = OptDecodeRunner(
             self.config,
             loader,
@@ -173,6 +175,13 @@ class OptRuntimeTest(unittest.TestCase):
             decode.next_token_ids,
             extended.next_token_ids,
         )
+        metrics = {metric.name: metric for metric in backend.profiler.snapshot()}
+        for phase in ("qkv", "output_to_gpu", "wo_norm_residual", "mlp"):
+            self.assertEqual(
+                metrics[f"decode.{phase}.host_wall"].count,
+                self.config.num_hidden_layers,
+            )
+        self.assertEqual(metrics["decode.output_head.host_wall"].count, 1)
         for layer, layer_output in enumerate(decode.layer_outputs):
             cached_keys, cached_values = backend.layer_cache(layer)
             torch.testing.assert_close(cached_keys[-1:], layer_output.key)

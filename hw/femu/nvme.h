@@ -941,6 +941,7 @@ typedef struct NvmeRequest {
     int                     nr_sres;
     int                     p2p_req;
     void                    *sdaddr;    // copy source address
+    SsdBackend              *sdaddr_backend; // NULL for private CSD buffers
     void                    *data_buffer;
     FemuCtrl                *mem_ctrl;  // ctrl of memory copy destination
     IndirectTask            indirect_task;

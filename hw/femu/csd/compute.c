@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include "compute.h"
@@ -6,6 +7,8 @@
 #include "qemu/atomic.h"
 #include <stdatomic.h>
 #include "hw/femu/backend/backend.h"
+#include "hw/femu/attention_workflow_abi.h"
+#include "hw/femu/sparf_workflow_abi.h"
 #include "hw/femu/inc/slab.h"
 #include "hw/femu/nvme-def.h"
 #include "hw/femu/nvme.h"
@@ -17,6 +20,222 @@
 
 #define MAX_PIND    1024
 #define MAX_RSID    1024
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec timestamp;
+    clock_gettime(CLOCK_MONOTONIC, &timestamp);
+    return (uint64_t)timestamp.tv_sec * 1000000000ULL + timestamp.tv_nsec;
+}
+
+static bool multiply_u64(uint64_t *value, uint64_t factor)
+{
+    if (!factor || *value > INT64_MAX / factor) {
+        return false;
+    }
+    *value *= factor;
+    return true;
+}
+
+static bool validate_attention_workflow(Program *program, uint64_t command,
+                                        uint32_t numr, const long long *mr_len,
+                                        const void *data, uint32_t length,
+                                        FemuCtrl *controller)
+{
+    if (command != CEMU_ATTENTION_WORKFLOW_COMMAND) {
+        return true;
+    }
+    if (controller->internal_bandwidth != 0) {
+        femu_err("Attention workflow requires internal_bandwidth=0 while "
+                 "functional execution freezes the virtual clock\n");
+        return false;
+    }
+    if (program->is_indirect || program->type != PROGRAM_TYPE_SHARED_LIB ||
+        (program->target != PROGRAM_TARGET_HOST &&
+         program->target != PROGRAM_TARGET_CUDA_DEVPTR) ||
+        numr != CEMU_ATTENTION_WORKFLOW_RANGES || !mr_len || !data ||
+        length < sizeof(struct cemu_attention_workflow_header)) {
+        return false;
+    }
+
+    struct cemu_attention_workflow_header header;
+    memcpy(&header, data, sizeof(header));
+    struct cemu_attention_phase_metadata *config = &header.attention;
+    uint64_t extent_count = (uint64_t)header.key_extents + header.value_extents;
+    if (header.version != CEMU_ATTENTION_WORKFLOW_VERSION ||
+        header.reserved[0] || header.reserved[1] ||
+        (header.flags & ~(CEMU_ATTENTION_WORKFLOW_TRACE |
+                          CEMU_ATTENTION_WORKFLOW_SERIAL)) ||
+        !header.key_extents || !header.value_extents ||
+        header.key_extents > CEMU_ATTENTION_WORKFLOW_MAX_EXTENTS ||
+        header.value_extents > CEMU_ATTENTION_WORKFLOW_MAX_EXTENTS ||
+        length != sizeof(header) + extent_count *
+                                  sizeof(struct cemu_attention_workflow_extent) ||
+        config->version != CEMU_ATTENTION_PHASES_VERSION ||
+        config->phase != CEMU_ATTENTION_PHASE_QK_SOFTMAX ||
+        (config->dtype != CEMU_ATTENTION_PHASES_FLOAT16 &&
+         config->dtype != CEMU_ATTENTION_PHASES_FLOAT32) ||
+        !config->batch_size || !config->num_query_heads ||
+        !config->num_kv_heads || !config->head_dim || !config->token_count ||
+        !config->token_stride ||
+        config->num_query_heads % config->num_kv_heads ||
+        config->token_stride % 512 || !isfinite(config->scale) ||
+        config->scale <= 0.0f) {
+        return false;
+    }
+
+    uint64_t element_size = config->dtype == CEMU_ATTENTION_PHASES_FLOAT16 ? 2 : 4;
+    uint64_t token_payload = config->batch_size;
+    uint64_t query_size = config->batch_size;
+    uint64_t storage_size = config->token_count;
+    uint64_t probability_size = config->batch_size;
+    if (!multiply_u64(&token_payload, config->num_kv_heads) ||
+        !multiply_u64(&token_payload, config->head_dim) ||
+        !multiply_u64(&token_payload, element_size) ||
+        token_payload > config->token_stride ||
+        !multiply_u64(&query_size, config->num_query_heads) ||
+        !multiply_u64(&query_size, config->head_dim) ||
+        !multiply_u64(&query_size, element_size) ||
+        !multiply_u64(&storage_size, config->token_stride) ||
+        !multiply_u64(&probability_size, config->num_query_heads) ||
+        !multiply_u64(&probability_size, config->token_count) ||
+        !multiply_u64(&probability_size, sizeof(float))) {
+        return false;
+    }
+    uint64_t required[] = {
+        query_size, storage_size, storage_size, probability_size,
+        query_size, sizeof(struct cemu_attention_workflow_trace),
+    };
+    for (uint32_t index = 0; index < CEMU_ATTENTION_WORKFLOW_RANGES; ++index) {
+        if (mr_len[index] < 0 || (uint64_t)mr_len[index] < required[index]) {
+            return false;
+        }
+    }
+
+    NvmeNamespace *nvm = nvme_find_namespace(controller, 1);
+    if (!nvm || !nvm->backend) {
+        return false;
+    }
+    const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(nvm->id_ns.flbas);
+    if (nvm->id_ns.lbaf[lba_index].lbads != 9) {
+        return false;
+    }
+    const uint64_t nvm_blocks = nvm->backend->size / 512;
+    const uint8_t *extent_data = (const uint8_t *)data + sizeof(header);
+    uint64_t accumulated = 0;
+    for (uint64_t index = 0; index < extent_count; ++index) {
+        struct cemu_attention_workflow_extent extent;
+        memcpy(&extent, extent_data + index * sizeof(extent), sizeof(extent));
+        if (!extent.nlb || extent.nlb > 65535 || extent.reserved ||
+            extent.slba >= nvm_blocks || extent.nlb > nvm_blocks - extent.slba) {
+            return false;
+        }
+        accumulated += (uint64_t)extent.nlb * 512;
+        if (index + 1 == header.key_extents || index + 1 == extent_count) {
+            if (accumulated != storage_size) {
+                return false;
+            }
+            accumulated = 0;
+        }
+    }
+    return true;
+}
+
+static bool validate_sparf_workflow(Program *program, uint64_t command,
+                                    uint32_t numr, const long long *mr_len,
+                                    const void *data, uint32_t length,
+                                    FemuCtrl *controller)
+{
+    if (command != CEMU_SPARF_WORKFLOW_COMMAND) {
+        return true;
+    }
+    if (controller->internal_bandwidth != 0 || program->is_indirect ||
+        program->type != PROGRAM_TYPE_SHARED_LIB ||
+        (program->target != PROGRAM_TARGET_HOST &&
+         program->target != PROGRAM_TARGET_CUDA_DEVPTR) ||
+        numr != CEMU_SPARF_WORKFLOW_RANGES || !mr_len || !data ||
+        length < sizeof(struct cemu_sparf_workflow_header)) {
+        return false;
+    }
+    struct cemu_sparf_workflow_header header;
+    memcpy(&header, data, sizeof(header));
+    uint64_t extents = (uint64_t)header.token_k_extents +
+                       header.channel_k_extents + header.token_v_extents;
+    if (header.version != CEMU_SPARF_WORKFLOW_VERSION ||
+        (header.flags & ~CEMU_SPARF_WORKFLOW_TRACE) ||
+        header.reserved[0] || header.reserved[1] ||
+        !header.token_k_extents || !header.channel_k_extents ||
+        !header.token_v_extents ||
+        header.token_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
+        header.channel_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
+        header.token_v_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
+        length != sizeof(header) + extents * sizeof(struct cemu_sparf_workflow_extent) ||
+        (header.dtype != CEMU_SPARF_FLOAT16 && header.dtype != CEMU_SPARF_FLOAT32) ||
+        !header.batch_size || !header.num_query_heads || !header.num_kv_heads ||
+        !header.head_dim || !header.max_seq_len || !header.valid_tokens ||
+        header.valid_tokens > header.max_seq_len ||
+        header.num_query_heads % header.num_kv_heads ||
+        !header.top_r || header.top_r > header.head_dim ||
+        !header.top_k || header.top_k > header.valid_tokens ||
+        !header.token_head_stride || !header.token_batch_stride ||
+        !header.token_layer_stride || !header.channel_stride ||
+        !header.channel_head_stride || !header.channel_batch_stride ||
+        !header.channel_layer_stride || !isfinite(header.scale) ||
+        header.scale <= 0.0f) {
+        return false;
+    }
+    uint64_t vectors = (uint64_t)header.batch_size * header.num_query_heads;
+    uint64_t element = header.dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+    uint64_t required[] = {
+        vectors * header.head_dim * element,
+        vectors * header.top_r * header.valid_tokens * element,
+        vectors * header.top_k * header.head_dim * element,
+        vectors * (header.top_k + 1) * header.head_dim * element,
+        vectors * header.head_dim * element,
+        (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim * element,
+        (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim * element,
+        vectors * sizeof(float),
+        vectors * (header.top_k + 1) * sizeof(float),
+        vectors * header.head_dim * element,
+        sizeof(struct cemu_sparf_workflow_trace),
+    };
+    for (uint32_t index = 0; index < CEMU_SPARF_WORKFLOW_RANGES; ++index) {
+        if (mr_len[index] < 0 || (uint64_t)mr_len[index] < required[index]) {
+            return false;
+        }
+    }
+    NvmeNamespace *nvm = nvme_find_namespace(controller, 1);
+    if (!nvm || !nvm->backend ||
+        nvm->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX(nvm->id_ns.flbas)].lbads != 9) {
+        return false;
+    }
+    const struct cemu_sparf_workflow_extent *map =
+        (const struct cemu_sparf_workflow_extent *)((const uint8_t *)data + sizeof(header));
+    uint64_t expected[] = {
+        ((uint64_t)header.layer + 1) * header.token_layer_stride,
+        ((uint64_t)header.layer + 1) * header.channel_layer_stride,
+        ((uint64_t)header.layer + 1) * header.token_layer_stride,
+    };
+    uint32_t counts[] = { header.token_k_extents, header.channel_k_extents,
+                          header.token_v_extents };
+    uint64_t nvm_blocks = nvm->backend->size / 512;
+    uint32_t map_index = 0;
+    for (uint32_t file = 0; file < 3; ++file) {
+        uint64_t covered = 0;
+        for (uint32_t index = 0; index < counts[file]; ++index, ++map_index) {
+            if (!map[map_index].nlb || map[map_index].nlb > 65535 ||
+                map[map_index].reserved || map[map_index].slba >= nvm_blocks ||
+                map[map_index].nlb > nvm_blocks - map[map_index].slba) {
+                return false;
+            }
+            covered += (uint64_t)map[map_index].nlb * 512;
+        }
+        if (covered < expected[file]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static inline ComputeNamespace *compute_ns(NvmeNamespace *ns)
 {
@@ -658,6 +877,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     void **mr_addr = NULL;
     long long *mr_len = NULL;
     SsdBackend **mr_backend = NULL;
+    bool owns_mr_arrays = !program->is_indirect && numr != 0;
     if (program->is_indirect || numr == 0) {
         // memory range set is in rsid
         if (rsid == 0 || rsid > MAX_RSID) {
@@ -676,6 +896,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             req->mem_ctrl = n;
             req->nr_sres = 0;
             req->sres = NULL;
+            req->sdaddr_backend = NULL;
 
             femu_debug("program_execute: data_buffer %p, dlen %u\n", data_buffer, dlen);
             // parse indirect task from data buffer
@@ -801,6 +1022,8 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
                 return NVME_INVALID_FIELD;
             }
 
+            req->sdaddr_backend = mr_backend[1];
+
             // mr[1] is input buffer
             if (chunk_nlb * 512 > mr_len[1]) {
                 femu_err("program_execute: indirect program %u input buffer size %lld less than chunk_nlb %d!\n", pind, mr_len[1], chunk_nlb);
@@ -836,6 +1059,35 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         dlen -= sizeof(NvmeMemoryRange) * numr;
     }
 
+    if (!validate_attention_workflow(program, cparam1, numr, mr_len,
+                                     dlen ? data_buffer : NULL, dlen, n)) {
+        femu_err("program_execute: invalid Attention workflow metadata or ranges\n");
+        if (!program->is_indirect) {
+            if (owns_mr_arrays) {
+                free(mr_addr);
+                free(mr_len);
+            }
+            free(mr_backend);
+            free(req->data_buffer);
+            req->data_buffer = NULL;
+        }
+        return NVME_INVALID_FIELD;
+    }
+    if (!validate_sparf_workflow(program, cparam1, numr, mr_len,
+                                dlen ? data_buffer : NULL, dlen, n)) {
+        femu_err("program_execute: invalid SparF workflow metadata or ranges\n");
+        if (!program->is_indirect) {
+            if (owns_mr_arrays) {
+                free(mr_addr);
+                free(mr_len);
+            }
+            free(mr_backend);
+            free(req->data_buffer);
+            req->data_buffer = NULL;
+        }
+        return NVME_INVALID_FIELD;
+    }
+
     void **mr_dev_addr = NULL;
     if (program->target == PROGRAM_TARGET_CUDA_DEVPTR && numr) {
         femu_debug("program_execute: preparing CUDA devptr args, numr %u\n", numr);
@@ -865,6 +1117,7 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.mr_addr = mr_addr;
     job->args.mr_len = mr_len;
     job->args.mr_dev_addr = mr_dev_addr;
+    job->owns_mr_arrays = owns_mr_arrays;
     job->owns_mr_dev_addr = mr_dev_addr != NULL;
     job->mr_backend = mr_backend;
     job->args.cparam1 = cparam1;
@@ -1093,6 +1346,799 @@ static uint64_t run_program_by_target(ComputeJob *job)
     }
 }
 
+static NvmeRequest *attention_submit_read(NvmeRequest *parent,
+                                          struct rte_ring *completion_ring,
+                                          void *destination,
+                                          const struct cemu_attention_workflow_extent *extents,
+                                          uint32_t extent_count,
+                                          uint64_t model_start_ns)
+{
+    NvmeRequest *request = g_new0(NvmeRequest, 1);
+    request->ns = parent->ns;
+    request->cmd.nsid = cpu_to_le32(3);
+    request->mem_ctrl = parent->ns->ctrl;
+    request->sdaddr = destination;
+    request->sdaddr_backend = NULL;
+    request->is_write = 0;
+    request->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+    request->nr_sres = extent_count;
+    request->sres = g_new0(NvmeCopyFormat, extent_count);
+    request->indirect_task.ring = completion_ring;
+    request->stat.stime = model_start_ns;
+    request->stat.expire_time = request->stat.stime;
+    for (uint32_t index = 0; index < extent_count; ++index) {
+        request->sres[index].cf2.snsid = cpu_to_le32(1);
+        request->sres[index].cf2.slba = cpu_to_le64(extents[index].slba);
+        request->sres[index].cf2.nlb = cpu_to_le16(extents[index].nlb - 1);
+    }
+    int rc = femu_ring_enqueue(parent->ns->ctrl->to_ftl[1],
+                               (void *)&request, 1);
+    if (rc != 1) {
+        g_free(request->sres);
+        g_free(request);
+        return NULL;
+    }
+    return request;
+}
+
+static bool attention_wait_read(struct rte_ring *completion_ring,
+                                NvmeRequest *expected)
+{
+    if (!expected) {
+        return false;
+    }
+    NvmeRequest *completed = NULL;
+    while (femu_ring_dequeue(completion_ring, (void *)&completed, 1) != 1) {
+        usleep(10);
+    }
+    if (completed != expected) {
+        femu_err("Attention workflow received an unexpected FTL completion\n");
+        abort();
+    }
+    if (completed->status != NVME_SUCCESS) {
+        femu_err("Attention workflow FTL read failed with status %#x\n",
+                 completed->status);
+        return false;
+    }
+    return true;
+}
+
+static void attention_free_read(NvmeRequest *request)
+{
+    if (request) {
+        g_free(request->sres);
+        g_free(request);
+    }
+}
+
+typedef struct SparfLogicalSpan {
+    uint64_t offset;
+    uint32_t size;
+    uint64_t destination_offset;
+    uint32_t prefix;
+    uint32_t read_size;
+    uint64_t temporary_offset;
+} SparfLogicalSpan;
+
+typedef struct SparfRead {
+    NvmeRequest *request;
+    GArray *physical_extents;
+    GArray *spans;
+    uint8_t *temporary;
+    uint64_t temporary_size;
+    void *destination;
+    SsdBackend *destination_backend;
+    uint64_t destination_len;
+} SparfRead;
+
+typedef struct SparfPageCache {
+    uint64_t *keys;
+    uint64_t *offsets;
+    uint8_t *used;
+    uint32_t capacity;
+} SparfPageCache;
+
+typedef struct SparfScoreIndex {
+    float score;
+    uint32_t index;
+} SparfScoreIndex;
+
+static int sparf_score_index_compare(const void *left, const void *right)
+{
+    const SparfScoreIndex *first = left;
+    const SparfScoreIndex *second = right;
+
+    if (first->score > second->score) {
+        return -1;
+    }
+    if (first->score < second->score) {
+        return 1;
+    }
+    return first->index < second->index ? -1 : first->index != second->index;
+}
+
+static uint64_t sparf_hash_page(uint64_t value)
+{
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static bool sparf_page_cache_find(const SparfPageCache *cache,
+                                  uint64_t key, uint64_t *offset)
+{
+    uint32_t slot = sparf_hash_page(key) & (cache->capacity - 1);
+    for (uint32_t probes = 0; probes < cache->capacity; ++probes) {
+        if (!cache->used[slot]) {
+            return false;
+        }
+        if (cache->keys[slot] == key) {
+            *offset = cache->offsets[slot];
+            return true;
+        }
+        slot = (slot + 1) & (cache->capacity - 1);
+    }
+    return false;
+}
+
+static bool sparf_page_cache_insert(SparfPageCache *cache,
+                                    uint64_t key, uint64_t offset)
+{
+    uint32_t slot = sparf_hash_page(key) & (cache->capacity - 1);
+    for (uint32_t probes = 0; probes < cache->capacity; ++probes) {
+        if (!cache->used[slot]) {
+            cache->used[slot] = 1;
+            cache->keys[slot] = key;
+            cache->offsets[slot] = offset;
+            return true;
+        }
+        if (cache->keys[slot] == key) {
+            return true;
+        }
+        slot = (slot + 1) & (cache->capacity - 1);
+    }
+    return false;
+}
+
+static bool sparf_append_physical_range(
+    GArray *output, const struct cemu_sparf_workflow_extent *map,
+    uint32_t map_count, uint64_t offset, uint64_t size)
+{
+    uint64_t logical = 0;
+    uint64_t end = offset + size;
+    for (uint32_t index = 0; index < map_count && offset < end; ++index) {
+        uint64_t extent_bytes = (uint64_t)map[index].nlb * 512;
+        uint64_t extent_end = logical + extent_bytes;
+        if (offset < extent_end && end > logical) {
+            uint64_t begin = MAX(offset, logical);
+            uint64_t finish = MIN(end, extent_end);
+            struct cemu_attention_workflow_extent physical = {
+                .slba = map[index].slba + (begin - logical) / 512,
+                .nlb = (finish - begin) / 512,
+                .reserved = 0,
+            };
+            if (!physical.nlb || physical.nlb > 65535) {
+                return false;
+            }
+            g_array_append_val(output, physical);
+            offset = finish;
+        }
+        logical = extent_end;
+    }
+    return offset == end;
+}
+
+static bool sparf_start_read(
+    ComputeJob *job, struct rte_ring *ring,
+    const struct cemu_sparf_workflow_extent *map, uint32_t map_count,
+    GArray *requested_spans, uint32_t destination_range,
+    uint64_t model_start_ns, SparfRead *read)
+{
+    memset(read, 0, sizeof(*read));
+    read->physical_extents = g_array_new(FALSE, FALSE,
+        sizeof(struct cemu_attention_workflow_extent));
+    read->spans = requested_spans;
+    read->destination = job->args.mr_addr[destination_range];
+    read->destination_backend = job->mr_backend[destination_range];
+    read->destination_len = 0;
+    SparfPageCache pages = { 0 };
+    pages.capacity = 1;
+    while (pages.capacity < requested_spans->len * 2 + 1) {
+        pages.capacity <<= 1;
+    }
+    pages.keys = g_new(uint64_t, pages.capacity);
+    pages.offsets = g_new(uint64_t, pages.capacity);
+    pages.used = g_new0(uint8_t, pages.capacity);
+    for (guint index = 0; index < requested_spans->len; ++index) {
+        SparfLogicalSpan *span = &g_array_index(requested_spans, SparfLogicalSpan, index);
+        uint64_t aligned_start = span->offset & ~UINT64_C(4095);
+        uint64_t aligned_end = (span->offset + span->size + 4095) & ~UINT64_C(4095);
+        span->prefix = span->offset - aligned_start;
+        span->read_size = aligned_end - aligned_start;
+        uint64_t existing_offset = 0;
+        if (span->read_size == 4096 &&
+            sparf_page_cache_find(&pages, aligned_start, &existing_offset)) {
+            span->temporary_offset = existing_offset;
+        } else {
+            span->temporary_offset = read->temporary_size;
+            if (!sparf_append_physical_range(read->physical_extents, map, map_count,
+                                             aligned_start, span->read_size)) {
+                g_free(pages.keys);
+                g_free(pages.offsets);
+                g_free(pages.used);
+                return false;
+            }
+            if (span->read_size == 4096) {
+                if (!sparf_page_cache_insert(&pages, aligned_start,
+                                             read->temporary_size)) {
+                    g_free(pages.keys);
+                    g_free(pages.offsets);
+                    g_free(pages.used);
+                    return false;
+                }
+            }
+            read->temporary_size += span->read_size;
+        }
+        read->destination_len = MAX(read->destination_len,
+                                    span->destination_offset + span->size);
+    }
+    g_free(pages.keys);
+    g_free(pages.offsets);
+    g_free(pages.used);
+    read->temporary = g_malloc(read->temporary_size);
+    read->request = attention_submit_read(
+        job->req, ring, read->temporary,
+        (const struct cemu_attention_workflow_extent *)read->physical_extents->data,
+        read->physical_extents->len, model_start_ns);
+    return read->request != NULL;
+}
+
+static bool sparf_finish_read(SparfRead *read, struct rte_ring *ring,
+                              uint64_t *modeled_ns)
+{
+    bool success = attention_wait_read(ring, read->request);
+    if (success) {
+        *modeled_ns = read->request->stat.reqlat;
+        if (backend_cuda_prepare_host(read->destination_backend,
+                                      read->destination,
+                                      read->destination_len) != 0) {
+            success = false;
+        }
+    }
+    if (success) {
+        for (guint index = 0; index < read->spans->len; ++index) {
+            const SparfLogicalSpan *span = &g_array_index(
+                read->spans, SparfLogicalSpan, index);
+            memcpy((uint8_t *)read->destination + span->destination_offset,
+                   read->temporary + span->temporary_offset + span->prefix,
+                   span->size);
+        }
+        backend_cuda_mark_host_dirty(read->destination_backend,
+                                     read->destination,
+                                     read->destination_len);
+    }
+    attention_free_read(read->request);
+    read->request = NULL;
+    g_free(read->temporary);
+    read->temporary = NULL;
+    if (read->physical_extents) g_array_free(read->physical_extents, TRUE);
+    if (read->spans) g_array_free(read->spans, TRUE);
+    read->physical_extents = NULL;
+    read->spans = NULL;
+    return success;
+}
+
+static float sparf_half_to_float(uint16_t value)
+{
+    uint32_t sign = (uint32_t)(value & 0x8000U) << 16;
+    uint32_t exponent = (value >> 10) & 31U;
+    uint32_t mantissa = value & 1023U;
+    uint32_t bits;
+    if (!exponent) {
+        if (!mantissa) {
+            bits = sign;
+        } else {
+            exponent = 127 - 15 + 1;
+            while (!(mantissa & 1024U)) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            bits = sign | (exponent << 23) | ((mantissa & 1023U) << 13);
+        }
+    } else if (exponent == 31) {
+        bits = sign | 0x7f800000U | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static float sparf_load_scalar(const void *address, uint64_t index, uint32_t dtype)
+{
+    return dtype == CEMU_SPARF_FLOAT16
+        ? sparf_half_to_float(((const uint16_t *)address)[index])
+        : ((const float *)address)[index];
+}
+
+static uint64_t run_sparf_phase(ComputeJob *job, uint32_t phase,
+                                const uint32_t *indices, uint32_t count,
+                                struct cemu_sparf_attention_metadata *metadata)
+{
+    void *host[4] = { 0 };
+    void *device[4] = { 0 };
+    long long lengths[4] = { 0 };
+    SsdBackend *backends[4] = { 0 };
+    for (uint32_t index = 0; index < count; ++index) {
+        uint32_t source = indices[index];
+        host[index] = job->args.mr_addr[source];
+        device[index] = job->args.mr_dev_addr ? job->args.mr_dev_addr[source] : NULL;
+        lengths[index] = job->args.mr_len[source];
+        backends[index] = job->mr_backend[source];
+    }
+    if (phase == CEMU_SPARF_PHASE_EXACT_QK) {
+        uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+        lengths[0] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
+                     metadata->head_dim * element;
+        lengths[1] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
+                     metadata->selected_tokens * metadata->head_dim * element;
+        lengths[2] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
+                     sizeof(float);
+    } else {
+        uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+        uint64_t vectors = (uint64_t)metadata->batch_size * metadata->num_query_heads;
+        lengths[0] = vectors * (metadata->selected_tokens + 1) * sizeof(float);
+        lengths[1] = vectors * (metadata->selected_tokens + 1) *
+                     metadata->head_dim * element;
+    }
+    struct ubpf_jit_args arguments = job->args;
+    arguments.numr = count;
+    arguments.mr_addr = host;
+    arguments.mr_dev_addr = job->args.mr_dev_addr ? device : NULL;
+    arguments.mr_len = lengths;
+    metadata->phase = phase;
+    arguments.data_buffer = metadata;
+    arguments.buffer_len = sizeof(*metadata);
+    for (uint32_t index = 0; index + 1 < count; ++index) {
+        int status = job->program->target == PROGRAM_TARGET_CUDA_DEVPTR
+            ? backend_cuda_prepare_device(backends[index], host[index], lengths[index])
+            : backend_cuda_prepare_host(backends[index], host[index], lengths[index]);
+        if (status != 0) return (uint64_t)-1;
+    }
+    uint64_t result = job->program->shared_lib.jit_fn(&arguments);
+    if (result != (uint64_t)-1) {
+        if (job->program->target == PROGRAM_TARGET_CUDA_DEVPTR)
+            backend_cuda_mark_device_dirty(backends[count - 1], host[count - 1], lengths[count - 1]);
+        else
+            backend_cuda_mark_host_dirty(backends[count - 1], host[count - 1], lengths[count - 1]);
+    }
+    return result;
+}
+
+static uint64_t run_sparf_workflow(ComputeJob *job, uint64_t *modeled_runtime)
+{
+    struct cemu_sparf_workflow_header header;
+    struct cemu_sparf_workflow_trace trace = { 0 };
+    memcpy(&header, job->args.data_buffer, sizeof(header));
+    const struct cemu_sparf_workflow_extent *maps =
+        (const struct cemu_sparf_workflow_extent *)
+        ((const uint8_t *)job->args.data_buffer + sizeof(header));
+    const struct cemu_sparf_workflow_extent *token_k_map = maps;
+    const struct cemu_sparf_workflow_extent *channel_k_map = token_k_map + header.token_k_extents;
+    const struct cemu_sparf_workflow_extent *token_v_map = channel_k_map + header.channel_k_extents;
+    const uint32_t vectors = header.batch_size * header.num_query_heads;
+    const uint32_t element = header.dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+    const uint32_t heads_per_kv = header.num_query_heads / header.num_kv_heads;
+    struct rte_ring *ring = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
+    uint32_t *channels = g_new(uint32_t, (uint64_t)vectors * header.top_r);
+    uint32_t *tokens = g_new(uint32_t, (uint64_t)vectors * header.top_k);
+    float *scores = g_new(float, header.valid_tokens);
+    SparfScoreIndex *score_indices = g_new(SparfScoreIndex, header.valid_tokens);
+    float *query_values = g_new(float, (uint64_t)vectors * header.head_dim);
+    float *channel_values = g_new(float,
+        (uint64_t)vectors * header.top_r * header.valid_tokens);
+    float *current_key_values = g_new(float,
+        (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim);
+    SparfScoreIndex *channel_indices = g_new(SparfScoreIndex, header.head_dim);
+    uint64_t result = (uint64_t)-1;
+    SparfRead channel_read = { 0 }, key_read = { 0 }, value_read = { 0 };
+    if (!ring || backend_cuda_prepare_host(job->mr_backend[0], job->args.mr_addr[0],
+                                           job->args.mr_len[0]) != 0) goto out;
+
+    for (uint64_t index = 0; index < (uint64_t)vectors * header.head_dim; ++index) {
+        query_values[index] = sparf_load_scalar(job->args.mr_addr[0], index,
+                                                header.dtype);
+    }
+
+    GArray *channel_spans = g_array_new(FALSE, FALSE, sizeof(SparfLogicalSpan));
+    for (uint32_t vector = 0; vector < vectors; ++vector) {
+        for (uint32_t dimension = 0; dimension < header.head_dim; ++dimension) {
+            channel_indices[dimension].score = fabsf(query_values[
+                (uint64_t)vector * header.head_dim + dimension]);
+            channel_indices[dimension].index = dimension;
+        }
+        qsort(channel_indices, header.head_dim, sizeof(*channel_indices),
+              sparf_score_index_compare);
+        for (uint32_t rank = 0; rank < header.top_r; ++rank) {
+            uint32_t best_index = channel_indices[rank].index;
+            channels[(uint64_t)vector * header.top_r + rank] = best_index;
+            uint32_t batch = vector / header.num_query_heads;
+            uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
+            SparfLogicalSpan span = {
+                .offset = (uint64_t)header.layer * header.channel_layer_stride +
+                          (uint64_t)batch * header.channel_batch_stride +
+                          (uint64_t)head * header.channel_head_stride +
+                          (uint64_t)best_index * header.channel_stride,
+                .size = header.valid_tokens * element,
+                .destination_offset = ((uint64_t)vector * header.top_r + rank) *
+                                      header.valid_tokens * element,
+            };
+            g_array_append_val(channel_spans, span);
+        }
+    }
+    if (!sparf_start_read(job, ring, channel_k_map, header.channel_k_extents,
+                          channel_spans, 1, clock_ns(), &channel_read) ||
+        !sparf_finish_read(&channel_read, ring, &trace.channel_read_model_ns)) goto out;
+
+    for (uint64_t index = 0;
+         index < (uint64_t)vectors * header.top_r * header.valid_tokens;
+         ++index) {
+        channel_values[index] = sparf_load_scalar(job->args.mr_addr[1], index,
+                                                  header.dtype);
+    }
+    if (backend_cuda_prepare_host(job->mr_backend[5], job->args.mr_addr[5], job->args.mr_len[5]) != 0) goto out;
+    for (uint64_t index = 0;
+         index < (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim;
+         ++index) {
+        current_key_values[index] = sparf_load_scalar(job->args.mr_addr[5], index,
+                                                      header.dtype);
+    }
+    float *alpha = (float *)job->args.mr_addr[7];
+    if (backend_cuda_prepare_host(job->mr_backend[7], alpha, vectors * sizeof(float)) != 0) goto out;
+    for (uint32_t vector = 0; vector < vectors; ++vector) {
+        uint32_t batch = vector / header.num_query_heads;
+        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
+        float q_norm = 0.0f, selected_norm = 0.0f, maximum = -INFINITY;
+        for (uint32_t dimension = 0; dimension < header.head_dim; ++dimension)
+            q_norm += fabsf(query_values[(uint64_t)vector * header.head_dim + dimension]);
+        for (uint32_t rank = 0; rank < header.top_r; ++rank)
+            selected_norm += fabsf(query_values[(uint64_t)vector * header.head_dim +
+                channels[(uint64_t)vector * header.top_r + rank]]);
+        float ratio = q_norm / MAX(selected_norm, 1.17549435e-38f);
+        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            scores[token] = 0.0f;
+        }
+        for (uint32_t rank = 0; rank < header.top_r; ++rank) {
+            uint32_t dimension = channels[(uint64_t)vector * header.top_r + rank];
+            float query_value = query_values[(uint64_t)vector * header.head_dim + dimension];
+            const float *key_values = &channel_values[
+                ((uint64_t)vector * header.top_r + rank) * header.valid_tokens];
+            for (uint32_t token = 0; token + 1 < header.valid_tokens; ++token) {
+                scores[token] += query_value * key_values[token];
+            }
+            scores[header.valid_tokens - 1] += query_value * current_key_values[
+                ((uint64_t)batch * header.num_kv_heads + head) * header.head_dim + dimension];
+        }
+        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            scores[token] *= ratio * header.scale;
+            maximum = MAX(maximum, scores[token]);
+        }
+        float denominator = 0.0f;
+        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            scores[token] = expf(scores[token] - maximum);
+            denominator += scores[token];
+        }
+        for (uint32_t token = 0; token < header.valid_tokens; ++token) scores[token] /= denominator;
+        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            score_indices[token].score = scores[token];
+            score_indices[token].index = token;
+        }
+        qsort(score_indices, header.valid_tokens, sizeof(*score_indices),
+              sparf_score_index_compare);
+        bool current_selected = false;
+        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
+            tokens[(uint64_t)vector * header.top_k + rank] = score_indices[rank].index;
+            current_selected |= score_indices[rank].index + 1 == header.valid_tokens;
+        }
+        uint32_t current = header.valid_tokens - 1;
+        if (!current_selected) {
+            uint32_t weakest = 0;
+            for (uint32_t rank = 1; rank < header.top_k; ++rank) {
+                if (scores[tokens[(uint64_t)vector * header.top_k + rank]] <
+                    scores[tokens[(uint64_t)vector * header.top_k + weakest]]) {
+                    weakest = rank;
+                }
+            }
+            tokens[(uint64_t)vector * header.top_k + weakest] = current;
+        }
+        alpha[vector] = 0.0f;
+        for (uint32_t rank = 0; rank < header.top_k; ++rank)
+            alpha[vector] += scores[tokens[(uint64_t)vector * header.top_k + rank]];
+    }
+    backend_cuda_mark_host_dirty(job->mr_backend[7], alpha, vectors * sizeof(float));
+
+    GArray *key_spans = g_array_new(FALSE, FALSE, sizeof(SparfLogicalSpan));
+    GArray *value_spans = g_array_new(FALSE, FALSE, sizeof(SparfLogicalSpan));
+    for (uint32_t vector = 0; vector < vectors; ++vector) {
+        uint32_t batch = vector / header.num_query_heads;
+        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
+        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
+            uint64_t logical = (uint64_t)header.layer * header.token_layer_stride +
+                (uint64_t)batch * header.token_batch_stride +
+                (uint64_t)head * header.token_head_stride +
+                (uint64_t)tokens[(uint64_t)vector * header.top_k + rank] * header.head_dim * element;
+            SparfLogicalSpan span = {
+                .offset = logical, .size = header.head_dim * element,
+                .destination_offset = ((uint64_t)vector * header.top_k + rank) * header.head_dim * element,
+            };
+            SparfLogicalSpan value_span = span;
+            value_span.destination_offset =
+                ((uint64_t)vector * (header.top_k + 1) + rank) *
+                header.head_dim * element;
+            g_array_append_val(key_spans, span);
+            g_array_append_val(value_spans, value_span);
+        }
+    }
+    if (!sparf_start_read(job, ring, token_k_map, header.token_k_extents,
+                          key_spans, 2, clock_ns(), &key_read) ||
+        !sparf_finish_read(&key_read, ring, &trace.token_k_read_model_ns)) goto out;
+    if (backend_cuda_prepare_host(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]) != 0) goto out;
+    for (uint32_t vector = 0; vector < vectors; ++vector) {
+        uint32_t batch = vector / header.num_query_heads;
+        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
+        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
+            if (tokens[(uint64_t)vector * header.top_k + rank] + 1 == header.valid_tokens) {
+                memcpy((uint8_t *)job->args.mr_addr[2] +
+                           ((uint64_t)vector * header.top_k + rank) * header.head_dim * element,
+                       (uint8_t *)job->args.mr_addr[5] +
+                           ((uint64_t)batch * header.num_kv_heads + head) * header.head_dim * element,
+                       header.head_dim * element);
+            }
+        }
+    }
+    backend_cuda_mark_host_dirty(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]);
+    if (!sparf_start_read(job, ring, token_v_map, header.token_v_extents,
+                          value_spans, 3, clock_ns(), &value_read)) goto out;
+
+    struct cemu_sparf_attention_metadata metadata = {
+        .version = CEMU_SPARF_ATTENTION_VERSION,
+        .phase = CEMU_SPARF_PHASE_EXACT_QK,
+        .dtype = header.dtype,
+        .batch_size = header.batch_size,
+        .num_query_heads = header.num_query_heads,
+        .head_dim = header.head_dim,
+        .selected_tokens = header.top_k,
+        .reserved = 0,
+        .scale = header.scale,
+    };
+    const uint32_t exact_ranges[] = { 0, 2, 7, 8 };
+    result = run_sparf_phase(job, CEMU_SPARF_PHASE_EXACT_QK,
+                             exact_ranges, 4, &metadata);
+    if (!sparf_finish_read(&value_read, ring, &trace.token_v_read_model_ns) ||
+        result == (uint64_t)-1) goto out;
+    if (backend_cuda_prepare_host(job->mr_backend[3], job->args.mr_addr[3],
+                                  job->args.mr_len[3]) != 0 ||
+        backend_cuda_prepare_host(job->mr_backend[4], job->args.mr_addr[4],
+                                  job->args.mr_len[4]) != 0 ||
+        backend_cuda_prepare_host(job->mr_backend[6], job->args.mr_addr[6],
+                                  job->args.mr_len[6]) != 0) goto out;
+    for (uint32_t vector = 0; vector < vectors; ++vector) {
+        uint32_t batch = vector / header.num_query_heads;
+        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
+        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
+            if (tokens[(uint64_t)vector * header.top_k + rank] + 1 == header.valid_tokens) {
+                memcpy((uint8_t *)job->args.mr_addr[3] +
+                           ((uint64_t)vector * (header.top_k + 1) + rank) * header.head_dim * element,
+                       (uint8_t *)job->args.mr_addr[6] +
+                           ((uint64_t)batch * header.num_kv_heads + head) * header.head_dim * element,
+                       header.head_dim * element);
+            }
+        }
+        memcpy((uint8_t *)job->args.mr_addr[3] +
+                   ((uint64_t)vector * (header.top_k + 1) + header.top_k) * header.head_dim * element,
+               (uint8_t *)job->args.mr_addr[4] + (uint64_t)vector * header.head_dim * element,
+               header.head_dim * element);
+    }
+    backend_cuda_mark_host_dirty(job->mr_backend[3], job->args.mr_addr[3], job->args.mr_len[3]);
+    const uint32_t pv_ranges[] = { 8, 3, 9 };
+    result = run_sparf_phase(job, CEMU_SPARF_PHASE_PV, pv_ranges, 3, &metadata);
+
+out:
+    if (channel_read.request) sparf_finish_read(&channel_read, ring, &trace.channel_read_model_ns);
+    if (key_read.request) sparf_finish_read(&key_read, ring, &trace.token_k_read_model_ns);
+    if (value_read.request) sparf_finish_read(&value_read, ring, &trace.token_v_read_model_ns);
+    trace.approximate_model_ns = header.approximate_runtime_ns;
+    trace.exact_qk_model_ns = header.exact_qk_runtime_ns;
+    trace.pv_model_ns = header.pv_runtime_ns;
+    trace.selected_channels = (uint64_t)vectors * header.top_r;
+    trace.selected_tokens = (uint64_t)vectors * header.top_k;
+    trace.total_model_ns = trace.channel_read_model_ns + trace.approximate_model_ns +
+        trace.token_k_read_model_ns + MAX(trace.exact_qk_model_ns, trace.token_v_read_model_ns) +
+        trace.pv_model_ns;
+    *modeled_runtime = trace.total_model_ns;
+    if (backend_cuda_prepare_host(job->mr_backend[10], job->args.mr_addr[10], sizeof(trace)) == 0) {
+        memcpy(job->args.mr_addr[10], &trace, sizeof(trace));
+        backend_cuda_mark_host_dirty(job->mr_backend[10], job->args.mr_addr[10], sizeof(trace));
+    } else result = (uint64_t)-1;
+    if (ring) femu_ring_free(ring);
+    g_free(channels); g_free(tokens); g_free(scores); g_free(score_indices);
+    g_free(query_values); g_free(channel_values); g_free(current_key_values);
+    g_free(channel_indices);
+    return result;
+}
+
+static uint64_t run_attention_phase_stage(ComputeJob *job, uint32_t phase,
+                                          const uint32_t indices[3],
+                                          struct cemu_attention_phase_metadata *metadata)
+{
+    void *host_addresses[3];
+    void *device_addresses[3];
+    long long lengths[3];
+    SsdBackend *backends[3];
+    for (uint32_t index = 0; index < 3; ++index) {
+        uint32_t source = indices[index];
+        host_addresses[index] = job->args.mr_addr[source];
+        device_addresses[index] = job->args.mr_dev_addr
+                                ? job->args.mr_dev_addr[source] : NULL;
+        lengths[index] = job->args.mr_len[source];
+        backends[index] = job->mr_backend[source];
+    }
+
+    struct ubpf_jit_args arguments = job->args;
+    arguments.numr = 3;
+    arguments.mr_addr = host_addresses;
+    arguments.mr_dev_addr = job->args.mr_dev_addr ? device_addresses : NULL;
+    arguments.mr_len = lengths;
+    metadata->phase = phase;
+    arguments.data_buffer = metadata;
+    arguments.buffer_len = sizeof(*metadata);
+
+    if (job->program->target == PROGRAM_TARGET_CUDA_DEVPTR) {
+        if (!arguments.mr_dev_addr) {
+            return (uint64_t)-1;
+        }
+        for (uint32_t index = 0; index < 2; ++index) {
+            if (backend_cuda_prepare_device(backends[index], host_addresses[index],
+                                            lengths[index]) != 0) {
+                return (uint64_t)-1;
+            }
+        }
+        uint64_t result = job->program->shared_lib.jit_fn(&arguments);
+        if (result != (uint64_t)-1) {
+            backend_cuda_mark_device_dirty(backends[2], host_addresses[2], lengths[2]);
+        }
+        return result;
+    }
+    if (job->program->target == PROGRAM_TARGET_HOST) {
+        for (uint32_t index = 0; index < 2; ++index) {
+            if (backend_cuda_prepare_host(backends[index], host_addresses[index],
+                                          lengths[index]) != 0) {
+                return (uint64_t)-1;
+            }
+        }
+        uint64_t result = job->program->shared_lib.jit_fn(&arguments);
+        if (result != (uint64_t)-1) {
+            backend_cuda_mark_host_dirty(backends[2], host_addresses[2], lengths[2]);
+        }
+        return result;
+    }
+    return (uint64_t)-1;
+}
+
+static uint64_t run_attention_workflow(ComputeJob *job, uint64_t *modeled_runtime)
+{
+    struct cemu_attention_workflow_header header;
+    struct cemu_attention_workflow_trace trace = { 0 };
+    memcpy(&header, job->args.data_buffer, sizeof(header));
+    const struct cemu_attention_workflow_extent *extents =
+        (const struct cemu_attention_workflow_extent *)
+        ((const uint8_t *)job->args.data_buffer + sizeof(header));
+    const bool serial = header.flags & CEMU_ATTENTION_WORKFLOW_SERIAL;
+    struct rte_ring *ring = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
+    NvmeRequest *key_request = NULL;
+    NvmeRequest *value_request = NULL;
+    uint64_t result = (uint64_t)-1;
+    if (!ring) {
+        return result;
+    }
+
+    trace.key_submit_ns = monotonic_ns();
+    uint64_t key_model_start = clock_ns();
+    key_request = attention_submit_read(job->req, ring, job->args.mr_addr[1],
+                                        extents, header.key_extents,
+                                        key_model_start);
+    if (!key_request || !attention_wait_read(ring, key_request)) {
+        goto out;
+    }
+    trace.key_ready_ns = monotonic_ns();
+    trace.key_model_ns = key_request->stat.reqlat;
+    uint64_t middle_model_start = key_model_start + trace.key_model_ns;
+    attention_free_read(key_request);
+    key_request = NULL;
+
+    if (!serial) {
+        trace.value_submit_ns = monotonic_ns();
+        value_request = attention_submit_read(
+            job->req, ring, job->args.mr_addr[2],
+            extents + header.key_extents, header.value_extents,
+            middle_model_start);
+        if (!value_request) {
+            goto out;
+        }
+    }
+
+    const uint32_t qk_indices[] = { 0, 1, 3 };
+    trace.qk_start_ns = monotonic_ns();
+    result = run_attention_phase_stage(job, CEMU_ATTENTION_PHASE_QK_SOFTMAX,
+                                       qk_indices, &header.attention);
+    trace.qk_done_ns = monotonic_ns();
+    if (result == (uint64_t)-1) {
+        if (value_request) {
+            goto wait_value;
+        }
+        goto out;
+    }
+
+    if (serial) {
+        trace.value_submit_ns = monotonic_ns();
+        value_request = attention_submit_read(
+            job->req, ring, job->args.mr_addr[2],
+            extents + header.key_extents, header.value_extents,
+            middle_model_start + header.qk_runtime_ns);
+        if (!value_request) {
+            result = (uint64_t)-1;
+            goto out;
+        }
+    }
+
+wait_value:
+    if (!attention_wait_read(ring, value_request)) {
+        result = (uint64_t)-1;
+        goto out;
+    }
+    trace.value_ready_ns = monotonic_ns();
+    trace.value_model_ns = value_request->stat.reqlat;
+    attention_free_read(value_request);
+    value_request = NULL;
+    if (result == (uint64_t)-1) {
+        goto out;
+    }
+
+    const uint32_t pv_indices[] = { 3, 2, 4 };
+    trace.pv_start_ns = monotonic_ns();
+    result = run_attention_phase_stage(job, CEMU_ATTENTION_PHASE_PV,
+                                       pv_indices, &header.attention);
+    trace.pv_done_ns = monotonic_ns();
+
+out:
+    if (value_request) {
+        attention_wait_read(ring, value_request);
+        attention_free_read(value_request);
+    }
+    attention_free_read(key_request);
+    trace.finish_ns = monotonic_ns();
+    trace.qk_model_ns = header.qk_runtime_ns;
+    trace.pv_model_ns = header.pv_runtime_ns;
+    uint64_t middle = serial
+        ? (uint64_t)header.qk_runtime_ns + trace.value_model_ns
+        : MAX((uint64_t)header.qk_runtime_ns, trace.value_model_ns);
+    trace.total_model_ns = trace.key_model_ns + middle + header.pv_runtime_ns;
+    *modeled_runtime = trace.total_model_ns;
+    if (backend_cuda_prepare_host(job->mr_backend[5], job->args.mr_addr[5],
+                                  sizeof(trace)) == 0) {
+        memcpy(job->args.mr_addr[5], &trace, sizeof(trace));
+        backend_cuda_mark_host_dirty(job->mr_backend[5], job->args.mr_addr[5],
+                                     sizeof(trace));
+    } else {
+        result = (uint64_t)-1;
+    }
+    femu_ring_free(ring);
+    return result;
+}
+
 static uint64_t run_functional_modeling(ComputeJob *job)
 {
     Program *program = job->program;
@@ -1104,6 +2150,11 @@ static uint64_t run_functional_modeling(ComputeJob *job)
     uint64_t runtime = job->user_runtime;
     const uint64_t requested_runtime = runtime;
     uint64_t freeze_entry_ns = 0;
+    uint64_t workflow_runtime = 0;
+    bool attention_workflow =
+        (uint64_t)job->args.cparam1 == CEMU_ATTENTION_WORKFLOW_COMMAND;
+    bool sparf_workflow =
+        (uint64_t)job->args.cparam1 == CEMU_SPARF_WORKFLOW_COMMAND;
     struct timespec t0, t1;
 
     if (detailed_compute_log) {
@@ -1127,10 +2178,19 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             runtime -= freeze_entry_ns;
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        res = run_program_by_target(job);
+        if (sparf_workflow) {
+            res = run_sparf_workflow(job, &workflow_runtime);
+        } else if (attention_workflow) {
+            res = run_attention_workflow(job, &workflow_runtime);
+        } else {
+            res = run_program_by_target(job);
+        }
         clock_gettime(CLOCK_MONOTONIC, &te);
         realtime = (te.tv_sec-ts.tv_sec)* 1000000000LL + (te.tv_nsec-ts.tv_nsec);
-        if(!runtime)
+        if (attention_workflow || sparf_workflow) {
+            runtime = workflow_runtime > freeze_entry_ns
+                    ? workflow_runtime - freeze_entry_ns : 0;
+        } else if(!runtime)
         {
             if (program->runtime_scale)
                 runtime = realtime * program->runtime_scale;

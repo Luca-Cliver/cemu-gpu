@@ -93,7 +93,18 @@ def estimate_capacity(
     layer_stride = align_up(sequence_capacity * token_stride, 4096)
     file_size = model.num_layers * layer_stride
     gpu_batches = batch_size // gpu_batch_size
-    nvm_bytes = 2 * gpu_batches * file_size
+    if experiment.workload.attention_mode == "sparf":
+        head_bytes = model.head_dim * element_size
+        token_head_stride = align_up(sequence_capacity * head_bytes, 4096)
+        token_layer_stride = align_up(gpu_batch_size * model.num_kv_heads * token_head_stride, 4096)
+        token_file_size = model.num_layers * token_layer_stride
+        channel_stride = align_up(sequence_capacity * element_size, 512)
+        channel_head_stride = align_up(model.head_dim * channel_stride, 4096)
+        channel_layer_stride = align_up(gpu_batch_size * model.num_kv_heads * channel_head_stride, 4096)
+        channel_file_size = model.num_layers * channel_layer_stride
+        nvm_bytes = gpu_batches * (2 * token_file_size + channel_file_size)
+    else:
+        nvm_bytes = 2 * gpu_batches * file_size
 
     staging_bytes = sequence_capacity * token_stride
     query_bytes = align_up(
@@ -104,9 +115,22 @@ def estimate_capacity(
         gpu_batch_size * model.num_query_heads * (model.head_dim + 2) * 4,
         512,
     )
-    fdm_bytes = attention_slots * (
-        2 * staging_bytes + 2 * query_bytes + state_bytes
-    )
+    if experiment.workload.attention_mode == "sparf":
+        vectors = gpu_batch_size * model.num_query_heads
+        maximum_k = (sequence_capacity + experiment.workload.compression_ratio - 1) // experiment.workload.compression_ratio
+        sparse_ranges = (
+            query_bytes,
+            align_up(vectors * experiment.workload.top_r * sequence_capacity * element_size, 512),
+            align_up(vectors * maximum_k * model.head_dim * element_size, 512),
+            align_up(vectors * (maximum_k + 1) * model.head_dim * element_size, 512),
+            query_bytes, align_up(vectors * 4, 512),
+            align_up(gpu_batch_size * model.num_kv_heads * model.head_dim * element_size, 512),
+            align_up(gpu_batch_size * model.num_kv_heads * model.head_dim * element_size, 512),
+            align_up(vectors * (maximum_k + 1) * 4, 512), query_bytes, 512,
+        )
+        fdm_bytes = sum(sparse_ranges)
+    else:
+        fdm_bytes = attention_slots * (2 * staging_bytes + 2 * query_bytes + state_bytes)
     history_token_sum = (
         decode_steps * prompt_length
         + decode_steps * (decode_steps - 1) // 2
@@ -119,6 +143,8 @@ def estimate_capacity(
         * token_stride
         * history_token_sum
     )
+    if experiment.workload.attention_mode == "sparf":
+        decode_staging_bytes //= experiment.workload.compression_ratio
     return WorkloadCapacity(
         batch_size=batch_size,
         gpu_batch_size=gpu_batch_size,
@@ -173,8 +199,12 @@ def parse_args():
     parser.add_argument(
         "--program",
         type=Path,
-        default=Path("./build/dense_attention_parallel_devptr.so"),
     )
+    parser.add_argument("--attention-mode", choices=("dense", "sparf"))
+    parser.add_argument("--sparf-top-r", type=positive_integer)
+    parser.add_argument("--sparf-compression-ratio", type=positive_integer)
+    parser.add_argument("--softmax-ratio-file", type=Path,
+                        help="measured CUDA Softmax shape-ratio JSON for SparF")
     parser.add_argument("--csd-target", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--gpu-batch-size", type=positive_integer, default=4)
     parser.add_argument("--attention-slots", type=positive_integer, default=2)
@@ -214,6 +244,15 @@ def parse_args():
 def main():
     args = parse_args()
     experiment = load_experiment_config(args.config)
+    attention_mode = args.attention_mode or experiment.workload.attention_mode
+    sparf_top_r = args.sparf_top_r or experiment.workload.top_r
+    sparf_compression = args.sparf_compression_ratio or experiment.workload.compression_ratio
+    if args.program is not None:
+        program = args.program
+    elif attention_mode == "sparf":
+        program = Path(f"./build/sparf_attention{'_devptr' if args.csd_target == 'cuda' else ''}.so")
+    else:
+        program = Path("./build/dense_attention_parallel_devptr.so" if args.csd_target == "cuda" else "./build/dense_attention.so")
     if experiment.model.name.lower() != "opt-13b":
         raise ValueError("Figure 14 functional runner requires the OPT-13B config")
     if experiment.instcsd.count != 1:
@@ -311,9 +350,17 @@ def main():
             "--namespace",
             args.namespace,
             "--program",
-            str(args.program),
+            str(program),
             "--csd-target",
             args.csd_target,
+            "--attention-mode",
+            attention_mode,
+            "--sparf-top-r",
+            str(sparf_top_r),
+            "--sparf-compression-ratio",
+            str(sparf_compression),
+            "--runtime-config",
+            str(args.config.resolve()),
             "--batch-size",
             str(capacity.batch_size),
             "--gpu-batch-size",
@@ -327,6 +374,10 @@ def main():
             "--attention-slots",
             str(args.attention_slots),
         ]
+        if args.softmax_ratio_file is not None:
+            if attention_mode != "sparf":
+                raise ValueError("--softmax-ratio-file requires --attention-mode sparf")
+            command.extend(("--softmax-ratio-file", str(args.softmax_ratio_file.resolve())))
         if profile_directory is not None:
             command.extend(
                 (

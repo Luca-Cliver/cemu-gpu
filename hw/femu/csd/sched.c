@@ -336,8 +336,15 @@ static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
         }
 
         qatomic_dec(&program->jobs_running);
-        if (job->args.data_buffer)
-            free(job->args.data_buffer);
+        if (req->data_buffer) {
+            free(req->data_buffer);
+            req->data_buffer = NULL;
+        }
+        if (job->owns_mr_arrays) {
+            free(job->args.mr_addr);
+            free(job->args.mr_len);
+        }
+        free(job->mr_backend);
         if (job->owns_mr_dev_addr && job->args.mr_dev_addr)
             free(job->args.mr_dev_addr);
         job_group_remove(job->group, job);

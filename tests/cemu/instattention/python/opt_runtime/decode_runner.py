@@ -26,7 +26,7 @@ class OptDecodeRunner(ModelDecodeRunner):
         super().__init__(
             config,
             weight_loader,
-            OptOperations(config),
+            OptOperations(config, profiler=getattr(attention_backend, "profiler", None)),
             attention_backend,
             logger=logger,
         )

@@ -75,6 +75,23 @@ static CudaMirrorRange *cuda_mirror_find_exact(SsdBackend *b, void *host_ptr,
     return NULL;
 }
 
+static CudaMirrorRange *cuda_mirror_find_covering(SsdBackend *b,
+                                                   void *host_ptr,
+                                                   uint64_t len)
+{
+    uintptr_t request_start = (uintptr_t)host_ptr;
+    uintptr_t request_end = request_start + len;
+
+    for (CudaMirrorRange *cur = cuda_mirror_head(b); cur; cur = cur->next) {
+        uintptr_t entry_start = (uintptr_t)cur->host_ptr;
+        uintptr_t entry_end = entry_start + cur->len;
+        if (request_start >= entry_start && request_end <= entry_end) {
+            return cur;
+        }
+    }
+    return NULL;
+}
+
 static void cuda_mirror_reserve_segments(CudaMirrorRange *entry,
                                          uint32_t capacity)
 {
@@ -500,7 +517,10 @@ int backend_cuda_prepare_device(SsdBackend *b, void *ptr, uint64_t len)
     }
 
     qemu_mutex_lock(&b->cuda_mirror_lock);
-    CudaMirrorRange *entry = cuda_mirror_ensure_locked(b, ptr, len);
+    CudaMirrorRange *entry = cuda_mirror_find_covering(b, ptr, len);
+    if (!entry) {
+        entry = cuda_mirror_ensure_locked(b, ptr, len);
+    }
     if (!entry) {
         qemu_mutex_unlock(&b->cuda_mirror_lock);
         return -1;

@@ -25,12 +25,14 @@ from cemu_flexgen import (
     CemuAttentionDevice,
     CemuAttentionSlotScheduler,
     CemuAttentionSharedWorkers,
+    CemuSparfDevice,
     KvCacheLayout,
     KvCacheStore,
     KvLayoutConfig,
+    SparfKvCacheLayout,
     align_up,
 )
-from flexgen_adapter import FlexGenAttentionBackend, FlexGenMicrobatchKvWriter
+from flexgen_adapter import FlexGenAttentionBackend, FlexGenMicrobatchKvWriter, SparfAttentionBackend
 from opt_runtime import (
     OptDecodeRunner,
     OptGenerationRunner,
@@ -41,7 +43,8 @@ from opt_runtime import (
     OptPrefillRunner,
     OptTorchAttentionBackend,
 )
-from experiments import PipelineTrace
+from experiments import PipelineTrace, SparfAttentionRuntimeModel, load_experiment_config
+from experiments.softmax_ratio import SoftmaxRatioTable
 from phase_profiler import PhaseProfiler, profile_scope
 from runtime_common import partition_kv_cache_by_batch
 
@@ -116,6 +119,12 @@ def parse_args():
     parser.add_argument("--decode-steps", type=positive_integer, default=1)
     parser.add_argument("--staging-tokens", type=nonnegative_integer, default=0)
     parser.add_argument("--attention-slots", type=positive_integer, default=2)
+    parser.add_argument("--attention-mode", choices=("dense", "sparf"), default="dense")
+    parser.add_argument("--sparf-top-r", type=positive_integer, default=16)
+    parser.add_argument("--sparf-compression-ratio", type=positive_integer, default=8)
+    parser.add_argument("--runtime-config", type=Path, help="paper hardware config used for CSD runtime modeling")
+    parser.add_argument("--softmax-ratio-file", type=Path,
+                        help="optional measured CUDA Softmax ratios; requires SparF and --runtime-config")
     parser.add_argument("--atol", type=nonnegative_float, default=2e-3)
     parser.add_argument("--rtol", type=nonnegative_float, default=2e-3)
     parser.add_argument("--qkv-atol", type=nonnegative_float, default=5e-3)
@@ -191,6 +200,9 @@ def write_profile(profiler, output_path):
         "[opt-profile] accumulated worker times may overlap; compare them with "
         "pipeline.decode_wall instead of adding every row"
     )
+    log("[opt-profile] *_wall = Guest caller time; *.cuda_stream = CUDA event interval; "
+        "csd_model.* = modeled device time. These are overlapping measurements, not additive. "
+        "prefill_forward_wall includes KV work and waits.")
     for line in profiler.summary():
         log(f"[opt-profile] {line}")
     log(f"[opt-profile] CSV={profile_path}")
@@ -391,12 +403,14 @@ def run_functional_pipeline(
         "CEMU NVM"
     )
     with profile_scope(profiler, "pipeline.prefill_wall"):
-        prefill_result = prefill_runner.run(
-            token_ids,
-            collect_kv_cache=False,
-            last_token_only=True,
-        )
-        kv_writer.flush()
+        with profile_scope(profiler, "pipeline.prefill_forward_wall"):
+            prefill_result = prefill_runner.run(
+                token_ids,
+                collect_kv_cache=False,
+                last_token_only=True,
+            )
+        with profile_scope(profiler, "pipeline.prefill_kv_flush_wall"):
+            kv_writer.flush()
         synchronize(device)
     log(
         "[opt-functional] Prefill complete; initial Decode tokens="
@@ -423,6 +437,23 @@ def run_functional_pipeline(
                 collect_steps=False,
             )
             synchronize(device)
+
+    modeled = []
+    seen_devices = set()
+    for backend in cemu_backends:
+        csd_device = getattr(backend, "attention_device", None)
+        if id(csd_device) in seen_devices:
+            continue
+        seen_devices.add(id(csd_device))
+        summary = getattr(csd_device, "modeled_runtime_summary", None)
+        if callable(summary):
+            modeled.append(summary())
+    if modeled:
+        total_ns = sum(item[0] for item in modeled)
+        log(
+            f"[opt-functional] CSD workflow modeled sum: total={total_ns / 1e9:.6f}s, "
+            f"attention_requests={sum(item[1] for item in modeled)}"
+        )
 
     log("[opt-functional] step 3/3: flush persistent Decode K/V")
     with profile_scope(profiler, "pipeline.final_flush_wall"):
@@ -928,19 +959,21 @@ def main():
         )
     if not torch.cuda.is_available():
         raise RuntimeError("PyTorch cannot access the Guest GPU")
-    if args.attention_slots < 2:
+    if args.attention_mode == "dense" and args.attention_slots < 2:
         raise ValueError("the slot-scheduled CEMU path requires at least two slots")
+    if args.attention_mode == "sparf" and not (args.functional or args.benchmark):
+        raise ValueError("SparF OPT integration currently uses --functional or --benchmark; use the device test for strict operator validation")
     if args.profile_output is not None and not args.functional:
         raise ValueError("--profile-output currently requires --functional")
 
     model_directory = require_directory("model directory", args.model_dir)
     nvm_root = require_directory("NVM directory", args.nvm_dir)
     fdm_root = require_directory("FDM directory", args.fdm_dir)
-    program_file = args.program or Path(
-        "./build/dense_attention_devptr.so"
-        if args.csd_target == "cuda"
-        else "./build/dense_attention.so"
+    default_program = (
+        f"./build/{'sparf_attention' if args.attention_mode == 'sparf' else 'dense_attention'}"
+        f"{'_devptr' if args.csd_target == 'cuda' else ''}.so"
     )
+    program_file = args.program or Path(default_program)
     if not program_file.is_file():
         raise FileNotFoundError(f"CEMU Attention program does not exist: {program_file}")
     program_reference = str(program_file)
@@ -984,9 +1017,29 @@ def main():
     trace = PipelineTrace() if args.trace_file is not None else None
     profiler = PhaseProfiler() if args.profile_output is not None else None
     detail_logger = None if args.benchmark or args.functional else (trace or log)
+    softmax_ratios = None
+    if args.softmax_ratio_file is not None:
+        if args.runtime_config is None or args.attention_mode != "sparf":
+            raise ValueError("--softmax-ratio-file requires --attention-mode sparf and --runtime-config")
+        softmax_ratios = SoftmaxRatioTable.load(args.softmax_ratio_file)
+        softmax_ratios.require_sparf(
+            gpu_batch_size, config.num_attention_heads, prompt_length,
+            args.decode_steps, args.sparf_compression_ratio,
+        )
+    sparf_runtime_model = None
+    if args.runtime_config is not None and args.attention_mode == "sparf":
+        sparf_runtime_model = SparfAttentionRuntimeModel(
+            load_experiment_config(args.runtime_config).instcsd,
+            softmax_ratios=softmax_ratios,
+        )
+        print(
+            f"[opt-cemu] Softmax timing={'measured CUDA shape ratio (not FPGA-validated)' if softmax_ratios else 'legacy linear anchor scaling'}, "
+            f"ratio_file={args.softmax_ratio_file}"
+        )
 
+    layout_type = SparfKvCacheLayout if args.attention_mode == "sparf" else KvCacheLayout
     layouts = tuple(
-        KvCacheLayout(
+        layout_type(
             KvLayoutConfig(
                 num_layers=config.num_hidden_layers,
                 max_seq_len=max_seq_len,
@@ -1002,7 +1055,7 @@ def main():
     staging_tokens = args.staging_tokens or max_seq_len
     if staging_tokens > max_seq_len:
         raise ValueError("staging tokens cannot exceed the configured sequence length")
-    if staging_tokens < max_seq_len:
+    if args.attention_mode == "dense" and staging_tokens < max_seq_len:
         raise ValueError(
             "the current double-slot runtime requires one Attention chunk; "
             "use --staging-tokens 0 or at least the full configured sequence length"
@@ -1018,7 +1071,8 @@ def main():
     log(
         f"[opt-cemu] model={model_directory}, device={device}, "
         f"gpu={torch.cuda.get_device_name(device)}, dtype={config.dtype}, "
-        f"csd_target={args.csd_target}, csd_program={program_reference}"
+        f"csd_target={args.csd_target}, attention_mode={args.attention_mode}, "
+        f"csd_program={program_reference}"
     )
     log(
         f"[opt-cemu] layers={config.num_hidden_layers}, "
@@ -1028,14 +1082,20 @@ def main():
         f"gpu_batches={num_gpu_batches}, prompt={prompt_length}, "
         f"decode_steps={args.decode_steps}, attention_slots={args.attention_slots}"
     )
-    log(
-        f"[opt-cemu] KV token_bytes={layout.token_bytes}, "
-        f"token_stride={layout.token_stride}, layer_stride={layout.layer_stride}, "
-        f"K_file_per_gpu_batch={layout.file_size}, "
-        f"V_file_per_gpu_batch={layout.file_size}, "
-        f"KV_files={2 * num_gpu_batches}, "
-        f"staging_tokens={staging_tokens}, staging_bytes={staging_bytes}"
-    )
+    if args.attention_mode == "sparf":
+        log(
+            f"[opt-cemu] SparF K_token={layout.token_file_size}, "
+            f"K_channel={layout.channel_file_size}, V_token={layout.token_file_size}, "
+            f"files={3 * num_gpu_batches}, top_r={args.sparf_top_r}, "
+            f"compression=1/{args.sparf_compression_ratio}"
+        )
+    else:
+        log(
+            f"[opt-cemu] KV token_bytes={layout.token_bytes}, "
+            f"token_stride={layout.token_stride}, layer_stride={layout.layer_stride}, "
+            f"K_file_per_gpu_batch={layout.file_size}, V_file_per_gpu_batch={layout.file_size}, "
+            f"KV_files={2 * num_gpu_batches}, staging_tokens={staging_tokens}, staging_bytes={staging_bytes}"
+        )
     if args.prompt_text is not None:
         log(f"[opt-cemu] prompt text={args.prompt_text!r}")
     log(f"[opt-cemu] prompt token_ids={format_token_ids(token_ids)}")
@@ -1050,10 +1110,9 @@ def main():
         nvm_path = Path(nvm_directory)
         fdm_path = Path(fdm_directory)
         cache_paths = tuple(
-            (
-                nvm_path / f"k_cache_{microbatch}",
-                nvm_path / f"v_cache_{microbatch}",
-            )
+            ((nvm_path / f"k_token_{microbatch}", nvm_path / f"k_channel_{microbatch}", nvm_path / f"v_token_{microbatch}")
+             if args.attention_mode == "sparf" else
+             (nvm_path / f"k_cache_{microbatch}", nvm_path / f"v_cache_{microbatch}"))
             for microbatch in range(num_gpu_batches)
         )
         query_bytes = align_up(
@@ -1100,16 +1159,17 @@ def main():
                     profiler=profiler,
                 )
                 for slot in range(args.attention_slots)
-        )
-        shared_csd_workers = CemuAttentionSharedWorkers(logger=detail_logger)
+        ) if args.attention_mode == "dense" else ()
+        shared_csd_workers = CemuAttentionSharedWorkers(logger=detail_logger) if attention_slots else None
         attention_scheduler = CemuAttentionSlotScheduler(
                 attention_slots,
                 workers=shared_csd_workers,
                 logger=detail_logger,
                 profiler=profiler,
-        )
-        attention_schedulers = (attention_scheduler,)
-        cemu_backends = tuple(
+        ) if attention_slots else None
+        attention_schedulers = (attention_scheduler,) if attention_scheduler else ()
+        if args.attention_mode == "dense":
+            cemu_backends = tuple(
             FlexGenAttentionBackend(
                 layout=layouts[microbatch],
                 k_cache_path=cache_paths[microbatch][0],
@@ -1120,7 +1180,31 @@ def main():
                 profiler=profiler,
             )
             for microbatch in range(num_gpu_batches)
-        )
+            )
+        else:
+            sparf_device = CemuSparfDevice(
+                    layout, *cache_paths[0],
+                    fdm_directory=fdm_path,
+                    program_path=program_reference,
+                    query_heads=config.num_attention_heads,
+                    top_r=args.sparf_top_r,
+                    compression_ratio=args.sparf_compression_ratio,
+                    control_path=args.control,
+                    namespace_path=args.namespace,
+                    cuda_target=args.csd_target == "cuda",
+                    runtime_model=sparf_runtime_model,
+                    profiler=profiler,
+                    logger=detail_logger,
+                    name_prefix="shared",
+                )
+            cemu_backends = tuple(
+                SparfAttentionBackend(
+                    layouts[microbatch], *cache_paths[microbatch],
+                    attention_device=sparf_device,
+                    replace_existing=True, logger=detail_logger, profiler=profiler,
+                )
+                for microbatch in range(num_gpu_batches)
+            )
         kv_writer = FlexGenMicrobatchKvWriter(
             cemu_backends,
             logger=detail_logger,

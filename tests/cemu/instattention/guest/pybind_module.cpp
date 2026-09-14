@@ -1,4 +1,5 @@
 #include "cemu_client.h"
+#include "../../util.h"
 
 #include <cstring>
 #include <limits>
@@ -75,6 +76,36 @@ PYBIND11_MODULE(_cemu_client, module)
         .value("HOST", ProgramTarget::Host)
         .value("CUDA_DEVICE_POINTER", ProgramTarget::CudaDevicePointer)
         .export_values();
+
+    module.def(
+        "get_file_extents",
+        [](const std::string &path, std::uint64_t size) {
+            if (size == 0 || size % LBA_SIZE != 0) {
+                throw py::value_error("file extent size must be a positive multiple of 512");
+            }
+            if (size / LBA_SIZE > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+                throw py::value_error("file extent request is too large");
+            }
+            std::uint64_t mapped_size = size;
+            NvmeCopyFormat2 *descriptors = nullptr;
+            int blocks = static_cast<int>(size / LBA_SIZE);
+            int descriptor_count = 0;
+            int result = get_file_mappings(path.c_str(), &mapped_size, &descriptors,
+                                           1, &blocks, &descriptor_count);
+            std::unique_ptr<NvmeCopyFormat2, decltype(&std::free)>
+                owned(descriptors, &std::free);
+            if (result < 0 || result != descriptor_count || mapped_size != size) {
+                throw std::runtime_error("cannot resolve complete NVM file extents: " + path);
+            }
+            py::list extents;
+            for (int index = 0; index < descriptor_count; ++index) {
+                extents.append(py::make_tuple(
+                    descriptors[index].slba,
+                    static_cast<std::uint32_t>(descriptors[index].nlb) + 1));
+            }
+            return extents;
+        },
+        py::arg("path"), py::arg("size"));
 
     py::class_<MemoryRange>(module, "MemoryRange")
         .def(py::init<std::string, std::uint64_t, std::uint64_t>(),

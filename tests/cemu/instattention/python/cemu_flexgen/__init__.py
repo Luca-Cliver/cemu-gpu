@@ -1,6 +1,8 @@
-from .kv_layout import KvCacheLayout, KvChunk, KvLayoutConfig, align_up
+from .kv_layout import KvCacheLayout, KvChunk, KvLayoutConfig, SparfKvCacheLayout, align_up
 from .kv_staging import KvStagingManager
 from .kv_store import KvCacheStore
+from .sparf_kv_store import SparfKvCacheStore
+from .sparf import SparfResult, sparf_attention
 from .attention_abi import DenseAttentionMetadata
 from .cemu_attention_slot_scheduler import (
     CemuAttentionSharedWorkers,
@@ -22,6 +24,11 @@ __all__ = [
     "RangeSpec",
     "KvCacheLayout",
     "KvCacheStore",
+    "SparfKvCacheLayout",
+    "SparfKvCacheStore",
+    "SparfResult",
+    "sparf_attention",
+    "CemuSparfDevice",
     "KvStagingManager",
     "KvChunk",
     "KvLayoutConfig",
@@ -30,6 +37,11 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name == "CemuSparfDevice":
+        from .cemu_sparf_device import CemuSparfDevice
+
+        globals()[name] = CemuSparfDevice
+        return CemuSparfDevice
     if name in ("AttentionBufferConfig", "AttentionRange", "CemuAttentionDevice"):
         from .cemu_attention_device import (
             AttentionBufferConfig,

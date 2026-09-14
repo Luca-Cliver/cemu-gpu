@@ -23,6 +23,8 @@ class WorkloadConfig:
     decode_length: int
     batch_sizes: Tuple[int, ...]
     attention_mode: str
+    top_r: int
+    compression_ratio: int
 
 
 @dataclass(frozen=True)
@@ -131,9 +133,15 @@ def load_experiment_config(path: Any) -> InstAttentionExperimentConfig:
         decode_length=_positive_int(workload_raw, "decode_length"),
         batch_sizes=batch_sizes,
         attention_mode=_text(workload_raw, "attention_mode"),
+        top_r=int(workload_raw.get("top_r", model.head_dim)),
+        compression_ratio=int(workload_raw.get("compression_ratio", 1)),
     )
-    if workload.attention_mode != "dense":
-        raise ValueError("the initial experiment only supports dense attention")
+    if workload.attention_mode not in ("dense", "sparf"):
+        raise ValueError("attention_mode must be dense or sparf")
+    if not 0 < workload.top_r <= model.head_dim:
+        raise ValueError("top_r must fit head_dim")
+    if workload.compression_ratio <= 0:
+        raise ValueError("compression_ratio must be positive")
     if workload.prompt_length + workload.decode_length > model.max_sequence_length:
         raise ValueError("prompt_length + decode_length exceeds max_sequence_length")
 

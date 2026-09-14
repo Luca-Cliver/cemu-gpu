@@ -1,9 +1,12 @@
 """OPT tensor operations used by the shared runtime schedulers."""
 
 from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
 from typing import Any, Optional, Sequence
 
 import torch
+from phase_profiler import profile_tensor_scope
 import torch.nn.functional as F
 
 from runtime_common import ModelEmbeddingResult
@@ -48,9 +51,25 @@ class OptOutputHeadResult:
     next_token_ids: torch.Tensor
 
 
+def profile_operation(name):
+    def decorate(function):
+        input_name = tuple(signature(function).parameters)[1]
+
+        @wraps(function)
+        def measured(self, *args, **kwargs):
+            if self.profiler is None:
+                return function(self, *args, **kwargs)
+            inputs = args[0] if args else kwargs[input_name]
+            with profile_tensor_scope(self.profiler, name, inputs.device):
+                return function(self, *args, **kwargs)
+        return measured
+    return decorate
+
+
 @dataclass(frozen=True)
 class OptOperations:
     config: OptConfig
+    profiler: Any = None
 
     def embed(
         self,
@@ -217,6 +236,7 @@ class OptOperations:
             values=flexgen_values,
         )
 
+    @profile_operation("decode.qkv")
     def prepare_decode_attention(
         self,
         inputs: torch.Tensor,
@@ -259,20 +279,22 @@ class OptOperations:
         weights: OptLayerWeights,
     ) -> OptDecodeAttentionOutput:
         attention = weights.attention
-        attention_tensor = torch.as_tensor(
-            attention_output,
-            dtype=inputs.dtype,
-            device=inputs.device,
-        )
+        with profile_tensor_scope(self.profiler, "decode.output_to_gpu", inputs.device):
+            attention_tensor = torch.as_tensor(
+                attention_output,
+                dtype=inputs.dtype,
+                device=inputs.device,
+            )
         if attention_tensor.shape != projection.query.shape:
             raise ValueError(
                 f"attention output shape {tuple(attention_tensor.shape)} does not match "
                 f"{tuple(projection.query.shape)}"
             )
-        output = attention_tensor.reshape(inputs.shape[0], 1, self.config.hidden_size)
-        output = F.linear(output, attention.output, attention.output_bias)
-        hidden_states = inputs + output
-        mlp_inputs = self._layer_norm(hidden_states, weights.mlp.input_norm)
+        with profile_tensor_scope(self.profiler, "decode.wo_norm_residual", inputs.device):
+            output = attention_tensor.reshape(inputs.shape[0], 1, self.config.hidden_size)
+            output = F.linear(output, attention.output, attention.output_bias)
+            hidden_states = inputs + output
+            mlp_inputs = self._layer_norm(hidden_states, weights.mlp.input_norm)
         return OptDecodeAttentionOutput(
             hidden_states=hidden_states,
             mlp_inputs=mlp_inputs,
@@ -282,6 +304,7 @@ class OptOperations:
             attention_output=attention_tensor,
         )
 
+    @profile_operation("decode.mlp")
     def run_mlp(
         self,
         inputs: torch.Tensor,
@@ -295,6 +318,7 @@ class OptOperations:
         hidden = F.linear(hidden, weights.output, weights.output_bias)
         return residual + hidden
 
+    @profile_operation("decode.output_head")
     def run_output_head(
         self,
         hidden_states: torch.Tensor,

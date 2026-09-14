@@ -236,3 +236,101 @@ class KvCacheLayout:
             or value % BLOCK_ALIGNMENT != 0
         ):
             raise ValueError(f"{name} must be a positive multiple of 512")
+
+
+class SparfKvCacheLayout(KvCacheLayout):
+    """InstAttention's head-local token and channel indexed KV layouts."""
+
+    @property
+    def token_head_stride(self) -> int:
+        return align_up(
+            self.config.max_seq_len * self.head_bytes,
+            LAYER_ALIGNMENT,
+        )
+
+    @property
+    def token_batch_stride(self) -> int:
+        return self.config.num_kv_heads * self.token_head_stride
+
+    @property
+    def token_layer_stride(self) -> int:
+        return align_up(
+            self.config.batch_size * self.token_batch_stride,
+            LAYER_ALIGNMENT,
+        )
+
+    @property
+    def token_file_size(self) -> int:
+        return self.config.num_layers * self.token_layer_stride
+
+    @property
+    def channel_stride(self) -> int:
+        return align_up(
+            self.config.max_seq_len * self.element_size,
+            BLOCK_ALIGNMENT,
+        )
+
+    @property
+    def channel_head_stride(self) -> int:
+        return align_up(
+            self.config.head_dim * self.channel_stride,
+            LAYER_ALIGNMENT,
+        )
+
+    @property
+    def channel_batch_stride(self) -> int:
+        return self.config.num_kv_heads * self.channel_head_stride
+
+    @property
+    def channel_layer_stride(self) -> int:
+        return align_up(
+            self.config.batch_size * self.channel_batch_stride,
+            LAYER_ALIGNMENT,
+        )
+
+    @property
+    def channel_file_size(self) -> int:
+        return self.config.num_layers * self.channel_layer_stride
+
+    @property
+    def file_size(self) -> int:
+        return self.token_file_size
+
+    def token_head_offset(
+        self,
+        layer: int,
+        batch: int,
+        kv_head: int,
+        token: int,
+    ) -> int:
+        self._validate_index("layer", layer, self.config.num_layers)
+        self._validate_index("batch", batch, self.config.batch_size)
+        self._validate_index("kv_head", kv_head, self.config.num_kv_heads)
+        self._validate_index("token", token, self.config.max_seq_len)
+        return (
+            layer * self.token_layer_stride
+            + batch * self.token_batch_stride
+            + kv_head * self.token_head_stride
+            + token * self.head_bytes
+        )
+
+    def channel_offset(
+        self,
+        layer: int,
+        batch: int,
+        kv_head: int,
+        dimension: int,
+        token: int = 0,
+    ) -> int:
+        self._validate_index("layer", layer, self.config.num_layers)
+        self._validate_index("batch", batch, self.config.batch_size)
+        self._validate_index("kv_head", kv_head, self.config.num_kv_heads)
+        self._validate_index("dimension", dimension, self.config.head_dim)
+        self._validate_index("token", token, self.config.max_seq_len)
+        return (
+            layer * self.channel_layer_stride
+            + batch * self.channel_batch_stride
+            + kv_head * self.channel_head_stride
+            + dimension * self.channel_stride
+            + token * self.element_size
+        )

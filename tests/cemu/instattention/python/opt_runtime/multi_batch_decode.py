@@ -22,10 +22,13 @@ class OptMultiBatchDecodeRunner(ModelMultiBatchDecodeRunner):
             raise TypeError("config must be an OptConfig")
         if not isinstance(weight_loader, OptCheckpointLoader):
             raise TypeError("weight_loader must be an OptCheckpointLoader")
+        attention_backends = tuple(attention_backends)
+        if not attention_backends:
+            raise ValueError("attention_backends must not be empty")
         super().__init__(
             config,
             weight_loader,
-            OptOperations(config),
+            OptOperations(config, profiler=getattr(attention_backends[0], "profiler", None)),
             attention_backends,
             gpu_batch_size,
             logger=logger,

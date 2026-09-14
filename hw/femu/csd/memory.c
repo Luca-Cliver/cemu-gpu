@@ -165,6 +165,7 @@ static uint16_t memory_copy(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         req->is_write = copy->cdft == 3;
         sres = req->sres;
         req->sdaddr = data;
+        req->sdaddr_backend = nvme_find_namespace(req->mem_ctrl, 2)->backend;
     }
 
     // dma read sre
