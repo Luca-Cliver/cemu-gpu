@@ -81,6 +81,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->stat.opcode = cmd.opcode;
         memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
         req->p2p_req = 0;
+        req->read_observation = NULL;
 
         if (n->print_log) {
             femu_debug("%s,cid:%d\n", __func__, cmd.cid);

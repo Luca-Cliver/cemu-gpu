@@ -12,6 +12,7 @@
 #include "../statistics/statistics.h"
 #include "../nvme.h"
 #include "compute.h"
+#include "sparf_autonomous_trace.h"
 
 #define CSD_THREAD_COUNT    4
 #define CSE_CORE_COUNT      4
@@ -32,6 +33,15 @@ typedef struct SsdBackend SsdBackend;
 
 typedef QSIMPLEQ_HEAD(JobList, ComputeJob) JobList;
 
+typedef struct SparfDispatchTrace {
+    uint64_t host_entry;
+    uint64_t host_mirror_start;
+    uint64_t host_mirror_end;
+    uint64_t host_enqueued;
+    uint64_t virtual_entry;
+    uint64_t virtual_enqueued;
+} SparfDispatchTrace;
+
 // A job is a exec request from a nvme request
 typedef struct ComputeJob {
     ubpf_jit_fn jit_fn;         // jit-ed bpf, NULL if not jit
@@ -47,6 +57,9 @@ typedef struct ComputeJob {
     uint64_t last_sched_time;
     uint32_t runtime;
     uint32_t user_runtime;      // user specified runtime
+    uint64_t sparf_trace_command; // zero when timeline diagnostics are disabled
+    int sparf_trace_cu;
+    SparfDispatchTrace sparf_dispatch;
 
     struct JobGroup *group;
     QSIMPLEQ_ENTRY(ComputeJob) group_list;
@@ -60,9 +73,15 @@ typedef struct ComputeJob {
     SsdBackend **mr_backend;
     bool owns_mr_arrays;
     bool owns_mr_dev_addr;
+    struct SparfAutonomous *sparf_autonomous;
+    struct rte_ring *internal_completion;
+    SparfComputeTrace *autonomous_trace;
 
     struct ubpf_jit_args args;
 } ComputeJob;
+
+void sparf_trace_job_finish(ComputeJob *job);
+void sparf_trace_job_enqueue(ComputeJob *job);
 
 static inline int job_permited_on_cu(ComputeJob *job, uint8_t cu_id)
 {
@@ -324,6 +343,10 @@ void sched_alloc_job(ComputeNamespace *ns, NvmeRequest *req);
 void sched_enqueue_job(ComputeNamespace *ns, NvmeRequest *req);
 void sched_enqueue_indirect(ComputeNamespace *cns, ComputeJob *job);
 void sched_job_finish_indirect(ComputeJob *job);
+bool sched_submit_internal(ComputeJob *parent, NvmeRequest *request,
+                           struct rte_ring *completion, uint64_t runtime,
+                           SparfComputeTrace *trace);
+void sched_release_autonomous(ComputeJob *job);
 int  sched_job_group_alloc(ComputeNamespace *nns);
 int  sched_job_group_free(ComputeNamespace *nns, int id);
 int  sched_job_group_set_qos(ComputeNamespace *nns, int id, int prio,

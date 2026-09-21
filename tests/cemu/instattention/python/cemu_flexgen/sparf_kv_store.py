@@ -1,5 +1,6 @@
 import os
 import mmap
+import time
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -35,6 +36,8 @@ class SparfKvCacheStore:
         self._channel_k_fd = -1
         self._token_v_fd = -1
         self._channel_map = None
+        self._unpublished = False
+        self._device_owned = False
         shape = (
             layout.config.num_layers,
             layout.config.batch_size,
@@ -51,6 +54,8 @@ class SparfKvCacheStore:
     def open(self):
         if self.is_open:
             return self
+        if self._device_owned:
+            raise RuntimeError("a device-owned KV store cannot be reopened; create a new session")
         for path in (self.token_k_path, self.channel_k_path, self.token_v_path):
             if not path.parent.is_dir():
                 raise FileNotFoundError(f"cache directory does not exist: {path.parent}")
@@ -65,11 +70,16 @@ class SparfKvCacheStore:
         return self
 
     def write_tokens(self, layer: int, start_token: int, keys: Any, values: Any) -> None:
+        if self._device_owned:
+            raise RuntimeError("KV file writes belong to the CEMU device until close")
         keys = self._normalize("keys", keys, True)
         values = self._normalize("values", values, True)
         if keys.shape != values.shape:
             raise ValueError("keys and values must have the same shape")
         self._validate_span(layer, start_token, keys.shape[0])
+        # Mark before writing so a partial write/sync failure cannot make a
+        # subsequent publish incorrectly skip dirty data.
+        self._unpublished = True
         if start_token == 0 and keys.shape[0] > 1:
             token_k = bytearray(self.layout.token_layer_stride)
             token_v = bytearray(self.layout.token_layer_stride)
@@ -95,24 +105,59 @@ class SparfKvCacheStore:
             self._value_sums[layer] = values.astype(np.float64).sum(axis=0)
             self._value_counts[layer] = keys.shape[0]
         else:
-            for batch in range(self.layout.config.batch_size):
-                for head in range(self.layout.config.num_kv_heads):
-                    token_keys = np.ascontiguousarray(keys[:, batch, head, :])
-                    token_values = np.ascontiguousarray(values[:, batch, head, :])
-                    self._pwrite(self._token_k_fd, token_keys.tobytes(),
-                                 self.layout.token_head_offset(layer, batch, head, start_token))
-                    self._pwrite(self._token_v_fd, token_values.tobytes(),
-                                 self.layout.token_head_offset(layer, batch, head, start_token))
-                    view = np.ndarray(
-                        (self.layout.config.head_dim, self.layout.config.max_seq_len),
-                        dtype=self.layout.config.dtype,
-                        buffer=self._channel_map,
-                        offset=self.layout.channel_offset(layer, batch, head, 0),
-                        strides=(self.layout.channel_stride, self.layout.element_size),
-                    )
-                    view[:, start_token:start_token + keys.shape[0]] = token_keys.T
+            self._append_tokens(layer, start_token, keys, values)
             self._value_sums[layer] += values.astype(np.float64).sum(axis=0)
             self._value_counts[layer] += keys.shape[0]
+
+    def _append_tokens(self, layer, start_token, keys, values):
+        elapsed = [0, 0, 0, 0] if self.profiler is not None else None
+        byte_count = keys.nbytes
+        try:
+            for batch in range(self.layout.config.batch_size):
+                for head in range(self.layout.config.num_kv_heads):
+                    if elapsed is not None:
+                        started = time.perf_counter_ns()
+                    token_keys = np.ascontiguousarray(keys[:, batch, head, :])
+                    token_values = np.ascontiguousarray(values[:, batch, head, :])
+                    key_bytes, value_bytes = token_keys.tobytes(), token_values.tobytes()
+                    if elapsed is not None:
+                        now = time.perf_counter_ns()
+                        elapsed[0] += now - started
+                        started = now
+                    self._pwrite(self._token_k_fd, key_bytes,
+                                 self.layout.token_head_offset(layer, batch, head, start_token))
+                    if elapsed is not None:
+                        now = time.perf_counter_ns()
+                        elapsed[1] += now - started
+                        started = now
+                    self._pwrite(self._token_v_fd, value_bytes,
+                                 self.layout.token_head_offset(layer, batch, head, start_token))
+                    if elapsed is not None:
+                        now = time.perf_counter_ns()
+                        elapsed[2] += now - started
+            if elapsed is not None:
+                started = time.perf_counter_ns()
+            try:
+                view = np.ndarray(
+                    (self.layout.config.batch_size, self.layout.config.num_kv_heads,
+                     self.layout.config.head_dim, keys.shape[0]),
+                    dtype=self.layout.config.dtype,
+                    buffer=self._channel_map,
+                    offset=self.layout.channel_offset(layer, 0, 0, 0, start_token),
+                    strides=(self.layout.channel_batch_stride, self.layout.channel_head_stride,
+                             self.layout.channel_stride, self.layout.element_size),
+                )
+                np.copyto(view, keys.transpose(1, 2, 3, 0), casting="no")
+            finally:
+                if elapsed is not None:
+                    elapsed[3] += time.perf_counter_ns() - started
+        finally:
+            if elapsed is not None:
+                for name, duration, size in zip(
+                    ("pack_wall", "token_k_pwrite_wall", "token_v_pwrite_wall", "channel_k_mmap_wall"),
+                    elapsed, (2 * byte_count, byte_count, byte_count, byte_count),
+                ):
+                    self.profiler.record("kv_append." + name, duration, size)
 
     def write_token(self, layer: int, token: int, key: Any, value: Any) -> None:
         key = self._normalize("key", key, False)
@@ -135,11 +180,11 @@ class SparfKvCacheStore:
             for head in range(self.layout.config.num_kv_heads):
                 offset = self.layout.token_head_offset(layer, batch, head, start_token)
                 keys[:, batch, head, :] = np.frombuffer(
-                    self._pread(self._token_k_fd, size, offset),
+                    self._read_cache(self._token_k_fd, size, offset),
                     dtype=self.layout.config.dtype,
                 ).reshape(token_count, self.layout.config.head_dim)
                 values[:, batch, head, :] = np.frombuffer(
-                    self._pread(self._token_v_fd, size, offset),
+                    self._read_cache(self._token_v_fd, size, offset),
                     dtype=self.layout.config.dtype,
                 ).reshape(token_count, self.layout.config.head_dim)
         return keys, values
@@ -152,7 +197,7 @@ class SparfKvCacheStore:
         for index, dimension in enumerate(dimensions):
             offset = self.layout.channel_offset(layer, batch, head, dimension)
             result[index] = np.frombuffer(
-                self._pread(self._channel_k_fd, size, offset),
+                self._read_cache(self._channel_k_fd, size, offset),
                 dtype=self.layout.config.dtype,
             )
         return result
@@ -167,10 +212,25 @@ class SparfKvCacheStore:
         )
 
     def flush(self) -> None:
+        self.publish()
+
+    def publish(self) -> None:
+        """Make pending file and mmap writes visible to raw CSD reads.
+
+        Linux fdatasync waits for dirty page-cache data, including MAP_SHARED
+        writes. One barrier per dirty file avoids a redundant full mmap msync
+        and does not issue a syscall for every head/channel update. This is a
+        correctness baseline, not the paper's CSD DRAM/background-write path.
+        """
         self._require_open()
-        self._channel_map.flush()
-        for descriptor in (self._token_k_fd, self._channel_k_fd, self._token_v_fd):
-            os.fsync(descriptor)
+        if not self._unpublished:
+            return
+        for name, descriptor in (("token_k", self._token_k_fd),
+                                 ("channel_k", self._channel_k_fd),
+                                 ("token_v", self._token_v_fd)):
+            with profile_scope(self.profiler, f"kv_publish.{name}_fdatasync_wall"):
+                os.fdatasync(descriptor)
+        self._unpublished = False
 
     def close(self) -> None:
         if self._channel_map is not None:
@@ -225,6 +285,12 @@ class SparfKvCacheStore:
     def _require_open(self) -> None:
         if not self.is_open:
             raise RuntimeError("SparF KV cache store is not open")
+
+    def _read_cache(self, descriptor, size, offset):
+        if self._device_owned:
+            from .sparf_device_writeback import direct_read
+            return direct_read(descriptor, size, offset)
+        return self._pread(descriptor, size, offset)
 
     @staticmethod
     def _pwrite(descriptor: int, data: bytes, offset: int) -> None:

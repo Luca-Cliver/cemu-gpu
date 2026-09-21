@@ -1,4 +1,5 @@
 from .kv_layout import KvCacheLayout, KvChunk, KvLayoutConfig, SparfKvCacheLayout, align_up
+from .sparf_group_capacity import SparfGroupCapacity, plan_group_capacity
 from .kv_staging import KvStagingManager
 from .kv_store import KvCacheStore
 from .sparf_kv_store import SparfKvCacheStore
@@ -33,6 +34,8 @@ __all__ = [
     "KvChunk",
     "KvLayoutConfig",
     "align_up",
+    "SparfGroupCapacity",
+    "plan_group_capacity",
 ]
 
 

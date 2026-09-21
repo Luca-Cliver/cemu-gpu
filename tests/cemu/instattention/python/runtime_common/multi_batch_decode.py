@@ -195,6 +195,14 @@ class ModelMultiBatchDecodeRunner(ModelDecodeRunner):
                             projection.key,
                             projection.value,
                         )
+                        if getattr(backend, "supports_async_decode", False):
+                            # Query-dependent backends cannot prefetch next-layer
+                            # KV. Overlap only independent microbatches after QKV.
+                            request = backend.submit_decode(layer, projection.query, valid_tokens)
+                            if pending is not None:
+                                self._finish_pending(pending, weights, microbatch_hidden, layer_outputs)
+                            pending = (microbatch, backend, request, inputs, projection)
+                            continue
                         attention_output = backend.decode(
                             layer=layer,
                             query=projection.query,

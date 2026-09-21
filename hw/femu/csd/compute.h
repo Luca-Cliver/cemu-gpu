@@ -97,6 +97,7 @@ typedef struct ComputeParams {
     uint16_t csf_runtime_scale;
     uint8_t  nr_cu;                 // number of compute unit
     uint8_t  nr_thread;             // number of functional simulation thread
+    uint8_t  sparf_engines;
     CsfSchedulerOption csf_sched_option;
 } ComputeParams;
 
@@ -109,6 +110,18 @@ typedef struct ComputeNamespace {
     struct ComputeEngine *ce;
     QemuThread *compute_threads;
     QemuThread *sched_thread;
+    unsigned int sparf_autonomous_active;
+    pthread_mutex_t sparf_autonomous_lock;
+    struct SparfAutonomousWorker *sparf_autonomous_workers;
+    pthread_mutex_t sparf_group_lock;
+    struct SparfGroupSession *sparf_group_session;
+    uint16_t sparf_group_owner;
+    uint16_t sparf_group_rsid;
+    struct rte_ring *sparf_autonomous_queue;
+    QemuSemaphore sparf_autonomous_wakeup;
+    unsigned int sparf_writeback_active;
+    struct rte_ring *sparf_writeback_queue;
+    QemuSemaphore sparf_writeback_wakeup;
 } ComputeNamespace;
 
 static inline Slab *program_slab(NvmeNamespace *ns)

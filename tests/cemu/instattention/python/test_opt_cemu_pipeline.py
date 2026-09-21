@@ -31,8 +31,19 @@ from cemu_flexgen import (
     KvLayoutConfig,
     SparfKvCacheLayout,
     align_up,
+    plan_group_capacity,
 )
-from flexgen_adapter import FlexGenAttentionBackend, FlexGenMicrobatchKvWriter, SparfAttentionBackend
+from cemu_flexgen.sparf_group_capacity import (
+    GROUP_IO_BYTES, check_fdm_space, check_filesystem_space, grouped_attention_reserve_bytes,
+)
+from flexgen_adapter import (
+    FlexGenAttentionBackend,
+    FlexGenMicrobatchKvWriter,
+    SparfAttentionBackend,
+    SparfGroupedAttentionBackend,
+)
+from cemu_flexgen.sparf_group_device import SparfGroupedDevice
+from cemu_flexgen.sparf_group_layout import SparfGroupLayout
 from opt_runtime import (
     OptDecodeRunner,
     OptGenerationRunner,
@@ -45,6 +56,8 @@ from opt_runtime import (
 )
 from experiments import PipelineTrace, SparfAttentionRuntimeModel, load_experiment_config
 from experiments.softmax_ratio import SoftmaxRatioTable
+from cemu_flexgen.cemu_sparf_slot_scheduler import CemuSparfSlotScheduler
+from cemu_flexgen.sparf_device_writeback import SparfDeviceWriteback
 from phase_profiler import PhaseProfiler, profile_scope
 from runtime_common import partition_kv_cache_by_batch
 
@@ -120,6 +133,28 @@ def parse_args():
     parser.add_argument("--staging-tokens", type=nonnegative_integer, default=0)
     parser.add_argument("--attention-slots", type=positive_integer, default=2)
     parser.add_argument("--attention-mode", choices=("dense", "sparf"), default="dense")
+    parser.add_argument("--sparf-staged", action="store_true",
+                        help="advance SparF through four device stages with slot-local FDM state")
+    parser.add_argument("--sparf-autonomous", action="store_true",
+                        help="experimental v3: one device-owned Attention workflow in flight; requires nr_cu=1")
+    parser.add_argument("--sparf-device-writeback", action="store_true",
+                        help="write buffered KV directly from FDM through the device FTL")
+    parser.add_argument("--sparf-writeback-format", choices=("spans", "compact"), default="compact",
+                        help="device writeback descriptors: legacy per-channel spans or compact matrices")
+    parser.add_argument("--nvm-device", default="/dev/nvme0n1",
+                        help="NVM namespace owning the private KV files for device writeback")
+    parser.add_argument("--sparf-kv-buffer-tokens", type=nonnegative_integer, default=0,
+                        help="bounded FDM KV tail per layer; 0 keeps synchronous publication")
+    parser.add_argument("--sparf-grouped", action="store_true",
+                        help="use the device-owned grouped KV pool (requires autonomous functional SparF)")
+    parser.add_argument("--sparf-group-channels-per-page", type=positive_integer, default=8,
+                        help="channel count in one grouped channel-K page")
+    parser.add_argument("--sparf-group-write-batch-pages", type=positive_integer, default=256,
+                        help="maximum pages per device write batch; match target block geometry")
+    parser.add_argument("--sparf-group-pool-bytes", type=nonnegative_integer, default=0,
+                        help="grouped NVM pool size in bytes; zero uses the exact planned size")
+    parser.add_argument("--sparf-group-fdm-budget-bytes", type=positive_integer,
+                        help="available FDM budget for this run, excluding existing allocations; required when FDMFS statfs reports no capacity")
     parser.add_argument("--sparf-top-r", type=positive_integer, default=16)
     parser.add_argument("--sparf-compression-ratio", type=positive_integer, default=8)
     parser.add_argument("--runtime-config", type=Path, help="paper hardware config used for CSD runtime modeling")
@@ -203,6 +238,9 @@ def write_profile(profiler, output_path):
     log("[opt-profile] *_wall = Guest caller time; *.cuda_stream = CUDA event interval; "
         "csd_model.* = modeled device time. These are overlapping measurements, not additive. "
         "prefill_forward_wall includes KV work and waits.")
+    log("[opt-profile] kv_writeback.device.*_host_ns = Host monotonic intervals; "
+        "kv_writeback.ftl_*_target_ns = FTL target intervals with actual transfer bytes; "
+        "neither is added to Guest wall. Profiled device writeback reads one status per group.")
     for line in profiler.summary():
         log(f"[opt-profile] {line}")
     log(f"[opt-profile] CSV={profile_path}")
@@ -276,6 +314,8 @@ def open_attention_schedulers(
 ):
     for scheduler in attention_schedulers:
         stack.enter_context(scheduler)
+    if not attention_slots:
+        return
     program_ids = tuple(slot.program_id for slot in attention_slots)
     mrs_ids = tuple(slot.memory_range_set_id for slot in attention_slots)
     if len(set(program_ids)) != len(program_ids):
@@ -398,6 +438,7 @@ def run_functional_pipeline(
     device,
     profiler=None,
 ):
+    functional_started = time.perf_counter_ns() if profiler is not None else None
     log(
         "[opt-functional] step 1/3: Guest GPU Prefill and persist K/V to "
         "CEMU NVM"
@@ -411,6 +452,10 @@ def run_functional_pipeline(
             )
         with profile_scope(profiler, "pipeline.prefill_kv_flush_wall"):
             kv_writer.flush()
+        if args.sparf_device_writeback:
+            initialized = sum(backend.store.device_writeback.initialized_bytes for backend in cemu_backends)
+            log(f"[opt-functional] device writeback ownership ready: microbatches={len(cemu_backends)}, "
+                f"initialized_unwritten_bytes={initialized}; Guest buffer control retained")
         synchronize(device)
     log(
         "[opt-functional] Prefill complete; initial Decode tokens="
@@ -421,6 +466,7 @@ def run_functional_pipeline(
         "[opt-functional] step 2/3: autoregressive Decode through "
         "NVM/FDM/MRS/CSD Attention"
     )
+    decode_started = time.perf_counter_ns() if profiler is not None else None
     with profile_scope(profiler, "pipeline.decode_wall"):
         with ExitStack() as scheduler_stack:
             open_attention_schedulers(
@@ -461,6 +507,20 @@ def run_functional_pipeline(
             flush = getattr(backend, "flush", None)
             if callable(flush):
                 flush()
+        grouped_stores = {id(getattr(backend, "grouped_store", None)): getattr(backend, "grouped_store", None)
+                          for backend in cemu_backends}
+        grouped_stores.pop(id(None), None)
+        for store in grouped_stores.values():
+            drain = getattr(store, "drain", None)
+            if callable(drain):
+                drain()
+                log("[opt-functional] grouped KV terminal drain complete")
+    if profiler is not None:
+        finished = time.perf_counter_ns()
+        profiler.record("pipeline.decode_and_drain_wall", finished - decode_started)
+        profiler.record("pipeline.e2e_including_drain_wall", finished - functional_started)
+    for store in grouped_stores.values():
+        log(f"[opt-functional] grouped writeback statistics: {store.statistics()}")
     if tokenizer is not None:
         log_generated_text(tokenizer, token_ids, generation.token_ids)
     log(
@@ -957,14 +1017,34 @@ def main():
         raise ValueError(
             "--benchmark, --functional, and --trace-file are separate modes"
         )
-    if not torch.cuda.is_available():
-        raise RuntimeError("PyTorch cannot access the Guest GPU")
-    if args.attention_mode == "dense" and args.attention_slots < 2:
+    if args.sparf_staged and args.attention_mode != "sparf":
+        raise ValueError("--sparf-staged requires --attention-mode sparf")
+    if args.sparf_autonomous and (args.attention_mode != "sparf" or args.sparf_staged):
+        raise ValueError("--sparf-autonomous requires SparF and cannot be combined with --sparf-staged")
+    if args.sparf_autonomous and not args.functional:
+        raise ValueError("autonomous OPT integration currently requires --functional")
+    if args.sparf_grouped and (args.attention_mode != "sparf" or not args.sparf_autonomous or
+                               not args.functional):
+        raise ValueError("grouped KV requires functional autonomous SparF")
+    if args.sparf_grouped and (args.sparf_kv_buffer_tokens or args.sparf_device_writeback):
+        raise ValueError("grouped KV cannot be combined with the legacy KV buffer or writeback")
+    if args.sparf_grouped and args.sparf_group_pool_bytes and args.sparf_group_pool_bytes % 4096:
+        raise ValueError("--sparf-group-pool-bytes must be a multiple of 4096")
+    if args.sparf_device_writeback and (args.attention_mode != "sparf" or
+                                      args.sparf_kv_buffer_tokens < 2 or not args.functional):
+        raise ValueError("device writeback requires --functional, SparF, and a KV buffer of at least two tokens")
+    if (args.attention_mode == "dense" or args.sparf_staged or args.sparf_autonomous) and args.attention_slots < 2:
         raise ValueError("the slot-scheduled CEMU path requires at least two slots")
     if args.attention_mode == "sparf" and not (args.functional or args.benchmark):
         raise ValueError("SparF OPT integration currently uses --functional or --benchmark; use the device test for strict operator validation")
+    if args.sparf_kv_buffer_tokens and (args.attention_mode != "sparf" or args.sparf_kv_buffer_tokens < 2):
+        raise ValueError("KV buffering requires SparF and at least two tokens per layer")
+    if args.sparf_kv_buffer_tokens and not args.functional:
+        raise ValueError("KV buffering currently requires --functional; benchmark reset is not supported")
     if args.profile_output is not None and not args.functional:
         raise ValueError("--profile-output currently requires --functional")
+    if not torch.cuda.is_available():
+        raise RuntimeError("PyTorch cannot access the Guest GPU")
 
     model_directory = require_directory("model directory", args.model_dir)
     nvm_root = require_directory("NVM directory", args.nvm_dir)
@@ -1052,6 +1132,45 @@ def main():
         for _ in range(num_gpu_batches)
     )
     layout = layouts[0]
+    grouped_capacity = None
+    if args.sparf_grouped:
+        attention_reserve = grouped_attention_reserve_bytes(
+            attention_slots=args.attention_slots,
+            batch_size=gpu_batch_size, query_heads=config.num_attention_heads,
+            kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
+            element_bytes=layout_dtype.itemsize, max_seq_len=max_seq_len,
+            top_r=args.sparf_top_r, compression_ratio=args.sparf_compression_ratio,
+        )
+        grouped_capacity = plan_group_capacity(
+            num_layers=config.num_hidden_layers,
+            batch_size=args.batch_size,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            element_bytes=layout_dtype.itemsize,
+            page_bytes=4096,
+            channels_per_page=args.sparf_group_channels_per_page,
+            max_seq_len=max_seq_len,
+            pool_bytes=args.sparf_group_pool_bytes or None,
+            fdm_budget_bytes=args.sparf_group_fdm_budget_bytes,
+            extra_fdm_bytes=attention_reserve,
+            write_batch_pages=args.sparf_group_write_batch_pages,
+        )
+        check_filesystem_space(nvm_root, grouped_capacity.pool_bytes)
+        fdm_available = check_fdm_space(
+            fdm_root, grouped_capacity.fdm_required_bytes,
+            args.sparf_group_fdm_budget_bytes,
+        )
+        log(f"[opt-cemu] grouped capacity preflight: pool_bytes={grouped_capacity.pool_bytes}, "
+            f"fdm_required_bytes={grouped_capacity.fdm_required_bytes}, "
+            f"fdm_available_budget={fdm_available}, "
+            f"explicit_fdm_budget={args.sparf_group_fdm_budget_bytes is not None}")
+        streams_per_packet = GROUP_IO_BYTES // (2 * config.head_dim * layout_dtype.itemsize)
+        append_commands = config.num_hidden_layers * num_gpu_batches * (
+            (gpu_batch_size * config.num_key_value_heads + streams_per_packet - 1) // streams_per_packet)
+        log(f"[opt-cemu] grouped submission plan: gpu_batches={num_gpu_batches}, "
+            f"append_commands_per_decode_step={append_commands}, "
+            f"decode_append_commands={append_commands * args.decode_steps}, "
+            f"write_batch_pages={args.sparf_group_write_batch_pages}; batched head submission")
     staging_tokens = args.staging_tokens or max_seq_len
     if staging_tokens > max_seq_len:
         raise ValueError("staging tokens cannot exceed the configured sequence length")
@@ -1083,12 +1202,19 @@ def main():
         f"decode_steps={args.decode_steps}, attention_slots={args.attention_slots}"
     )
     if args.attention_mode == "sparf":
-        log(
-            f"[opt-cemu] SparF K_token={layout.token_file_size}, "
-            f"K_channel={layout.channel_file_size}, V_token={layout.token_file_size}, "
-            f"files={3 * num_gpu_batches}, top_r={args.sparf_top_r}, "
-            f"compression=1/{args.sparf_compression_ratio}"
-        )
+        if args.sparf_grouped:
+            log(
+                f"[opt-cemu] SparF grouped KV pool_bytes={grouped_capacity.pool_bytes if grouped_capacity else 'n/a'}, "
+                f"streams={grouped_capacity.streams if grouped_capacity else 'n/a'}, "
+                f"top_r={args.sparf_top_r}, compression=1/{args.sparf_compression_ratio}"
+            )
+        else:
+            log(
+                f"[opt-cemu] SparF K_token={layout.token_file_size}, "
+                f"K_channel={layout.channel_file_size}, V_token={layout.token_file_size}, "
+                f"files={3 * num_gpu_batches}, top_r={args.sparf_top_r}, "
+                f"compression=1/{args.sparf_compression_ratio}"
+            )
     else:
         log(
             f"[opt-cemu] KV token_bytes={layout.token_bytes}, "
@@ -1109,6 +1235,25 @@ def main():
     ) as fdm_directory:
         nvm_path = Path(nvm_directory)
         fdm_path = Path(fdm_directory)
+        grouped_store = None
+        if grouped_capacity is not None:
+            grouped_store = SparfGroupedDevice(
+                SparfGroupLayout(
+                    config.head_dim,
+                    args.sparf_group_channels_per_page,
+                    page_bytes=4096,
+                    dtype=layout_dtype,
+                ),
+                nvm_path / "grouped_kv_pool",
+                grouped_capacity.pool_bytes,
+                fdm_path,
+                program_reference,
+                control_path=args.control,
+                namespace_path=args.namespace,
+                nvm_path=args.nvm_device,
+                buffer_streams=grouped_capacity.streams,
+                write_batch_pages=args.sparf_group_write_batch_pages,
+            )
         cache_paths = tuple(
             ((nvm_path / f"k_token_{microbatch}", nvm_path / f"k_channel_{microbatch}", nvm_path / f"v_token_{microbatch}")
              if args.attention_mode == "sparf" else
@@ -1182,8 +1327,13 @@ def main():
             for microbatch in range(num_gpu_batches)
             )
         else:
-            sparf_device = CemuSparfDevice(
-                    layout, *cache_paths[0],
+            # Staged mode owns a bounded pool of FDM slots independently of
+            # microbatch count. Legacy mode keeps a device per microbatch.
+            scheduled_sparf = args.sparf_staged or args.sparf_autonomous
+            sparf_devices = tuple(
+                CemuSparfDevice(
+                    layout if scheduled_sparf else layouts[microbatch],
+                    *(cache_paths[0] if scheduled_sparf else cache_paths[microbatch]),
                     fdm_directory=fdm_path,
                     program_path=program_reference,
                     query_heads=config.num_attention_heads,
@@ -1195,16 +1345,43 @@ def main():
                     runtime_model=sparf_runtime_model,
                     profiler=profiler,
                     logger=detail_logger,
-                    name_prefix="shared",
+                    name_prefix=f"sparf_slot{microbatch}" if scheduled_sparf else f"shared_mb{microbatch}",
+                    staged=args.sparf_staged,
+                    autonomous=args.sparf_autonomous,
+                    buffer_tokens=args.sparf_kv_buffer_tokens,
+                    grouped_store=grouped_store,
                 )
-            cemu_backends = tuple(
-                SparfAttentionBackend(
-                    layouts[microbatch], *cache_paths[microbatch],
-                    attention_device=sparf_device,
-                    replace_existing=True, logger=detail_logger, profiler=profiler,
-                )
-                for microbatch in range(num_gpu_batches)
+                for microbatch in range(args.attention_slots if scheduled_sparf else num_gpu_batches)
             )
+            sparf_scheduler = CemuSparfSlotScheduler(sparf_devices) if scheduled_sparf else None
+            if grouped_store is not None:
+                streams_per_backend = (config.num_hidden_layers * gpu_batch_size *
+                                       config.num_key_value_heads)
+                cemu_backends = tuple(
+                    SparfGroupedAttentionBackend(
+                        layouts[microbatch], grouped_store,
+                        sparf_scheduler or sparf_devices[microbatch],
+                        microbatch * streams_per_backend,
+                        logger=detail_logger, profiler=profiler,
+                    )
+                    for microbatch in range(num_gpu_batches)
+                )
+            else:
+                cemu_backends = tuple(
+                    SparfAttentionBackend(
+                        layouts[microbatch], *cache_paths[microbatch],
+                        attention_device=sparf_scheduler or sparf_devices[microbatch],
+                        replace_existing=True, logger=detail_logger, profiler=profiler,
+                        buffer_tokens=args.sparf_kv_buffer_tokens,
+                        buffer_path=fdm_path / f"kv_buffer_mb{microbatch}",
+                        device_writeback=SparfDeviceWriteback(
+                            program_reference, control_path=args.control,
+                            namespace_path=args.namespace, nvm_path=args.nvm_device,
+                            metadata_format=args.sparf_writeback_format,
+                        ) if args.sparf_device_writeback else None,
+                    )
+                    for microbatch in range(num_gpu_batches)
+                )
         kv_writer = FlexGenMicrobatchKvWriter(
             cemu_backends,
             logger=detail_logger,
@@ -1216,8 +1393,33 @@ def main():
             device=device,
             cache_layers=True,
         ) as loader, ExitStack() as backend_stack, kv_writer:
+            if grouped_store is not None:
+                backend_stack.enter_context(grouped_store)
             for backend in cemu_backends:
                 backend_stack.enter_context(backend)
+            if args.attention_mode == "sparf":
+                log(f"[opt-cemu] SparF ready: devices={len(sparf_devices)}, "
+                    f"staged={args.sparf_staged}, autonomous={args.sparf_autonomous}, "
+                    f"ranges_per_device={12 if args.sparf_staged else 11}, "
+                    f"gpu_batches={num_gpu_batches}")
+                if grouped_capacity is not None:
+                    log(
+                        f"[opt-cemu] grouped KV: streams={grouped_capacity.streams}, "
+                        f"planned_pages={grouped_capacity.pages}, "
+                        f"pool_bytes={grouped_capacity.pool_bytes}, "
+                        f"fdm_tail_bytes={grouped_capacity.fdm_tail_bytes}, "
+                        f"fdm_required_bytes={grouped_capacity.fdm_required_bytes}, "
+                        f"channels_per_page={args.sparf_group_channels_per_page}"
+                    )
+                if args.sparf_autonomous:
+                    log("[opt-cemu] v3 admission: one parent execute in flight; "
+                        "internal IO/CU dependencies are device-owned; nr_cu=1 required")
+                if args.sparf_kv_buffer_tokens:
+                    log(f"[opt-cemu] KV buffer: tokens_per_layer={args.sparf_kv_buffer_tokens}, "
+                        f"FDM_bytes={sum(backend.store.file_bytes for backend in cemu_backends)}, "
+                        "visibility=buffer+published_NVM, "
+                        f"writeback={'device-FTL' if args.sparf_device_writeback else 'Guest-background'}, "
+                        f"writeback_format={args.sparf_writeback_format if args.sparf_device_writeback else 'n/a'}")
             with profile_scope(profiler, "setup.checkpoint_preload_wall"):
                 preload_weights(
                     loader,

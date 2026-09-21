@@ -8,6 +8,7 @@ static void bb_init(NvmeNamespace *ns, Error **errp)
 {
     NvmNamespace *nns = ns->private = g_malloc0(sizeof(NvmNamespace));
     nns->params = ns->params;
+    nns->namespace = ns;
 
     nns->ssdname = (char *)ns->ctrl->devname;
     femu_debug("Starting FEMU in Blackbox-SSD mode ...\n");
@@ -33,6 +34,11 @@ static void bb_exit(NvmeNamespace *ns)
         femu_ring_free(nns->to_ftl[i]);
     }
     g_free(nns->to_ftl);
+    g_free(nns->kv_lpn_kind);
+    g_free(nns->kv_lpn_stream);
+    g_free(nns->kv_lpn_cookie);
+    g_free(nns->kv_lpn_group);
+    g_free(nns->kv_lpn_page);
     g_free(nns);
 }
 

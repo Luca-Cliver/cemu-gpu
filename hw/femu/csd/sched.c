@@ -60,7 +60,7 @@ static inline ComputeJob *job_alloc(ComputeEngine *ce)
         pthread_spin_init(&job->lock, PTHREAD_PROCESS_PRIVATE);
         job->stat.exec_time = UINT64_MAX;
         job->running_cu = -1;
-        ce->nr_active_job++;
+        qatomic_inc(&ce->nr_active_job);
     }
     return job;
 }
@@ -69,7 +69,7 @@ static inline void job_free(ComputeEngine *ce, ComputeJob *job)
 {
     pthread_spin_lock(&job->lock);
     pthread_spin_destroy(&job->lock);
-    ce->nr_active_job--;
+    qatomic_dec(&ce->nr_active_job);
     slab_free(&ce->job_slab, job, 1);
 }
 
@@ -293,20 +293,27 @@ static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
     NvmeRequest *req = job->req;
     JobGroup *group = job->group;
     Program *program = job->program;
+    bool internal_queued = job->internal_completion && !job->stat.start_time;
+    if (job->autonomous_trace) job->autonomous_trace->completed_ns = finish_time;
 
     // update statistics
     job->stat.finish_time = finish_time;
+    if (job->stat.start_time == 0) {
+        job->stat.start_time = finish_time;
+    }
     req->stat.reqlat = finish_time - req->stat.stime;
     req->stat.expire_time = finish_time;
     req->stat.exec.queueing_time += job->stat.start_time - req->stat.stime;
     req->stat.exec.nr_context_switch += job->stat.nr_context_switch;
     req->stat.exec.runtime += job->runtime;
     req->cqe.n.rsvd += req->stat.exec.queueing_time;
+    if (job->sparf_trace_command) sparf_trace_job_finish(job);
 
     // job group statistics
     if (!job_is_indirect(job)) {
         pthread_spin_lock(&group->lock);
-        group->jobs_running--;
+        if (internal_queued) group->jobs_queueing--;
+        else group->jobs_running--;
         group->jobs_finished++;
         pthread_spin_unlock(&group->lock);
     }
@@ -319,6 +326,16 @@ static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
                 scheduler->dequeue_job(cu, job, scheduler->private);
             }
         }
+    }
+
+    if (job->internal_completion) {
+        struct rte_ring *completion = job->internal_completion;
+        job_group_remove(group, job);
+        job_free(ce, job);
+        while (femu_ring_enqueue(completion, (void *)&req, 1) != 1) {
+            usleep(10);
+        }
+        return;
     }
 
     if (!job_is_indirect(job)) {
@@ -379,6 +396,9 @@ static int stage_job(ComputeEngine *ce, ComputeJob *job)
         job_finish(ce, NULL, job, now);
         return -1;
     }
+    if (job->sparf_dispatch.host_entry) {
+        sparf_trace_job_enqueue(job);
+    }
     ce->staged_jobs.jobs[ce->staged_jobs.tail] = job;
     ce->staged_jobs.tail = next_tail;
     pthread_spin_unlock(&ce->staged_jobs.lock);
@@ -390,6 +410,7 @@ void sched_alloc_job(ComputeNamespace *cns, NvmeRequest *req)
     ComputeEngine *ce = cns->ce;
     ComputeJob *job = job_alloc(ce);
     req->job = job;
+    if (!job) return;
     job->req = req;
     job->ce = ce;
     req->stat.exec.queueing_time = 0;
@@ -443,6 +464,57 @@ void sched_enqueue_indirect(ComputeNamespace *cns, ComputeJob *job)
     job->runtime = 0;
 
     stage_job(job->ce, job);
+}
+
+bool sched_submit_internal(ComputeJob *parent, NvmeRequest *request,
+                           struct rte_ring *completion, uint64_t runtime,
+                           SparfComputeTrace *trace)
+{
+    ComputeEngine *engine = parent->ce;
+    NvmeProgramExecuteCmd *command = (NvmeProgramExecuteCmd *)&parent->req->cmd;
+    JobGroup *group = job_group_get(engine, command->group);
+    if (!group || runtime > UINT32_MAX) return false;
+    ComputeJob *child = job_alloc(engine);
+    if (!child) return false;
+    request->ns = parent->req->ns;
+    request->stat.stime = clock_ns();
+    child->req = request;
+    child->ce = engine;
+    child->program = parent->program;
+    child->permited_cu_mask = parent->permited_cu_mask;
+    child->internal_completion = completion;
+    child->autonomous_trace = trace;
+    child->stat.exec_time = runtime;
+    pthread_spin_lock(&engine->staged_jobs.lock);
+    int tail = (engine->staged_jobs.tail + 1) % MAX_STAGED_JOBS;
+    if (tail == engine->staged_jobs.head) {
+        pthread_spin_unlock(&engine->staged_jobs.lock);
+        job_free(engine, child);
+        return false;
+    }
+    job_group_add(group, child);
+    if (trace) {
+        trace->scheduled = true;
+        trace->submitted_ns = clock_ns();
+    }
+    engine->staged_jobs.jobs[engine->staged_jobs.tail] = child;
+    engine->staged_jobs.tail = tail;
+    pthread_spin_unlock(&engine->staged_jobs.lock);
+    return true;
+}
+
+void sched_release_autonomous(ComputeJob *job)
+{
+    if (job->owns_mr_arrays) {
+        free(job->args.mr_addr);
+        free(job->args.mr_len);
+    }
+    if (job->owns_mr_dev_addr) free(job->args.mr_dev_addr);
+    free(job->mr_backend);
+    free(job->req->data_buffer);
+    job->req->data_buffer = NULL;
+    qatomic_dec(&job->program->jobs_running);
+    job_free(job->ce, job);
 }
 
 // add newly added job from staged queue to compute unit's job queue
@@ -514,6 +586,12 @@ static inline ComputeJob *job_switched_out(ComputeNamespace *cns, ComputeUnit *c
 
     // update statistics
     uint64_t runtime = now - job->last_sched_time;
+    if (job->autonomous_trace) {
+        SparfComputeTrace *trace = job->autonomous_trace;
+        SparfCuSpan span = { job->last_sched_time, now, cu->id };
+        if (trace->spans->len < 4096) g_array_append_val(trace->spans, span);
+        else trace->truncated = true;
+    }
     job->runtime += runtime;
     pthread_spin_lock(&group->lock);
     group->active_runtime += runtime;
@@ -539,6 +617,7 @@ static inline void job_switched_in(ComputeUnit* cu, ComputeJob *job, uint64_t no
     if (job->stat.start_time == 0)
         job->stat.start_time = now;
     job->running_cu = cu->id;
+    job->sparf_trace_cu = cu->id;
 }
 
 // timing simulation of csf scheduling

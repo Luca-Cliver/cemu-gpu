@@ -70,13 +70,108 @@ instattention-sparf-test:
 instattention-sparf-kv-test:
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_kv_store.py
 
+.PHONY: instattention-sparf-group-layout-test
+instattention-sparf-group-layout-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_layout.py
+
+.PHONY: instattention-sparf-group-capacity-test
+instattention-sparf-group-capacity-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_capacity.py
+
+.PHONY: instattention-sparf-group-test instattention-sparf-group-device-test
+instattention-sparf-group-test: instattention-sparf-group-layout-test instattention-sparf-group-capacity-test
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_device.py
+
+.PHONY: instattention-sparf-group-buffer-test instattention-sparf-group-buffer-device-test instattention-sparf-grouped-backend-test
+.PHONY: instattention-sparf-group-attention-test instattention-sparf-group-attention-device-test
+instattention-sparf-group-attention-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_attention.py
+
+instattention-sparf-group-attention-device-test: instattention
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_attention_device.py \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--nvm-device "$(if $(NVM_DEVICE),$(NVM_DEVICE),/dev/nvme0n1)" \
+		$(if $(filter cuda,$(CSD_TARGET)),--cuda) \
+		$(if $(PROGRAM),--program "$(PROGRAM)")
+
+instattention-sparf-group-buffer-test: instattention-sparf-group-test
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_buffer.py
+
+instattention-sparf-grouped-backend-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_grouped_backend.py
+
+instattention-sparf-group-buffer-device-test: instattention
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_buffer_device.py \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--nvm-device "$(if $(NVM_DEVICE),$(NVM_DEVICE),/dev/nvme0n1)" \
+		--write-batch-pages "$(if $(SPARF_GROUP_WRITE_BATCH_PAGES),$(SPARF_GROUP_WRITE_BATCH_PAGES),256)" \
+		--program "$(if $(PROGRAM),$(PROGRAM),./build/sparf_attention_devptr.so)"
+
+instattention-sparf-group-device-test: instattention
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_io_device.py \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--nvm-device "$(if $(NVM_DEVICE),$(NVM_DEVICE),/dev/nvme0n1)" \
+		--program "$(if $(PROGRAM),$(PROGRAM),./build/sparf_attention.so)"
+
+.PHONY: instattention-sparf-stages-test instattention-sparf-stages-device-test
+instattention-sparf-stages-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_write_buffer.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_stages.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_slot_scheduler.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_kv_store.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_timeline.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_handoffs.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_autonomous_timeline.py
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_device_writeback.py
+
+instattention-sparf-stages-device-test: COMPARE_STAGED=1
+instattention-sparf-stages-device-test: instattention-sparf-device-test
+
+.PHONY: instattention-sparf-autonomous-device-test
+instattention-sparf-autonomous-device-test: AUTONOMOUS=1
+instattention-sparf-autonomous-device-test: COMPARE_STAGED=1
+instattention-sparf-autonomous-device-test: instattention-sparf-device-test
+
+.PHONY: instattention-sparf-buffer-device-test
+.PHONY: instattention-sparf-device-writeback-test
+instattention-sparf-device-writeback-test: DEVICE_WRITEBACK=1
+instattention-sparf-device-writeback-test: instattention-sparf-buffer-device-test
+
+.PHONY: instattention-sparf-autonomous-writeback-test instattention-opt-sparf-integration-test
+instattention-sparf-autonomous-writeback-test: AUTONOMOUS=1
+instattention-sparf-autonomous-writeback-test: DEVICE_WRITEBACK=1
+instattention-sparf-autonomous-writeback-test: instattention-sparf-buffer-device-test
+
+instattention-opt-sparf-integration-test: instattention
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_opt_sparf_integration.py
+
+instattention-sparf-buffer-device-test: instattention
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_buffer_device.py \
+		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
+		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--dtype "$(if $(DTYPE),$(DTYPE),float16)" \
+		$(if $(filter 1,$(DEVICE_WRITEBACK)),--device-writeback) \
+		$(if $(filter 1 true yes,$(AUTONOMOUS)),--autonomous) \
+		$(if $(SPARF_WRITEBACK_FORMAT),--writeback-format "$(SPARF_WRITEBACK_FORMAT)") \
+		$(if $(PROFILE_OUTPUT),--profile-output "$(PROFILE_OUTPUT)") \
+		$(if $(filter cuda,$(CSD_TARGET)),--cuda) \
+		$(if $(PROGRAM),--program "$(PROGRAM)")
+
 instattention-sparf-device-test: instattention
+	$(if $(PROGRAM),,$(MAKE) -C kernel ../build/sparf_attention$(if $(filter cuda,$(CSD_TARGET)),_devptr).so)
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_cemu_sparf_workflow.py \
 		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
 		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
+		--dtype "$(if $(DTYPE),$(DTYPE),float16)" \
 		--tokens "$(if $(TOKEN_COUNT),$(TOKEN_COUNT),129)" \
 		--top-r "$(if $(SPARF_TOP_R),$(SPARF_TOP_R),4)" \
+		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),4)" \
 		--compression-ratio "$(if $(SPARF_COMPRESSION_RATIO),$(SPARF_COMPRESSION_RATIO),8)" \
+		$(if $(filter 1 true yes,$(COMPARE_STAGED)),--compare-staged) \
+		$(if $(filter 1 true yes,$(AUTONOMOUS)),--autonomous) \
 		$(if $(filter cuda,$(CSD_TARGET)),--cuda) \
 		$(if $(PROGRAM),--program "$(PROGRAM)")
 
@@ -206,6 +301,17 @@ instattention-opt-cemu-gpu-test: instattention
 		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),1)" \
 		--staging-tokens "$(if $(STAGING_TOKENS),$(STAGING_TOKENS),0)" \
 		--attention-slots "$(if $(ATTENTION_SLOTS),$(ATTENTION_SLOTS),2)" \
+		$(if $(filter 1 true yes,$(SPARF_STAGED)),--sparf-staged) \
+		$(if $(filter 1 true yes,$(SPARF_AUTONOMOUS)),--sparf-autonomous) \
+		$(if $(filter 1 true yes,$(SPARF_GROUPED)),--sparf-grouped) \
+		$(if $(SPARF_GROUP_CHANNELS_PER_PAGE),--sparf-group-channels-per-page "$(SPARF_GROUP_CHANNELS_PER_PAGE)") \
+		$(if $(SPARF_GROUP_WRITE_BATCH_PAGES),--sparf-group-write-batch-pages "$(SPARF_GROUP_WRITE_BATCH_PAGES)") \
+		$(if $(SPARF_GROUP_POOL_BYTES),--sparf-group-pool-bytes "$(SPARF_GROUP_POOL_BYTES)") \
+		$(if $(SPARF_GROUP_FDM_BUDGET_BYTES),--sparf-group-fdm-budget-bytes "$(SPARF_GROUP_FDM_BUDGET_BYTES)") \
+		$(if $(filter 1 true yes,$(SPARF_DEVICE_WRITEBACK)),--sparf-device-writeback) \
+		$(if $(SPARF_WRITEBACK_FORMAT),--sparf-writeback-format "$(SPARF_WRITEBACK_FORMAT)") \
+		$(if $(NVM_DEVICE),--nvm-device "$(NVM_DEVICE)") \
+		--sparf-kv-buffer-tokens "$(if $(SPARF_KV_BUFFER_TOKENS),$(SPARF_KV_BUFFER_TOKENS),0)" \
 		--sparf-top-r "$(if $(SPARF_TOP_R),$(SPARF_TOP_R),16)" \
 		--sparf-compression-ratio "$(if $(SPARF_COMPRESSION_RATIO),$(SPARF_COMPRESSION_RATIO),8)" \
 		$(if $(RUNTIME_CONFIG),--runtime-config "$(RUNTIME_CONFIG)") \

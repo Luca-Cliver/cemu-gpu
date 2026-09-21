@@ -176,12 +176,14 @@ class FlexGenMicrobatchKvWriter:
             backend.flush()
 
     def close(self) -> None:
-        self.flush()
-        with self._lock:
-            executor = self._executor
-            self._executor = None
-        if executor is not None:
-            executor.shutdown(wait=True)
+        try:
+            self.flush()
+        finally:
+            with self._lock:
+                executor = self._executor
+                self._executor = None
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     def __enter__(self):
         return self.open()

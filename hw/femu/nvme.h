@@ -20,6 +20,8 @@
 #include "timing-model/timing.h"
 #include "statistics/statistics.h"
 #include "param.h"
+#include "hw/femu/read_observation.h"
+#include "hw/femu/kv_page.h"
 
 struct ComputeJob;
 
@@ -942,6 +944,10 @@ typedef struct NvmeRequest {
     int                     p2p_req;
     void                    *sdaddr;    // copy source address
     SsdBackend              *sdaddr_backend; // NULL for private CSD buffers
+    /* Borrowed by a private SparF read until its FTL completion. */
+    FemuReadObservation     *read_observation;
+    CemuKvPageTag           *kv_pages;
+    uint32_t                nr_kv_pages;
     void                    *data_buffer;
     FemuCtrl                *mem_ctrl;  // ctrl of memory copy destination
     IndirectTask            indirect_task;

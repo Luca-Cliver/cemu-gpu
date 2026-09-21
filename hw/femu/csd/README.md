@@ -41,6 +41,9 @@ sudo ./x86_64-softmmu/qemu-system-x86_64 \
 - `csf_runtim_scale`: csf timing simulation scale, default value is 3.
 - `nr_cu`: number of compute unit, default value is 4.
 - `nr_thread`: number of thread for functional simulation, default value is 4.
+- `sparf_engines`: number of concurrent autonomous SparF attention engines;
+  default value is 1. Each engine is assigned a compute-unit lane for timing
+  validation; use a matching `nr_cu` when modeling independent engines.
 - `time_slice`: time slice for scheduler interface, default value is 200000 ns.
 - `context_switch_time`: time of one context switch for scheduler interface, default value is 200 ns.
 - `pmem_file`: if you have pmem and want to use it to act the backend of fdm, you can set this param with the path to your pmem file, more details in [Persistent Memory Backend](#persistent-memory-backend).

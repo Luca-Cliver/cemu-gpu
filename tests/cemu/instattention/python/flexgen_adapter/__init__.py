@@ -1,6 +1,6 @@
 from .cemu_attention import FlexGenAttentionBackend, FlexGenAttentionRequest
 from .microbatch import FlexGenMicrobatchKvWriter, FlexGenPrefillWriteRequest
-from .sparf_attention import SparfAttentionBackend
+from .sparf_attention import SparfAttentionBackend, SparfGroupedAttentionBackend
 
 __all__ = [
     "FlexGenAttentionBackend",
@@ -8,4 +8,5 @@ __all__ = [
     "FlexGenMicrobatchKvWriter",
     "FlexGenPrefillWriteRequest",
     "SparfAttentionBackend",
+    "SparfGroupedAttentionBackend",
 ]

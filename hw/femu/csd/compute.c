@@ -9,9 +9,12 @@
 #include "hw/femu/backend/backend.h"
 #include "hw/femu/attention_workflow_abi.h"
 #include "hw/femu/sparf_workflow_abi.h"
+#include "sparf_writeback.h"
+#include "sparf_group_buffer.h"
 #include "hw/femu/inc/slab.h"
 #include "hw/femu/nvme-def.h"
 #include "hw/femu/nvme.h"
+#include "hw/femu/bbssd/bb.h"
 #include "hw/femu/param.h"
 #include "sched.h"
 #include "sysemu/cpus.h"
@@ -21,11 +24,176 @@
 #define MAX_PIND    1024
 #define MAX_RSID    1024
 
+static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, uint16_t rsid);
+static uint16_t sparf_submit_writeback(NvmeRequest *request, Program *program, uint16_t rsid);
+
 static uint64_t monotonic_ns(void)
 {
     struct timespec timestamp;
     clock_gettime(CLOCK_MONOTONIC, &timestamp);
     return (uint64_t)timestamp.tv_sec * 1000000000ULL + timestamp.tv_nsec;
+}
+
+#include "sparf_timeline.h"
+
+static int sparf_timeline_fd(void)
+{
+    static gsize initialized;
+    static int fd = -1;
+    if (g_once_init_enter(&initialized)) {
+        const char *path = getenv("CEMU_SPARF_TIMELINE");
+        if (path && *path) {
+            fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (fd < 0) femu_err("cannot open SparF timeline %s: %s\n", path, strerror(errno));
+        }
+        g_once_init_leave(&initialized, 1);
+    }
+    return fd;
+}
+
+static pthread_mutex_t sparf_trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t sparf_trace_sequence, sparf_trace_session;
+
+void sparf_trace_job_enqueue(ComputeJob *job)
+{
+    job->sparf_dispatch.host_enqueued = monotonic_ns();
+    job->sparf_dispatch.virtual_enqueued = clock_ns();
+}
+
+/* Called with sparf_trace_lock held; never from a frozen functional section. */
+static void sparf_trace_write(GString *line)
+{
+    g_string_append(line, "}\n");
+    size_t offset = 0;
+    while (offset < line->len) {
+        ssize_t written = write(sparf_timeline_fd(), line->str + offset, line->len - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            femu_err("SparF timeline write failed: %s\n", strerror(errno));
+            break;
+        }
+        offset += written;
+    }
+    g_string_free(line, TRUE);
+}
+
+static void sparf_write_read(GString *line, const char *name,
+                             const FemuReadObservation *r)
+{
+    g_string_append_printf(line,
+        "{\"name\":\"%s\",\"logical_bytes\":%llu,\"submitted_bytes\":%llu,"
+        "\"ranges\":%llu,\"model_start_ns\":%llu,\"model_end_ns\":%llu,"
+        "\"pages\":%llu,\"unmapped_pages\":%llu,\"service_ns\":%llu,"
+        "\"queue_ns\":%llu,\"max_queue_ns\":%llu,"
+        "\"critical_queue_ns\":%llu,\"critical_service_ns\":%llu,"
+        "\"critical_initial_wait_ns\":%llu,"
+        "\"channels\":%u,\"luns_per_channel\":%u,\"page_bytes\":%u,"
+        "\"page_read_ns\":%u,\"lun_pages\":[",
+        name, (unsigned long long)r->logical_bytes,
+        (unsigned long long)r->submitted_bytes, (unsigned long long)r->ranges,
+        (unsigned long long)r->model_start_ns, (unsigned long long)r->model_end_ns,
+        (unsigned long long)r->pages, (unsigned long long)r->unmapped_pages,
+        (unsigned long long)r->service_ns, (unsigned long long)r->queue_ns,
+        (unsigned long long)r->max_queue_ns, (unsigned long long)r->critical_queue_ns,
+        (unsigned long long)r->critical_service_ns,
+        (unsigned long long)r->critical_initial_wait_ns, r->channels,
+        r->luns_per_channel, r->page_bytes, r->page_read_ns);
+    for (uint32_t i = 0; i < r->channels * r->luns_per_channel; ++i) {
+        g_string_append_printf(line, "%s%llu", i ? "," : "",
+                               (unsigned long long)r->lun_pages[i]);
+    }
+    g_string_append(line, "]}");
+}
+
+static void sparf_write_observation(ComputeJob *job, const SparfObservation *obs,
+                                    uint64_t result, uint64_t modeled_ns)
+{
+    static const char *names[] = { "channel_read_wait", "token_k_read_wait",
+        "v_outstanding", "qk_functional", "pv_functional" };
+    static const char *read_names[] = { "channel_k", "token_k", "token_v" };
+    struct cemu_sparf_workflow_header h;
+    memcpy(&h, job->args.data_buffer, sizeof(h));
+    ComputeNamespace *cns = job->req->ns->private;
+    pthread_mutex_lock(&sparf_trace_lock);
+    if (!sparf_trace_session) sparf_trace_session = monotonic_ns();
+    job->sparf_trace_command = ++sparf_trace_sequence;
+    GString *line = g_string_new(NULL);
+    g_string_append_printf(line,
+        "{\"schema\":1,\"clock\":\"host_monotonic_ns\",\"pid\":%d,"
+        "\"session\":%llu,\"command\":%llu,\"controller\":%d,\"program\":%u,"
+        "\"workflow\":%u,\"stage\":%u,\"layer\":%u,\"tokens\":%u,"
+        "\"worker\":%d,\"workers\":%u,\"compute_units\":%u,\"sparf_engines\":%u,\"active\":%u,\"success\":%s,"
+        "\"worker_start_ns\":%llu,\"start_ns\":%llu,\"end_ns\":%llu,"
+        "\"worker_end_ns\":%llu,\"modeled_ns\":%llu,"
+        "\"virtual\":{\"clock\":\"qemu_virtual_ns\",\"functional_start_ns\":%llu,"
+        "\"functional_end_ns\":%llu},\"intervals\":[",
+        (int)getpid(), (unsigned long long)sparf_trace_session,
+        (unsigned long long)job->sparf_trace_command,
+        job->req->ns->ctrl->drive_id, job->program->pind, h.reserved[1], h.reserved[0],
+        h.layer, h.valid_tokens, job->req->stat.exec.thread,
+        cns->params->nr_thread, cns->params->nr_cu,
+        cns->params->sparf_engines,
+        qatomic_read(&cns->sparf_autonomous_active),
+        result == UINT64_MAX ? "false" : "true",
+        (unsigned long long)obs->worker_start, (unsigned long long)obs->command_start,
+        (unsigned long long)obs->command_end, (unsigned long long)obs->worker_end,
+        (unsigned long long)modeled_ns, (unsigned long long)obs->virtual_start,
+        (unsigned long long)obs->virtual_end);
+    bool first = true;
+    for (int i = 0; i < SPARF_OBS_COUNT; ++i) {
+        if (!obs->start[i]) continue;
+        g_string_append_printf(line, "%s{\"name\":\"%s\",\"start_ns\":%llu,\"end_ns\":%llu}",
+            first ? "" : ",", names[i], (unsigned long long)obs->start[i],
+            (unsigned long long)(obs->end[i] ? obs->end[i] : obs->command_end));
+        first = false;
+    }
+    g_string_append(line, "],\"reads\":[");
+    first = true;
+    for (int i = 0; i < 3; ++i) {
+        if (!obs->reads[i].ranges) continue;
+        if (!first) g_string_append_c(line, ',');
+        sparf_write_read(line, read_names[i], &obs->reads[i]);
+        first = false;
+    }
+    g_string_append_c(line, ']');
+    if (job->sparf_dispatch.host_entry) {
+        const SparfDispatchTrace *dispatch = &job->sparf_dispatch;
+        g_string_append_printf(line,
+            ",\"dispatch\":{\"host_clock\":\"host_monotonic_ns\","
+            "\"virtual_clock\":\"qemu_virtual_ns\",\"host_entry_ns\":%llu,"
+            "\"host_mirror_start_ns\":%llu,\"host_mirror_end_ns\":%llu,"
+            "\"host_enqueued_ns\":%llu,\"virtual_entry_ns\":%llu,"
+            "\"virtual_enqueued_ns\":%llu}",
+            (unsigned long long)dispatch->host_entry,
+            (unsigned long long)dispatch->host_mirror_start,
+            (unsigned long long)dispatch->host_mirror_end,
+            (unsigned long long)dispatch->host_enqueued,
+            (unsigned long long)dispatch->virtual_entry,
+            (unsigned long long)dispatch->virtual_enqueued);
+    }
+    sparf_trace_write(line);
+    pthread_mutex_unlock(&sparf_trace_lock);
+}
+
+/* Scheduler completion, before the request can be recycled. This is not the
+ * Guest's ioctl return or CQ-consumption timestamp. */
+void sparf_trace_job_finish(ComputeJob *job)
+{
+    pthread_mutex_lock(&sparf_trace_lock);
+    GString *line = g_string_new(NULL);
+    g_string_append_printf(line,
+        "{\"schema\":1,\"event\":\"completion\",\"clock\":\"qemu_virtual_ns\","
+        "\"pid\":%d,\"session\":%llu,\"controller\":%d,\"command\":%llu,"
+        "\"received_ns\":%llu,\"start_ns\":%llu,\"finish_ns\":%llu,"
+        "\"scheduled_runtime_ns\":%llu,\"cu\":%d",
+        (int)getpid(), (unsigned long long)sparf_trace_session,
+        job->req->ns->ctrl->drive_id, (unsigned long long)job->sparf_trace_command,
+        (unsigned long long)job->req->stat.stime,
+        (unsigned long long)job->stat.start_time,
+        (unsigned long long)job->stat.finish_time,
+        (unsigned long long)job_exec_time(job), job->sparf_trace_cu);
+    sparf_trace_write(line);
+    pthread_mutex_unlock(&sparf_trace_lock);
 }
 
 static bool multiply_u64(uint64_t *value, uint64_t factor)
@@ -153,7 +321,8 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         program->type != PROGRAM_TYPE_SHARED_LIB ||
         (program->target != PROGRAM_TARGET_HOST &&
          program->target != PROGRAM_TARGET_CUDA_DEVPTR) ||
-        numr != CEMU_SPARF_WORKFLOW_RANGES || !mr_len || !data ||
+        (numr != CEMU_SPARF_WORKFLOW_RANGES &&
+         numr != CEMU_SPARF_STAGED_RANGES) || !mr_len || !data ||
         length < sizeof(struct cemu_sparf_workflow_header)) {
         return false;
     }
@@ -161,15 +330,28 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
     memcpy(&header, data, sizeof(header));
     uint64_t extents = (uint64_t)header.token_k_extents +
                        header.channel_k_extents + header.token_v_extents;
-    if (header.version != CEMU_SPARF_WORKFLOW_VERSION ||
-        (header.flags & ~CEMU_SPARF_WORKFLOW_TRACE) ||
-        header.reserved[0] || header.reserved[1] ||
-        !header.token_k_extents || !header.channel_k_extents ||
-        !header.token_v_extents ||
+    bool staged = header.version == CEMU_SPARF_STAGED_VERSION;
+    bool autonomous = header.version == CEMU_SPARF_AUTONOMOUS_VERSION;
+    bool buffered = header.flags & CEMU_SPARF_WORKFLOW_BUFFERED;
+    bool grouped = header.flags & CEMU_SPARF_WORKFLOW_GROUPED;
+    if (grouped && (!autonomous || buffered || extents || header.token_head_stride ||
+        header.token_batch_stride || header.token_layer_stride || header.channel_stride ||
+        header.channel_head_stride || header.channel_batch_stride || header.channel_layer_stride ||
+        (uint64_t)header.batch_size * header.num_query_heads > 65536 ||
+        header.head_dim > 4096 || header.max_seq_len > 65536)) return false;
+    if ((!staged && ((!autonomous && header.version != CEMU_SPARF_WORKFLOW_VERSION) ||
+                     header.reserved[0] || header.reserved[1])) ||
+        (staged && (header.reserved[0] < CEMU_SPARF_STAGE_SELECT ||
+                    header.reserved[0] > CEMU_SPARF_STAGE_PV || !header.reserved[1])) ||
+        numr != (staged ? CEMU_SPARF_STAGED_RANGES : CEMU_SPARF_WORKFLOW_RANGES) ||
+        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED)) ||
+        (!grouped && (!header.token_k_extents || !header.channel_k_extents || !header.token_v_extents)) ||
         header.token_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.channel_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.token_v_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
-        length != sizeof(header) + extents * sizeof(struct cemu_sparf_workflow_extent) ||
+        length != sizeof(header) + extents * sizeof(struct cemu_sparf_workflow_extent) +
+                  (buffered ? sizeof(struct cemu_sparf_buffer_tail) : 0) +
+                  (grouped ? sizeof(struct cemu_sparf_group_binding) : 0) ||
         (header.dtype != CEMU_SPARF_FLOAT16 && header.dtype != CEMU_SPARF_FLOAT32) ||
         !header.batch_size || !header.num_query_heads || !header.num_kv_heads ||
         !header.head_dim || !header.max_seq_len || !header.valid_tokens ||
@@ -177,30 +359,54 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         header.num_query_heads % header.num_kv_heads ||
         !header.top_r || header.top_r > header.head_dim ||
         !header.top_k || header.top_k > header.valid_tokens ||
-        !header.token_head_stride || !header.token_batch_stride ||
+        (!grouped && (!header.token_head_stride || !header.token_batch_stride ||
         !header.token_layer_stride || !header.channel_stride ||
         !header.channel_head_stride || !header.channel_batch_stride ||
-        !header.channel_layer_stride || !isfinite(header.scale) ||
+        !header.channel_layer_stride)) || !isfinite(header.scale) ||
         header.scale <= 0.0f) {
         return false;
     }
     uint64_t vectors = (uint64_t)header.batch_size * header.num_query_heads;
     uint64_t element = header.dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+    uint64_t buffered_tokens = 1;
+    if (buffered) {
+        struct cemu_sparf_buffer_tail tail;
+        memcpy(&tail, (const uint8_t *)data + length - sizeof(tail), sizeof(tail));
+        if (tail.published_tokens > header.valid_tokens ||
+            tail.buffered_tokens != header.valid_tokens - tail.published_tokens) {
+            return false;
+        }
+        buffered_tokens = MAX(tail.buffered_tokens, 1);
+    }
+    uint64_t buffered_bytes = buffered_tokens;
+    if (!multiply_u64(&buffered_bytes, header.batch_size) ||
+        !multiply_u64(&buffered_bytes, header.num_kv_heads) ||
+        !multiply_u64(&buffered_bytes, header.head_dim) ||
+        !multiply_u64(&buffered_bytes, element)) return false;
     uint64_t required[] = {
         vectors * header.head_dim * element,
         vectors * header.top_r * header.valid_tokens * element,
         vectors * header.top_k * header.head_dim * element,
         vectors * (header.top_k + 1) * header.head_dim * element,
         vectors * header.head_dim * element,
-        (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim * element,
-        (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim * element,
+        buffered_bytes,
+        buffered_bytes,
         vectors * sizeof(float),
         vectors * (header.top_k + 1) * sizeof(float),
         vectors * header.head_dim * element,
         sizeof(struct cemu_sparf_workflow_trace),
     };
     for (uint32_t index = 0; index < CEMU_SPARF_WORKFLOW_RANGES; ++index) {
-        if (mr_len[index] < 0 || (uint64_t)mr_len[index] < required[index]) {
+        if (mr_len[index] < 0 || (uint64_t)mr_len[index] < required[index] ||
+            (grouped && required[index] > CEMU_SPARF_WRITEBACK_MAX_BYTES)) {
+            return false;
+        }
+    }
+    if (staged) {
+        uint64_t context_bytes = sizeof(struct cemu_sparf_stage_context) + length +
+                                 vectors * header.top_k * sizeof(uint32_t);
+        if (mr_len[CEMU_SPARF_STAGE_CONTEXT_RANGE] < 0 ||
+            (uint64_t)mr_len[CEMU_SPARF_STAGE_CONTEXT_RANGE] < context_bytes) {
             return false;
         }
     }
@@ -208,6 +414,11 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
     if (!nvm || !nvm->backend ||
         nvm->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX(nvm->id_ns.flbas)].lbads != 9) {
         return false;
+    }
+    if (grouped) {
+        struct cemu_sparf_group_binding binding;
+        memcpy(&binding, (const uint8_t *)data + sizeof(header), sizeof(binding));
+        return binding.cookie != 0;
     }
     const struct cemu_sparf_workflow_extent *map =
         (const struct cemu_sparf_workflow_extent *)((const uint8_t *)data + sizeof(header));
@@ -337,6 +548,16 @@ static void compute_init(NvmeNamespace *ns, Error **errp)
     ns->private = cns;
     cns->ns = ns;
     cns->params = param;
+    cns->sparf_autonomous_active = 0;
+    pthread_mutex_init(&cns->sparf_autonomous_lock, NULL);
+    cns->sparf_autonomous_workers = NULL;
+    cns->sparf_writeback_active = 0;
+    cns->sparf_writeback_queue = NULL;
+    pthread_mutex_init(&cns->sparf_group_lock, NULL);
+    cns->sparf_group_session = NULL;
+    cns->sparf_group_owner = 0;
+    cns->sparf_group_rsid = 0;
+    cns->sparf_autonomous_queue = NULL;
 
     // program slab init
     struct ProgramInitArgs init_arg;
@@ -744,7 +965,29 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         }
     } else {
         // unload program
-        // TODO add jobs_running check
+        if (qatomic_load_acquire(&program->jobs_running) != 0) {
+            pthread_mutex_unlock(&program->lock);
+            return NVME_PROGRAM_IN_USE;
+        }
+        ComputeNamespace *namespace = compute_ns(ns);
+        pthread_mutex_lock(&namespace->sparf_group_lock);
+        if (namespace->sparf_group_session && namespace->sparf_group_owner == program->pind) {
+            SparfGroupBuffer *buffer = namespace->sparf_group_session->buffer;
+            if (buffer) {
+                g_mutex_lock(&buffer->lock);
+                bool busy = buffer->users != 0;
+                g_mutex_unlock(&buffer->lock);
+                if (busy) {
+                    pthread_mutex_unlock(&namespace->sparf_group_lock);
+                    pthread_mutex_unlock(&program->lock);
+                    return NVME_PROGRAM_IN_USE;
+                }
+            }
+            sparf_group_free(namespace->sparf_group_session);
+            namespace->sparf_group_session = NULL;
+            namespace->sparf_group_rsid = 0;
+        }
+        pthread_mutex_unlock(&namespace->sparf_group_lock);
         if (program->state == PROGRAM_STATE_ACTIVATED) {
             femu_err("unload program: program %u is activated!\n", pind);
         }
@@ -820,6 +1063,11 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     uint64_t prp2 = le64_to_cpu(exec->prp2);
     uint32_t chunk_nlb = le32_to_cpu(exec->chunk_nlb) + 1;
     uint32_t runtime = le32_to_cpu(exec->runtime);
+    SparfDispatchTrace dispatch = {0};
+    if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND && sparf_timeline_fd() >= 0) {
+        dispatch.host_entry = monotonic_ns();
+        dispatch.virtual_entry = clock_ns();
+    }
 
     femu_debug("program_execute: stime %lu, pind %u, rsid %u, numr %u, dlen %u, "
                "cparam1 %lx, cparam2 %lx, chunk_nlb %d, group %d, prp1 %lx, prp2 %lx\n",
@@ -872,6 +1120,14 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         }
     }
     req->data_buffer = data_buffer;
+    if (cparam1 == CEMU_SPARF_WRITEBACK_COMMAND || cparam1 == CEMU_SPARF_GROUP_COMMAND) {
+        return sparf_submit_writeback(req, program, rsid);
+    }
+    if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND &&
+        dlen >= sizeof(struct cemu_sparf_workflow_header) &&
+        ((struct cemu_sparf_workflow_header *)data_buffer)->version == CEMU_SPARF_AUTONOMOUS_VERSION) {
+        return sparf_submit_autonomous(req, program, rsid);
+    }
 
     // get all memory range
     void **mr_addr = NULL;
@@ -885,6 +1141,11 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             return NVME_INVALID_MR_SET_ID;
         }
         MemoryRangeSet *mrs = memory_range_set_get(ns, rsid);
+        if (!mrs || !mrs->numr || qatomic_read(&mrs->in_use)) {
+            free(req->data_buffer);
+            req->data_buffer = NULL;
+            return NVME_MR_SET_IN_USE;
+        }
         mr_addr = mrs->mr_addr;
         mr_len = mrs->mr_len;
         mr_backend = g_malloc0(sizeof(SsdBackend *) * mrs->numr);
@@ -1089,6 +1350,9 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     }
 
     void **mr_dev_addr = NULL;
+    if (dispatch.host_entry) {
+        dispatch.host_mirror_start = monotonic_ns();
+    }
     if (program->target == PROGRAM_TARGET_CUDA_DEVPTR && numr) {
         femu_debug("program_execute: preparing CUDA devptr args, numr %u\n", numr);
         mr_dev_addr = malloc(sizeof(void *) * numr);
@@ -1097,6 +1361,11 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
             return NVME_DNR;
         }
         for (uint32_t i = 0; i < numr; i++) {
+            if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND &&
+                i == CEMU_SPARF_STAGE_CONTEXT_RANGE) {
+                mr_dev_addr[i] = NULL;
+                continue;
+            }
             mr_dev_addr[i] = backend_cuda_ensure_device_ptr(mr_backend[i], mr_addr[i], mr_len[i]);
             if (!mr_dev_addr[i]) {
                 femu_err("program_execute: failed to prepare CUDA devptr for mr %u, host %p len %lld\n",
@@ -1109,8 +1378,12 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         }
     }
 
+    if (dispatch.host_entry) {
+        dispatch.host_mirror_end = monotonic_ns();
+    }
     sched_alloc_job(compute_ns(req->ns), req);
     ComputeJob *job = req->job;
+    job->sparf_dispatch = dispatch;
     job->user_runtime = runtime ? runtime : program->runtime;
     job->program = program;
     job->args.numr = numr;
@@ -1126,6 +1399,14 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     job->args.buffer_len = dlen;
     if (!program->is_indirect) {
         sched_enqueue_job(compute_ns(req->ns), req);
+    }
+    if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND) {
+        struct cemu_sparf_workflow_header header;
+        memcpy(&header, data_buffer, sizeof(header));
+        if (header.version == CEMU_SPARF_STAGED_VERSION) {
+            req->stat.exec.thread = sparf_stage_worker(header.reserved[0],
+                compute_ns(req->ns)->params->nr_thread, req->stat.exec.thread);
+        }
     }
     int rc = femu_ring_enqueue(compute_ns(req->ns)->to_csd[req->stat.exec.thread], (void *)&req, 1);
     if (rc != 1) {
@@ -1351,7 +1632,8 @@ static NvmeRequest *attention_submit_read(NvmeRequest *parent,
                                           void *destination,
                                           const struct cemu_attention_workflow_extent *extents,
                                           uint32_t extent_count,
-                                          uint64_t model_start_ns)
+                                          uint64_t model_start_ns,
+                                          FemuReadObservation *observation)
 {
     NvmeRequest *request = g_new0(NvmeRequest, 1);
     request->ns = parent->ns;
@@ -1364,6 +1646,7 @@ static NvmeRequest *attention_submit_read(NvmeRequest *parent,
     request->nr_sres = extent_count;
     request->sres = g_new0(NvmeCopyFormat, extent_count);
     request->indirect_task.ring = completion_ring;
+    request->read_observation = observation;
     request->stat.stime = model_start_ns;
     request->stat.expire_time = request->stat.stime;
     for (uint32_t index = 0; index < extent_count; ++index) {
@@ -1407,6 +1690,7 @@ static void attention_free_read(NvmeRequest *request)
 {
     if (request) {
         g_free(request->sres);
+        g_free(request->kv_pages);
         g_free(request);
     }
 }
@@ -1437,25 +1721,6 @@ typedef struct SparfPageCache {
     uint8_t *used;
     uint32_t capacity;
 } SparfPageCache;
-
-typedef struct SparfScoreIndex {
-    float score;
-    uint32_t index;
-} SparfScoreIndex;
-
-static int sparf_score_index_compare(const void *left, const void *right)
-{
-    const SparfScoreIndex *first = left;
-    const SparfScoreIndex *second = right;
-
-    if (first->score > second->score) {
-        return -1;
-    }
-    if (first->score < second->score) {
-        return 1;
-    }
-    return first->index < second->index ? -1 : first->index != second->index;
-}
 
 static uint64_t sparf_hash_page(uint64_t value)
 {
@@ -1534,7 +1799,7 @@ static bool sparf_start_read(
     ComputeJob *job, struct rte_ring *ring,
     const struct cemu_sparf_workflow_extent *map, uint32_t map_count,
     GArray *requested_spans, uint32_t destination_range,
-    uint64_t model_start_ns, SparfRead *read)
+    uint64_t model_start_ns, SparfRead *read, FemuReadObservation *observation)
 {
     memset(read, 0, sizeof(*read));
     read->physical_extents = g_array_new(FALSE, FALSE,
@@ -1543,6 +1808,14 @@ static bool sparf_start_read(
     read->destination = job->args.mr_addr[destination_range];
     read->destination_backend = job->mr_backend[destination_range];
     read->destination_len = 0;
+    if (observation) {
+        observation->model_start_ns = model_start_ns;
+        observation->model_end_ns = model_start_ns;
+        observation->logical_spans = requested_spans->len;
+    }
+    if (!requested_spans->len) {
+        return true;
+    }
     SparfPageCache pages = { 0 };
     pages.capacity = 1;
     while (pages.capacity < requested_spans->len * 2 + 1) {
@@ -1555,8 +1828,10 @@ static bool sparf_start_read(
         SparfLogicalSpan *span = &g_array_index(requested_spans, SparfLogicalSpan, index);
         uint64_t aligned_start = span->offset & ~UINT64_C(4095);
         uint64_t aligned_end = (span->offset + span->size + 4095) & ~UINT64_C(4095);
+        if (observation) observation->logical_bytes += span->size;
         span->prefix = span->offset - aligned_start;
         span->read_size = aligned_end - aligned_start;
+        if (observation) observation->aligned_bytes_before_dedup += span->read_size;
         uint64_t existing_offset = 0;
         if (span->read_size == 4096 &&
             sparf_page_cache_find(&pages, aligned_start, &existing_offset)) {
@@ -1588,17 +1863,45 @@ static bool sparf_start_read(
     g_free(pages.offsets);
     g_free(pages.used);
     read->temporary = g_malloc(read->temporary_size);
+    if (observation) {
+        observation->submitted_bytes = read->temporary_size;
+        observation->ranges = read->physical_extents->len;
+        observation->model_start_ns = model_start_ns;
+        observation->model_end_ns = model_start_ns;
+    }
     read->request = attention_submit_read(
         job->req, ring, read->temporary,
         (const struct cemu_attention_workflow_extent *)read->physical_extents->data,
-        read->physical_extents->len, model_start_ns);
+        read->physical_extents->len, model_start_ns, observation);
     return read->request != NULL;
+}
+
+static void sparf_clear_read(SparfRead *read)
+{
+    attention_free_read(read->request);
+    read->request = NULL;
+    g_free(read->temporary);
+    read->temporary = NULL;
+    if (read->physical_extents) g_array_free(read->physical_extents, TRUE);
+    if (read->spans) g_array_free(read->spans, TRUE);
+    read->physical_extents = NULL;
+    read->spans = NULL;
+    memset(read, 0, sizeof(*read));
 }
 
 static bool sparf_finish_read(SparfRead *read, struct rte_ring *ring,
                               uint64_t *modeled_ns)
 {
+    if (read->spans && !read->spans->len) {
+        *modeled_ns = 0;
+        sparf_clear_read(read);
+        return true;
+    }
     bool success = attention_wait_read(ring, read->request);
+    if (read->request && read->request->read_observation) {
+        FemuReadObservation *obs = read->request->read_observation;
+        obs->model_end_ns = obs->model_start_ns + read->request->stat.reqlat;
+    }
     if (success) {
         *modeled_ns = read->request->stat.reqlat;
         if (backend_cuda_prepare_host(read->destination_backend,
@@ -1619,356 +1922,13 @@ static bool sparf_finish_read(SparfRead *read, struct rte_ring *ring,
                                      read->destination,
                                      read->destination_len);
     }
-    attention_free_read(read->request);
-    read->request = NULL;
-    g_free(read->temporary);
-    read->temporary = NULL;
-    if (read->physical_extents) g_array_free(read->physical_extents, TRUE);
-    if (read->spans) g_array_free(read->spans, TRUE);
-    read->physical_extents = NULL;
-    read->spans = NULL;
+    sparf_clear_read(read);
     return success;
 }
 
-static float sparf_half_to_float(uint16_t value)
-{
-    uint32_t sign = (uint32_t)(value & 0x8000U) << 16;
-    uint32_t exponent = (value >> 10) & 31U;
-    uint32_t mantissa = value & 1023U;
-    uint32_t bits;
-    if (!exponent) {
-        if (!mantissa) {
-            bits = sign;
-        } else {
-            exponent = 127 - 15 + 1;
-            while (!(mantissa & 1024U)) {
-                mantissa <<= 1;
-                --exponent;
-            }
-            bits = sign | (exponent << 23) | ((mantissa & 1023U) << 13);
-        }
-    } else if (exponent == 31) {
-        bits = sign | 0x7f800000U | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
-    }
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-static float sparf_load_scalar(const void *address, uint64_t index, uint32_t dtype)
-{
-    return dtype == CEMU_SPARF_FLOAT16
-        ? sparf_half_to_float(((const uint16_t *)address)[index])
-        : ((const float *)address)[index];
-}
-
-static uint64_t run_sparf_phase(ComputeJob *job, uint32_t phase,
-                                const uint32_t *indices, uint32_t count,
-                                struct cemu_sparf_attention_metadata *metadata)
-{
-    void *host[4] = { 0 };
-    void *device[4] = { 0 };
-    long long lengths[4] = { 0 };
-    SsdBackend *backends[4] = { 0 };
-    for (uint32_t index = 0; index < count; ++index) {
-        uint32_t source = indices[index];
-        host[index] = job->args.mr_addr[source];
-        device[index] = job->args.mr_dev_addr ? job->args.mr_dev_addr[source] : NULL;
-        lengths[index] = job->args.mr_len[source];
-        backends[index] = job->mr_backend[source];
-    }
-    if (phase == CEMU_SPARF_PHASE_EXACT_QK) {
-        uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
-        lengths[0] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
-                     metadata->head_dim * element;
-        lengths[1] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
-                     metadata->selected_tokens * metadata->head_dim * element;
-        lengths[2] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
-                     sizeof(float);
-    } else {
-        uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
-        uint64_t vectors = (uint64_t)metadata->batch_size * metadata->num_query_heads;
-        lengths[0] = vectors * (metadata->selected_tokens + 1) * sizeof(float);
-        lengths[1] = vectors * (metadata->selected_tokens + 1) *
-                     metadata->head_dim * element;
-    }
-    struct ubpf_jit_args arguments = job->args;
-    arguments.numr = count;
-    arguments.mr_addr = host;
-    arguments.mr_dev_addr = job->args.mr_dev_addr ? device : NULL;
-    arguments.mr_len = lengths;
-    metadata->phase = phase;
-    arguments.data_buffer = metadata;
-    arguments.buffer_len = sizeof(*metadata);
-    for (uint32_t index = 0; index + 1 < count; ++index) {
-        int status = job->program->target == PROGRAM_TARGET_CUDA_DEVPTR
-            ? backend_cuda_prepare_device(backends[index], host[index], lengths[index])
-            : backend_cuda_prepare_host(backends[index], host[index], lengths[index]);
-        if (status != 0) return (uint64_t)-1;
-    }
-    uint64_t result = job->program->shared_lib.jit_fn(&arguments);
-    if (result != (uint64_t)-1) {
-        if (job->program->target == PROGRAM_TARGET_CUDA_DEVPTR)
-            backend_cuda_mark_device_dirty(backends[count - 1], host[count - 1], lengths[count - 1]);
-        else
-            backend_cuda_mark_host_dirty(backends[count - 1], host[count - 1], lengths[count - 1]);
-    }
-    return result;
-}
-
-static uint64_t run_sparf_workflow(ComputeJob *job, uint64_t *modeled_runtime)
-{
-    struct cemu_sparf_workflow_header header;
-    struct cemu_sparf_workflow_trace trace = { 0 };
-    memcpy(&header, job->args.data_buffer, sizeof(header));
-    const struct cemu_sparf_workflow_extent *maps =
-        (const struct cemu_sparf_workflow_extent *)
-        ((const uint8_t *)job->args.data_buffer + sizeof(header));
-    const struct cemu_sparf_workflow_extent *token_k_map = maps;
-    const struct cemu_sparf_workflow_extent *channel_k_map = token_k_map + header.token_k_extents;
-    const struct cemu_sparf_workflow_extent *token_v_map = channel_k_map + header.channel_k_extents;
-    const uint32_t vectors = header.batch_size * header.num_query_heads;
-    const uint32_t element = header.dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
-    const uint32_t heads_per_kv = header.num_query_heads / header.num_kv_heads;
-    struct rte_ring *ring = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
-    uint32_t *channels = g_new(uint32_t, (uint64_t)vectors * header.top_r);
-    uint32_t *tokens = g_new(uint32_t, (uint64_t)vectors * header.top_k);
-    float *scores = g_new(float, header.valid_tokens);
-    SparfScoreIndex *score_indices = g_new(SparfScoreIndex, header.valid_tokens);
-    float *query_values = g_new(float, (uint64_t)vectors * header.head_dim);
-    float *channel_values = g_new(float,
-        (uint64_t)vectors * header.top_r * header.valid_tokens);
-    float *current_key_values = g_new(float,
-        (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim);
-    SparfScoreIndex *channel_indices = g_new(SparfScoreIndex, header.head_dim);
-    uint64_t result = (uint64_t)-1;
-    SparfRead channel_read = { 0 }, key_read = { 0 }, value_read = { 0 };
-    if (!ring || backend_cuda_prepare_host(job->mr_backend[0], job->args.mr_addr[0],
-                                           job->args.mr_len[0]) != 0) goto out;
-
-    for (uint64_t index = 0; index < (uint64_t)vectors * header.head_dim; ++index) {
-        query_values[index] = sparf_load_scalar(job->args.mr_addr[0], index,
-                                                header.dtype);
-    }
-
-    GArray *channel_spans = g_array_new(FALSE, FALSE, sizeof(SparfLogicalSpan));
-    for (uint32_t vector = 0; vector < vectors; ++vector) {
-        for (uint32_t dimension = 0; dimension < header.head_dim; ++dimension) {
-            channel_indices[dimension].score = fabsf(query_values[
-                (uint64_t)vector * header.head_dim + dimension]);
-            channel_indices[dimension].index = dimension;
-        }
-        qsort(channel_indices, header.head_dim, sizeof(*channel_indices),
-              sparf_score_index_compare);
-        for (uint32_t rank = 0; rank < header.top_r; ++rank) {
-            uint32_t best_index = channel_indices[rank].index;
-            channels[(uint64_t)vector * header.top_r + rank] = best_index;
-            uint32_t batch = vector / header.num_query_heads;
-            uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
-            SparfLogicalSpan span = {
-                .offset = (uint64_t)header.layer * header.channel_layer_stride +
-                          (uint64_t)batch * header.channel_batch_stride +
-                          (uint64_t)head * header.channel_head_stride +
-                          (uint64_t)best_index * header.channel_stride,
-                .size = header.valid_tokens * element,
-                .destination_offset = ((uint64_t)vector * header.top_r + rank) *
-                                      header.valid_tokens * element,
-            };
-            g_array_append_val(channel_spans, span);
-        }
-    }
-    if (!sparf_start_read(job, ring, channel_k_map, header.channel_k_extents,
-                          channel_spans, 1, clock_ns(), &channel_read) ||
-        !sparf_finish_read(&channel_read, ring, &trace.channel_read_model_ns)) goto out;
-
-    for (uint64_t index = 0;
-         index < (uint64_t)vectors * header.top_r * header.valid_tokens;
-         ++index) {
-        channel_values[index] = sparf_load_scalar(job->args.mr_addr[1], index,
-                                                  header.dtype);
-    }
-    if (backend_cuda_prepare_host(job->mr_backend[5], job->args.mr_addr[5], job->args.mr_len[5]) != 0) goto out;
-    for (uint64_t index = 0;
-         index < (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim;
-         ++index) {
-        current_key_values[index] = sparf_load_scalar(job->args.mr_addr[5], index,
-                                                      header.dtype);
-    }
-    float *alpha = (float *)job->args.mr_addr[7];
-    if (backend_cuda_prepare_host(job->mr_backend[7], alpha, vectors * sizeof(float)) != 0) goto out;
-    for (uint32_t vector = 0; vector < vectors; ++vector) {
-        uint32_t batch = vector / header.num_query_heads;
-        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
-        float q_norm = 0.0f, selected_norm = 0.0f, maximum = -INFINITY;
-        for (uint32_t dimension = 0; dimension < header.head_dim; ++dimension)
-            q_norm += fabsf(query_values[(uint64_t)vector * header.head_dim + dimension]);
-        for (uint32_t rank = 0; rank < header.top_r; ++rank)
-            selected_norm += fabsf(query_values[(uint64_t)vector * header.head_dim +
-                channels[(uint64_t)vector * header.top_r + rank]]);
-        float ratio = q_norm / MAX(selected_norm, 1.17549435e-38f);
-        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
-            scores[token] = 0.0f;
-        }
-        for (uint32_t rank = 0; rank < header.top_r; ++rank) {
-            uint32_t dimension = channels[(uint64_t)vector * header.top_r + rank];
-            float query_value = query_values[(uint64_t)vector * header.head_dim + dimension];
-            const float *key_values = &channel_values[
-                ((uint64_t)vector * header.top_r + rank) * header.valid_tokens];
-            for (uint32_t token = 0; token + 1 < header.valid_tokens; ++token) {
-                scores[token] += query_value * key_values[token];
-            }
-            scores[header.valid_tokens - 1] += query_value * current_key_values[
-                ((uint64_t)batch * header.num_kv_heads + head) * header.head_dim + dimension];
-        }
-        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
-            scores[token] *= ratio * header.scale;
-            maximum = MAX(maximum, scores[token]);
-        }
-        float denominator = 0.0f;
-        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
-            scores[token] = expf(scores[token] - maximum);
-            denominator += scores[token];
-        }
-        for (uint32_t token = 0; token < header.valid_tokens; ++token) scores[token] /= denominator;
-        for (uint32_t token = 0; token < header.valid_tokens; ++token) {
-            score_indices[token].score = scores[token];
-            score_indices[token].index = token;
-        }
-        qsort(score_indices, header.valid_tokens, sizeof(*score_indices),
-              sparf_score_index_compare);
-        bool current_selected = false;
-        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
-            tokens[(uint64_t)vector * header.top_k + rank] = score_indices[rank].index;
-            current_selected |= score_indices[rank].index + 1 == header.valid_tokens;
-        }
-        uint32_t current = header.valid_tokens - 1;
-        if (!current_selected) {
-            uint32_t weakest = 0;
-            for (uint32_t rank = 1; rank < header.top_k; ++rank) {
-                if (scores[tokens[(uint64_t)vector * header.top_k + rank]] <
-                    scores[tokens[(uint64_t)vector * header.top_k + weakest]]) {
-                    weakest = rank;
-                }
-            }
-            tokens[(uint64_t)vector * header.top_k + weakest] = current;
-        }
-        alpha[vector] = 0.0f;
-        for (uint32_t rank = 0; rank < header.top_k; ++rank)
-            alpha[vector] += scores[tokens[(uint64_t)vector * header.top_k + rank]];
-    }
-    backend_cuda_mark_host_dirty(job->mr_backend[7], alpha, vectors * sizeof(float));
-
-    GArray *key_spans = g_array_new(FALSE, FALSE, sizeof(SparfLogicalSpan));
-    GArray *value_spans = g_array_new(FALSE, FALSE, sizeof(SparfLogicalSpan));
-    for (uint32_t vector = 0; vector < vectors; ++vector) {
-        uint32_t batch = vector / header.num_query_heads;
-        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
-        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
-            uint64_t logical = (uint64_t)header.layer * header.token_layer_stride +
-                (uint64_t)batch * header.token_batch_stride +
-                (uint64_t)head * header.token_head_stride +
-                (uint64_t)tokens[(uint64_t)vector * header.top_k + rank] * header.head_dim * element;
-            SparfLogicalSpan span = {
-                .offset = logical, .size = header.head_dim * element,
-                .destination_offset = ((uint64_t)vector * header.top_k + rank) * header.head_dim * element,
-            };
-            SparfLogicalSpan value_span = span;
-            value_span.destination_offset =
-                ((uint64_t)vector * (header.top_k + 1) + rank) *
-                header.head_dim * element;
-            g_array_append_val(key_spans, span);
-            g_array_append_val(value_spans, value_span);
-        }
-    }
-    if (!sparf_start_read(job, ring, token_k_map, header.token_k_extents,
-                          key_spans, 2, clock_ns(), &key_read) ||
-        !sparf_finish_read(&key_read, ring, &trace.token_k_read_model_ns)) goto out;
-    if (backend_cuda_prepare_host(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]) != 0) goto out;
-    for (uint32_t vector = 0; vector < vectors; ++vector) {
-        uint32_t batch = vector / header.num_query_heads;
-        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
-        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
-            if (tokens[(uint64_t)vector * header.top_k + rank] + 1 == header.valid_tokens) {
-                memcpy((uint8_t *)job->args.mr_addr[2] +
-                           ((uint64_t)vector * header.top_k + rank) * header.head_dim * element,
-                       (uint8_t *)job->args.mr_addr[5] +
-                           ((uint64_t)batch * header.num_kv_heads + head) * header.head_dim * element,
-                       header.head_dim * element);
-            }
-        }
-    }
-    backend_cuda_mark_host_dirty(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]);
-    if (!sparf_start_read(job, ring, token_v_map, header.token_v_extents,
-                          value_spans, 3, clock_ns(), &value_read)) goto out;
-
-    struct cemu_sparf_attention_metadata metadata = {
-        .version = CEMU_SPARF_ATTENTION_VERSION,
-        .phase = CEMU_SPARF_PHASE_EXACT_QK,
-        .dtype = header.dtype,
-        .batch_size = header.batch_size,
-        .num_query_heads = header.num_query_heads,
-        .head_dim = header.head_dim,
-        .selected_tokens = header.top_k,
-        .reserved = 0,
-        .scale = header.scale,
-    };
-    const uint32_t exact_ranges[] = { 0, 2, 7, 8 };
-    result = run_sparf_phase(job, CEMU_SPARF_PHASE_EXACT_QK,
-                             exact_ranges, 4, &metadata);
-    if (!sparf_finish_read(&value_read, ring, &trace.token_v_read_model_ns) ||
-        result == (uint64_t)-1) goto out;
-    if (backend_cuda_prepare_host(job->mr_backend[3], job->args.mr_addr[3],
-                                  job->args.mr_len[3]) != 0 ||
-        backend_cuda_prepare_host(job->mr_backend[4], job->args.mr_addr[4],
-                                  job->args.mr_len[4]) != 0 ||
-        backend_cuda_prepare_host(job->mr_backend[6], job->args.mr_addr[6],
-                                  job->args.mr_len[6]) != 0) goto out;
-    for (uint32_t vector = 0; vector < vectors; ++vector) {
-        uint32_t batch = vector / header.num_query_heads;
-        uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
-        for (uint32_t rank = 0; rank < header.top_k; ++rank) {
-            if (tokens[(uint64_t)vector * header.top_k + rank] + 1 == header.valid_tokens) {
-                memcpy((uint8_t *)job->args.mr_addr[3] +
-                           ((uint64_t)vector * (header.top_k + 1) + rank) * header.head_dim * element,
-                       (uint8_t *)job->args.mr_addr[6] +
-                           ((uint64_t)batch * header.num_kv_heads + head) * header.head_dim * element,
-                       header.head_dim * element);
-            }
-        }
-        memcpy((uint8_t *)job->args.mr_addr[3] +
-                   ((uint64_t)vector * (header.top_k + 1) + header.top_k) * header.head_dim * element,
-               (uint8_t *)job->args.mr_addr[4] + (uint64_t)vector * header.head_dim * element,
-               header.head_dim * element);
-    }
-    backend_cuda_mark_host_dirty(job->mr_backend[3], job->args.mr_addr[3], job->args.mr_len[3]);
-    const uint32_t pv_ranges[] = { 8, 3, 9 };
-    result = run_sparf_phase(job, CEMU_SPARF_PHASE_PV, pv_ranges, 3, &metadata);
-
-out:
-    if (channel_read.request) sparf_finish_read(&channel_read, ring, &trace.channel_read_model_ns);
-    if (key_read.request) sparf_finish_read(&key_read, ring, &trace.token_k_read_model_ns);
-    if (value_read.request) sparf_finish_read(&value_read, ring, &trace.token_v_read_model_ns);
-    trace.approximate_model_ns = header.approximate_runtime_ns;
-    trace.exact_qk_model_ns = header.exact_qk_runtime_ns;
-    trace.pv_model_ns = header.pv_runtime_ns;
-    trace.selected_channels = (uint64_t)vectors * header.top_r;
-    trace.selected_tokens = (uint64_t)vectors * header.top_k;
-    trace.total_model_ns = trace.channel_read_model_ns + trace.approximate_model_ns +
-        trace.token_k_read_model_ns + MAX(trace.exact_qk_model_ns, trace.token_v_read_model_ns) +
-        trace.pv_model_ns;
-    *modeled_runtime = trace.total_model_ns;
-    if (backend_cuda_prepare_host(job->mr_backend[10], job->args.mr_addr[10], sizeof(trace)) == 0) {
-        memcpy(job->args.mr_addr[10], &trace, sizeof(trace));
-        backend_cuda_mark_host_dirty(job->mr_backend[10], job->args.mr_addr[10], sizeof(trace));
-    } else result = (uint64_t)-1;
-    if (ring) femu_ring_free(ring);
-    g_free(channels); g_free(tokens); g_free(scores); g_free(score_indices);
-    g_free(query_values); g_free(channel_values); g_free(current_key_values);
-    g_free(channel_indices);
-    return result;
-}
+#include "sparf_group_attention.h"
+#include "sparf_workflow.h"
+#include "sparf_autonomous_log.h"
 
 static uint64_t run_attention_phase_stage(ComputeJob *job, uint32_t phase,
                                           const uint32_t indices[3],
@@ -2049,7 +2009,7 @@ static uint64_t run_attention_workflow(ComputeJob *job, uint64_t *modeled_runtim
     uint64_t key_model_start = clock_ns();
     key_request = attention_submit_read(job->req, ring, job->args.mr_addr[1],
                                         extents, header.key_extents,
-                                        key_model_start);
+                                        key_model_start, NULL);
     if (!key_request || !attention_wait_read(ring, key_request)) {
         goto out;
     }
@@ -2064,7 +2024,7 @@ static uint64_t run_attention_workflow(ComputeJob *job, uint64_t *modeled_runtim
         value_request = attention_submit_read(
             job->req, ring, job->args.mr_addr[2],
             extents + header.key_extents, header.value_extents,
-            middle_model_start);
+            middle_model_start, NULL);
         if (!value_request) {
             goto out;
         }
@@ -2087,7 +2047,7 @@ static uint64_t run_attention_workflow(ComputeJob *job, uint64_t *modeled_runtim
         value_request = attention_submit_read(
             job->req, ring, job->args.mr_addr[2],
             extents + header.key_extents, header.value_extents,
-            middle_model_start + header.qk_runtime_ns);
+            middle_model_start + header.qk_runtime_ns, NULL);
         if (!value_request) {
             result = (uint64_t)-1;
             goto out;
@@ -2155,6 +2115,11 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         (uint64_t)job->args.cparam1 == CEMU_ATTENTION_WORKFLOW_COMMAND;
     bool sparf_workflow =
         (uint64_t)job->args.cparam1 == CEMU_SPARF_WORKFLOW_COMMAND;
+    SparfObservation observation = { 0 };
+    SparfObservation *observe = sparf_workflow && !job->sparf_autonomous && sparf_timeline_fd() >= 0
+                              ? &observation : NULL;
+    job->sparf_trace_command = 0;
+    if (observe) observe->worker_start = monotonic_ns();
     struct timespec t0, t1;
 
     if (detailed_compute_log) {
@@ -2179,7 +2144,15 @@ static uint64_t run_functional_modeling(ComputeJob *job)
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
         if (sparf_workflow) {
-            res = run_sparf_workflow(job, &workflow_runtime);
+            if (observe) {
+                observe->command_start = monotonic_ns();
+                observe->virtual_start = clock_ns();
+            }
+            res = run_sparf_workflow(job, &workflow_runtime, observe);
+            if (observe) {
+                observe->command_end = monotonic_ns();
+                observe->virtual_end = clock_ns();
+            }
         } else if (attention_workflow) {
             res = run_attention_workflow(job, &workflow_runtime);
         } else {
@@ -2196,6 +2169,15 @@ static uint64_t run_functional_modeling(ComputeJob *job)
                 runtime = realtime * program->runtime_scale;
         }
         leave_compute_section();
+        if (observe) {
+            observe->worker_end = monotonic_ns();
+            /* File I/O is outside the frozen functional section. */
+            sparf_write_observation(job, observe, res, workflow_runtime);
+            for (int i = 0; i < 3; ++i) {
+                g_free(observe->reads[i].lun_pages);
+                g_free(observe->reads[i].lun_initial_wait_ns);
+            }
+        }
     // }
 
         femu_debug("run_on_host: program %u, runtime %lu, realtime: %lu, size %llu\n", program->pind, runtime, realtime,job->args.mr_len[0]);
@@ -2242,6 +2224,647 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         }
     }
     return res;
+}
+
+static void sparf_wait_physical(SparfAutonomous *state)
+{
+    bool pending = state->channel_read.request || state->key_read.request ||
+                   state->value_read.request;
+    while (pending && femu_ring_empty(state->ring)) usleep(10);
+}
+
+static void *sparf_autonomous_main(void *opaque)
+{
+    ComputeJob *job = opaque;
+    NvmeRequest *parent = job->req;
+    ComputeNamespace *namespace = compute_ns(parent->ns);
+    SparfAutonomous *state = job->sparf_autonomous;
+    SparfAutonomousTrace *trace = state->timeline;
+    if (trace) sparf_trace_stamp(&trace->started);
+    struct rte_ring *completion = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
+    uint64_t result = (uint64_t)-1;
+    if (!completion) goto finish;
+    while (state->resume != SPARF_RESUME_DONE) {
+        if (state->resume == SPARF_RESUME_VALUE || state->wait == SPARF_WAIT_IO) {
+            sparf_wait_physical(state);
+            if (trace) {
+                int index = state->resume == SPARF_RESUME_CHANNEL ? 0 :
+                            state->resume == SPARF_RESUME_KEY ? 1 : 2;
+                sparf_trace_stamp(&trace->reads[index].observed);
+            }
+        }
+        if (state->wait == SPARF_WAIT_TIME) {
+            while (clock_ns() < state->deadline) usleep(10);
+            if (trace) {
+                int index = state->resume == SPARF_RESUME_APPROX ? 0 :
+                            state->resume == SPARF_RESUME_EXACT ? 1 : 2;
+                sparf_trace_stamp(&trace->reads[index].ready);
+            }
+        }
+        state->wait = SPARF_WAIT_NONE;
+        result = run_functional_modeling(job);
+        if (result == (uint64_t)-1) break;
+        if (trace && state->wait == SPARF_WAIT_TIME) {
+            int index = state->resume == SPARF_RESUME_APPROX ? 0 :
+                        state->resume == SPARF_RESUME_EXACT ? 1 : 2;
+            trace->reads[index].deadline_ns = state->deadline;
+        }
+        if (state->wait == SPARF_WAIT_COMPUTE) {
+            int index = state->resume == SPARF_RESUME_KEY_START ? 0 :
+                        state->resume == SPARF_RESUME_VALUE ? 1 : 2;
+            SparfComputeTrace *compute_trace = trace ? &trace->computes[index] : NULL;
+            if (compute_trace) compute_trace->effective_ns = job_exec_time(job);
+            if (!job_exec_time(job)) {
+                if (compute_trace) {
+                    compute_trace->submitted_ns = compute_trace->completed_ns = clock_ns();
+                    sparf_trace_stamp(&compute_trace->observed_done);
+                }
+                continue;
+            }
+            NvmeRequest *child = g_new0(NvmeRequest, 1);
+            if (!sched_submit_internal(job, child, completion, job_exec_time(job), compute_trace)) {
+                g_free(child);
+                result = (uint64_t)-1;
+                break;
+            }
+            NvmeRequest *finished = NULL;
+            while (femu_ring_dequeue(completion, (void *)&finished, 1) != 1) usleep(10);
+            if (compute_trace) sparf_trace_stamp(&compute_trace->observed_done);
+            parent->stat.exec.runtime += finished->stat.exec.runtime;
+            parent->stat.exec.queueing_time += finished->stat.exec.queueing_time;
+            parent->stat.exec.nr_context_switch += finished->stat.exec.nr_context_switch;
+            bool failed = finished->cqe.status != NVME_SUCCESS;
+            g_free(finished);
+            if (failed) {
+                result = (uint64_t)-1;
+                break;
+            }
+        }
+    }
+finish:
+    if (state->ring) {
+        sparf_wait_physical(state);
+        state->resume = SPARF_RESUME_DONE;
+        run_functional_modeling(job);
+    }
+    if (completion) femu_ring_free(completion);
+    Slab *mrs_slab = memory_range_set_slab(parent->ns);
+    pthread_spin_lock(&mrs_slab->lock);
+    qatomic_dec(&memory_range_set_get(parent->ns, state->rsid)->in_use);
+    pthread_spin_unlock(&mrs_slab->lock);
+    if (state->group_session) {
+        struct cemu_sparf_workflow_header *header = job->args.data_buffer;
+        struct cemu_sparf_group_binding binding;
+        memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
+        sparf_group_unbind(state->group_session, header, &binding);
+    }
+    g_free(state);
+    parent->cqe.res64 = result;
+    parent->stat.expire_time = clock_ns();
+    parent->stat.reqlat = parent->stat.expire_time - parent->stat.stime;
+    parent->cqe.n.rsvd = parent->stat.exec.queueing_time;
+    parent->status = result == (uint64_t)-1 ? NVME_INTERNAL_DEV_ERROR | NVME_DNR : NVME_SUCCESS;
+    if (trace) {
+        sparf_trace_stamp(&trace->ready);
+        sparf_auto_log(trace, job->args.data_buffer, parent->ns->ctrl->drive_id,
+                        job->program->pind, false, result);
+        for (int index = 0; index < 3; ++index) {
+            g_array_free(trace->computes[index].spans, TRUE);
+            g_free(trace->reads[index].io.lun_pages);
+            g_free(trace->reads[index].io.lun_initial_wait_ns);
+        }
+        g_free(trace);
+    }
+    sched_release_autonomous(job);
+    parent->job = NULL;
+    qatomic_dec(&namespace->sparf_autonomous_active);
+    while (femu_ring_enqueue(parent->ns->ctrl->to_poller[1], (void *)&parent, 1) != 1) usleep(10);
+    return NULL;
+}
+
+typedef struct SparfAutonomousWorker {
+    ComputeNamespace *namespace;
+    QemuThread thread;
+    unsigned int index;
+} SparfAutonomousWorker;
+
+static void *sparf_autonomous_worker(void *opaque)
+{
+    SparfAutonomousWorker *worker = opaque;
+    ComputeNamespace *namespace = worker->namespace;
+    for (;;) {
+        ComputeJob *job = NULL;
+        qemu_sem_wait(&namespace->sparf_autonomous_wakeup);
+        if (femu_ring_dequeue(namespace->sparf_autonomous_queue, (void *)&job, 1) == 1) {
+            job->permited_cu_mask = UINT64_C(1) << (worker->index % namespace->ce->nr_cu);
+            if (job->sparf_autonomous->timeline) {
+                job->sparf_autonomous->timeline->engine = worker->index;
+            }
+            sparf_autonomous_main(job);
+        }
+    }
+    return NULL;
+}
+
+static bool sparf_autonomous_start_workers(ComputeNamespace *namespace)
+{
+    pthread_mutex_lock(&namespace->sparf_autonomous_lock);
+    if (namespace->sparf_autonomous_queue) {
+        pthread_mutex_unlock(&namespace->sparf_autonomous_lock);
+        return true;
+    }
+
+    unsigned int workers = namespace->params->sparf_engines;
+    namespace->sparf_autonomous_queue = femu_ring_create(
+        FEMU_RING_TYPE_MP_MC, 128);
+    if (!namespace->sparf_autonomous_queue) {
+        pthread_mutex_unlock(&namespace->sparf_autonomous_lock);
+        return false;
+    }
+
+    namespace->sparf_autonomous_workers = g_new0(SparfAutonomousWorker, workers);
+    qemu_sem_init(&namespace->sparf_autonomous_wakeup, 0);
+    for (unsigned int index = 0; index < workers; ++index) {
+        SparfAutonomousWorker *worker = &namespace->sparf_autonomous_workers[index];
+        worker->namespace = namespace;
+        worker->index = index;
+        char name[32];
+        snprintf(name, sizeof(name), "cemu-sparf-%u", index);
+        qemu_thread_create(&worker->thread, name,
+                           sparf_autonomous_worker, worker, QEMU_THREAD_DETACHED);
+    }
+    pthread_mutex_unlock(&namespace->sparf_autonomous_lock);
+    return true;
+}
+
+static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, uint16_t rsid)
+{
+    ComputeNamespace *namespace = compute_ns(request->ns);
+    NvmeProgramExecuteCmd *command = (NvmeProgramExecuteCmd *)&request->cmd;
+    Slab *mrs_slab = memory_range_set_slab(request->ns);
+    MemoryRangeSet *mrs = NULL;
+    SsdBackend **backends = NULL;
+    void **device_addresses = NULL;
+    bool admitted = false, referenced = false, pinned = false;
+    SparfGroupSession *group_session = NULL;
+    uint16_t status = NVME_INVALID_FIELD;
+    if (!rsid || rsid > MAX_RSID || le32_to_cpu(command->numr) ||
+        program->is_indirect ||
+        le32_to_cpu(command->group) >= MAX_JOB_GROUPS ||
+        !job_group_get(namespace->ce, le32_to_cpu(command->group))) goto reject;
+    status = NVME_INTERNAL_DEV_ERROR;
+    if (!sparf_autonomous_start_workers(namespace)) goto reject;
+    status = NVME_PROGRAM_IN_USE;
+    unsigned int active;
+    do {
+        active = qatomic_read(&namespace->sparf_autonomous_active);
+        if (active >= 64) goto reject;
+    } while (qatomic_cmpxchg(&namespace->sparf_autonomous_active, active, active + 1) != active);
+    admitted = true;
+    pthread_mutex_lock(&program->lock);
+    if (program->state != PROGRAM_STATE_ACTIVATED) {
+        pthread_mutex_unlock(&program->lock);
+        goto reject;
+    }
+    qatomic_inc(&program->jobs_running);
+    referenced = true;
+    pthread_mutex_unlock(&program->lock);
+    pthread_spin_lock(&mrs_slab->lock);
+    mrs = memory_range_set_get(request->ns, rsid);
+    if (!mrs || qatomic_read(&mrs->in_use) || mrs->numr != CEMU_SPARF_WORKFLOW_RANGES) {
+        pthread_spin_unlock(&mrs_slab->lock);
+        status = NVME_MR_SET_IN_USE;
+        goto reject;
+    }
+    qatomic_inc(&mrs->in_use);
+    pinned = true;
+    pthread_spin_unlock(&mrs_slab->lock);
+    status = NVME_INVALID_FIELD;
+    if (!validate_sparf_workflow(program, CEMU_SPARF_WORKFLOW_COMMAND, mrs->numr,
+                                  mrs->mr_len, request->data_buffer,
+                                  le32_to_cpu(command->dlen), request->ns->ctrl)) goto reject;
+    struct cemu_sparf_workflow_header *header = request->data_buffer;
+    if (header->flags & CEMU_SPARF_WORKFLOW_GROUPED) {
+        struct cemu_sparf_group_binding binding;
+        memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
+        pthread_mutex_lock(&namespace->sparf_group_lock);
+        SparfGroupSession *session = namespace->sparf_group_session;
+        if (sparf_group_bind(session, header, &binding)) group_session = session;
+        pthread_mutex_unlock(&namespace->sparf_group_lock);
+        if (!group_session) goto reject;
+    }
+    backends = g_new0(SsdBackend *, mrs->numr);
+    if (program->target == PROGRAM_TARGET_CUDA_DEVPTR) device_addresses = g_new0(void *, mrs->numr);
+    for (uint32_t range = 0; range < mrs->numr; ++range) {
+        backends[range] = mrs->mr[range].backend;
+        if (device_addresses) {
+            device_addresses[range] = backend_cuda_ensure_device_ptr(
+                backends[range], mrs->mr_addr[range], mrs->mr_len[range]);
+            if (!device_addresses[range]) {
+                status = NVME_INTERNAL_DEV_ERROR;
+                goto reject;
+            }
+        }
+    }
+    sched_alloc_job(namespace, request);
+    ComputeJob *job = request->job;
+    if (!job) {
+        status = NVME_INTERNAL_DEV_ERROR;
+        goto reject;
+    }
+    job->program = program;
+    job->mr_backend = backends;
+    job->args.numr = mrs->numr;
+    job->args.mr_addr = mrs->mr_addr;
+    job->args.mr_len = mrs->mr_len;
+    job->args.mr_dev_addr = device_addresses;
+    job->owns_mr_dev_addr = device_addresses != NULL;
+    job->args.cparam1 = CEMU_SPARF_WORKFLOW_COMMAND;
+    job->args.cparam2 = le64_to_cpu(command->cparam2);
+    job->args.data_buffer = request->data_buffer;
+    job->args.buffer_len = le32_to_cpu(command->dlen);
+    job->sparf_autonomous = g_new0(SparfAutonomous, 1);
+    job->sparf_autonomous->group_session = group_session;
+    job->sparf_autonomous->rsid = rsid;
+    if (sparf_auto_log_fd() >= 0) {
+        SparfAutonomousTrace *trace = g_new0(SparfAutonomousTrace, 1);
+        trace->engine = -1;
+        trace->engines = namespace->params->sparf_engines;
+        trace->compute_units = namespace->ce->nr_cu;
+        trace->read_diagnostics = group_session && sparf_auto_read_diagnostics_enabled();
+        trace->group_write_order = group_session ?
+            (group_session->buffer->kind_major ? "kind" : "fifo") : NULL;
+        job->sparf_autonomous->timeline = trace;
+        for (int index = 0; index < 3; ++index) {
+            trace->computes[index].spans = g_array_new(FALSE, FALSE, sizeof(SparfCuSpan));
+        }
+        sparf_trace_stamp(&trace->admitted);
+        sparf_auto_log(trace, job->args.data_buffer, request->ns->ctrl->drive_id,
+                        program->pind, true, 0);
+    }
+    while (femu_ring_enqueue(namespace->sparf_autonomous_queue, (void *)&job, 1) != 1) usleep(10);
+    qemu_sem_post(&namespace->sparf_autonomous_wakeup);
+    return NVME_SUCCESS;
+reject:
+    if (group_session) {
+        struct cemu_sparf_workflow_header *header = request->data_buffer;
+        struct cemu_sparf_group_binding binding;
+        memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
+        sparf_group_unbind(group_session, header, &binding);
+    }
+    if (pinned) {
+        pthread_spin_lock(&mrs_slab->lock);
+        qatomic_dec(&mrs->in_use);
+        pthread_spin_unlock(&mrs_slab->lock);
+    }
+    if (referenced) qatomic_dec(&program->jobs_running);
+    if (admitted) qatomic_dec(&namespace->sparf_autonomous_active);
+    g_free(backends);
+    g_free(device_addresses);
+    free(request->data_buffer);
+    request->data_buffer = NULL;
+    return status;
+}
+
+typedef struct SparfWritebackRequest {
+    ComputeJob *job;
+    SparfWritebackPlan *plan;
+    struct rte_ring *completion;
+    uint16_t rsid;
+    uint64_t queued_host_ns;
+    bool grouped;
+} SparfWritebackRequest;
+
+static bool sparf_group_transfer(NvmeNamespace *namespace, struct rte_ring *completion,
+                                SparfWritebackPlan *plan, bool write, uint64_t *start, uint64_t *end)
+{
+    uint64_t host_start = plan->profile ? monotonic_ns() : 0;
+    NvmeNamespace *nvm = nvme_find_namespace(namespace->ctrl, 1);
+    if (!nvm || !nvm->params) return false;
+    NvmParams *parameters = nvm->params;
+    if (parameters->secs_per_pg <= 0 || parameters->secs_per_pg > UINT16_MAX) return false;
+    GArray *extents = g_array_new(FALSE, FALSE, sizeof(struct cemu_attention_workflow_extent));
+    for (guint index = 0; index < plan->sectors->len;) {
+        uint64_t first = g_array_index(plan->sectors, uint64_t, index);
+        guint count = sparf_wb_extent_sectors(plan->sectors, index, parameters->secs_per_pg);
+        struct cemu_attention_workflow_extent extent = { .slba = first, .nlb = count };
+        g_array_append_val(extents, extent);
+        index += count;
+    }
+    NvmeRequest *request = g_new0(NvmeRequest, 1);
+    request->ns = namespace;
+    request->cmd.nsid = cpu_to_le32(3);
+    request->mem_ctrl = namespace->ctrl;
+    request->sdaddr = plan->image;
+    request->is_write = write;
+    request->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+    request->nr_sres = extents->len;
+    request->sres = g_new0(NvmeCopyFormat, extents->len);
+    if (write && plan->kv_pages && plan->kv_pages->len) {
+        request->kv_pages = g_new(CemuKvPageTag, plan->kv_pages->len);
+        memcpy(request->kv_pages, plan->kv_pages->data,
+               sizeof(CemuKvPageTag) * plan->kv_pages->len);
+        request->nr_kv_pages = plan->kv_pages->len;
+    }
+    request->indirect_task.ring = completion;
+    *start = clock_ns();
+    request->stat.stime = request->stat.expire_time = *start;
+    for (guint index = 0; index < extents->len; ++index) {
+        struct cemu_attention_workflow_extent extent = g_array_index(extents, struct cemu_attention_workflow_extent, index);
+        request->sres[index].cf2.snsid = cpu_to_le32(1);
+        request->sres[index].cf2.slba = cpu_to_le64(extent.slba);
+        request->sres[index].cf2.nlb = cpu_to_le16(extent.nlb - 1);
+    }
+    g_array_free(extents, TRUE);
+    if (femu_ring_enqueue(namespace->ctrl->to_ftl[1], (void *)&request, 1) != 1) {
+        attention_free_read(request);
+        return false;
+    }
+    bool success = attention_wait_read(completion, request);
+    *end = request->stat.expire_time;
+    uint64_t data_ready = plan->profile ? monotonic_ns() : 0;
+    if (success) while (clock_ns() < *end) usleep(10);
+    if (plan->profile) {
+        uint64_t target_wait = monotonic_ns() - data_ready;
+        if (write) {
+            plan->diagnostics.write_service_host_ns = data_ready - host_start;
+            plan->diagnostics.write_target_wait_host_ns = target_wait;
+        } else {
+            plan->diagnostics.read_service_host_ns = data_ready - host_start;
+            plan->diagnostics.read_target_wait_host_ns = target_wait;
+        }
+    }
+    attention_free_read(request);
+    return success;
+}
+
+static bool sparf_wb_transfer(void *opaque, SparfWritebackPlan *plan, bool write,
+                              uint64_t *start, uint64_t *end)
+{
+    SparfWritebackRequest *work = opaque;
+    return sparf_group_transfer(work->job->req->ns, work->completion, plan, write, start, end);
+}
+
+typedef struct SparfGroupBackground {
+    NvmeNamespace *namespace;
+    struct rte_ring *completion;
+    SsdBackend *backend;
+    uint16_t rsid;
+} SparfGroupBackground;
+
+static bool sparf_group_background_transfer(void *opaque, SparfWritebackPlan *plan, bool write,
+                                            uint64_t *start, uint64_t *end)
+{
+    SparfGroupBackground *background = opaque;
+    return sparf_group_transfer(background->namespace, background->completion, plan, write, start, end);
+}
+
+static void sparf_group_background_dirty(void *opaque, uint8_t *address, uint64_t bytes)
+{
+    SparfGroupBackground *background = opaque;
+    backend_cuda_mark_host_dirty(background->backend, address, bytes);
+}
+
+static void sparf_group_background_release(void *opaque)
+{
+    SparfGroupBackground *background = opaque;
+    Slab *slab = memory_range_set_slab(background->namespace);
+    pthread_spin_lock(&slab->lock);
+    qatomic_dec(&memory_range_set_get(background->namespace, background->rsid)->in_use);
+    pthread_spin_unlock(&slab->lock);
+    femu_ring_free(background->completion);
+    g_free(background);
+}
+
+static void *sparf_writeback_worker(void *opaque)
+{
+    ComputeNamespace *namespace = opaque;
+    for (;;) {
+        qemu_sem_wait(&namespace->sparf_writeback_wakeup);
+        SparfWritebackRequest *work = NULL;
+        if (femu_ring_dequeue(namespace->sparf_writeback_queue, (void *)&work, 1) != 1) continue;
+        ComputeJob *job = work->job;
+        NvmeRequest *parent = job->req;
+        struct cemu_sparf_writeback_result result = {0};
+        struct cemu_sparf_group_result grouped_result = {0};
+        struct cemu_sparf_group_progress progress = {0};
+        bool profile = work->plan && work->plan->profile;
+        uint64_t started = profile ? monotonic_ns() : 0;
+        if (profile) work->plan->diagnostics.queue_host_ns = started - work->queued_host_ns;
+        uint32_t group_operation = work->grouped ?
+            ((struct cemu_sparf_group_header *)job->args.data_buffer)->operation : 0;
+        bool needs_input = !work->grouped || group_operation == CEMU_SPARF_GROUP_PUT ||
+            group_operation == CEMU_SPARF_GROUP_APPEND || group_operation == CEMU_SPARF_GROUP_APPEND_BATCH;
+        bool success = !needs_input ||
+            backend_cuda_prepare_host(job->mr_backend[0], job->args.mr_addr[0], job->args.mr_len[0]) == 0;
+        if (profile) work->plan->diagnostics.prepare_host_ns = monotonic_ns() - started;
+        if (success && work->grouped) {
+            NvmeNamespace *nvm = nvme_find_namespace(parent->ns->ctrl, 1);
+            NvmParams *parameters = nvm->params;
+            pthread_mutex_lock(&namespace->sparf_group_lock);
+            if (namespace->sparf_group_session && namespace->sparf_group_owner != job->program->pind) {
+                success = false;
+            } else if (group_operation == CEMU_SPARF_GROUP_REGISTER_BUFFER) {
+                success = false;
+                if (!namespace->sparf_group_session && job->args.numr == 3 &&
+                    backend_cuda_prepare_host(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]) == 0) {
+                    SparfGroupBackground *background = g_new0(SparfGroupBackground, 1);
+                    background->namespace = parent->ns;
+                    background->backend = job->mr_backend[2];
+                    background->rsid = work->rsid;
+                    background->completion = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
+                    if (background->completion) {
+                        namespace->sparf_group_session = sparf_group_buffer_register(
+                            job->args.data_buffer, job->args.buffer_len, nvm->backend->size,
+                            parameters->secsz * parameters->secs_per_pg, job->args.mr_addr[2], job->args.mr_len[2],
+                            sparf_group_background_transfer, sparf_group_background_dirty,
+                            sparf_group_background_release, background);
+                    }
+                    success = namespace->sparf_group_session != NULL;
+                    if (success) {
+                        Slab *slab = memory_range_set_slab(parent->ns);
+                        pthread_spin_lock(&slab->lock);
+                        qatomic_inc(&memory_range_set_get(parent->ns, work->rsid)->in_use);
+                        pthread_spin_unlock(&slab->lock);
+                        namespace->sparf_group_rsid = work->rsid;
+                        namespace->sparf_group_owner = job->program->pind;
+                        progress.buffer_bytes = namespace->sparf_group_session->buffer->bytes;
+                        grouped_result.version = CEMU_SPARF_GROUP_VERSION;
+                    } else {
+                        if (background->completion) femu_ring_free(background->completion);
+                        g_free(background);
+                    }
+                }
+            } else {
+                success = sparf_group_buffer_execute(&namespace->sparf_group_session,
+                    job->args.data_buffer, job->args.buffer_len, job->args.mr_addr[0], job->args.mr_len[0],
+                    nvm->backend->size, parameters->secsz * parameters->secs_per_pg,
+                    sparf_wb_transfer, work, &grouped_result, &progress);
+                if (success && namespace->sparf_group_session) namespace->sparf_group_owner = job->program->pind;
+                if (!namespace->sparf_group_session) namespace->sparf_group_rsid = 0;
+            }
+            pthread_mutex_unlock(&namespace->sparf_group_lock);
+            if (success && grouped_result.output_bytes) {
+                backend_cuda_mark_host_dirty(job->mr_backend[0], job->args.mr_addr[0], grouped_result.output_bytes);
+            }
+            result = grouped_result.io;
+        } else if (success) success = sparf_wb_run(work->plan, job->args.data_buffer, job->args.mr_addr[0],
+                                            sparf_wb_transfer, work, &result);
+        result.ready = clock_ns();
+        memcpy(job->args.mr_addr[1], &result, sizeof(result));
+        size_t result_bytes = sizeof(result);
+        if (work->grouped) {
+            grouped_result.io = result;
+            memcpy(job->args.mr_addr[1], &grouped_result, sizeof(grouped_result));
+            result_bytes = sizeof(grouped_result);
+            if (job->args.numr == 3) {
+                memcpy((uint8_t *)job->args.mr_addr[1] + result_bytes, &progress, sizeof(progress));
+                result_bytes += sizeof(progress);
+            }
+        } else if (profile) {
+            memcpy((uint8_t *)job->args.mr_addr[1] + result_bytes, &work->plan->diagnostics,
+                   sizeof(work->plan->diagnostics));
+            result_bytes += sizeof(work->plan->diagnostics);
+        }
+        backend_cuda_mark_host_dirty(job->mr_backend[1], job->args.mr_addr[1], result_bytes);
+        parent->cqe.res64 = success ? 0 : UINT64_MAX;
+        parent->status = success ? NVME_SUCCESS : NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+        parent->stat.expire_time = clock_ns();
+        parent->stat.reqlat = parent->stat.expire_time - parent->stat.stime;
+        Slab *slab = memory_range_set_slab(parent->ns);
+        pthread_spin_lock(&slab->lock);
+        qatomic_dec(&memory_range_set_get(parent->ns, work->rsid)->in_use);
+        pthread_spin_unlock(&slab->lock);
+        sparf_wb_free(work->plan);
+        femu_ring_free(work->completion);
+        g_free(work);
+        sched_release_autonomous(job);
+        parent->job = NULL;
+        qatomic_set(&namespace->sparf_writeback_active, 0);
+        while (femu_ring_enqueue(parent->ns->ctrl->to_poller[1], (void *)&parent, 1) != 1) usleep(10);
+    }
+    return NULL;
+}
+
+static uint16_t sparf_submit_writeback(NvmeRequest *request, Program *program, uint16_t rsid)
+{
+    ComputeNamespace *namespace = compute_ns(request->ns);
+    NvmeProgramExecuteCmd *command = (NvmeProgramExecuteCmd *)&request->cmd;
+    NvmeNamespace *nvm = nvme_find_namespace(request->ns->ctrl, 1);
+    Slab *slab = memory_range_set_slab(request->ns);
+    MemoryRangeSet *mrs = NULL;
+    SparfWritebackRequest *work = NULL;
+    bool active = false, referenced = false, pinned = false;
+    bool grouped = le64_to_cpu(command->cparam1) == CEMU_SPARF_GROUP_COMMAND;
+    uint16_t status = NVME_INVALID_FIELD;
+    if (!rsid || rsid > MAX_RSID || le32_to_cpu(command->numr) || program->is_indirect ||
+        request->ns->ctrl->internal_bandwidth || !nvm || !nvm->backend ||
+        nvm->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX(nvm->id_ns.flbas)].lbads != 9) goto reject;
+    if (grouped && (nvm->csi != NVME_CSI_NVM || !nvm->ops ||
+        nvm->ops != command_set_ops[NVME_CSI_NVM] || !nvm->params || !nvm->private)) {
+        femu_err("sparf-group: NVM namespace is not an initialized registered NVM backend\n");
+        goto reject;
+    }
+    if (grouped) {
+        NvmParams *parameters = nvm->params;
+        if (parameters->secsz != 512 || parameters->secs_per_pg <= 0 || parameters->secs_per_pg > 128) goto reject;
+    }
+    status = NVME_PROGRAM_IN_USE;
+    if (qatomic_cmpxchg(&namespace->sparf_writeback_active, 0, 1)) goto reject;
+    active = true;
+    pthread_mutex_lock(&program->lock);
+    if (program->state != PROGRAM_STATE_ACTIVATED) {
+        pthread_mutex_unlock(&program->lock);
+        goto reject;
+    }
+    qatomic_inc(&program->jobs_running);
+    referenced = true;
+    pthread_mutex_unlock(&program->lock);
+    pthread_mutex_lock(&namespace->sparf_group_lock);
+    unsigned retained = grouped && namespace->sparf_group_rsid == rsid &&
+        namespace->sparf_group_owner == program->pind ? 1 : 0;
+    bool wrong_group_mrs = grouped && namespace->sparf_group_rsid &&
+        namespace->sparf_group_owner == program->pind && namespace->sparf_group_rsid != rsid;
+    pthread_mutex_unlock(&namespace->sparf_group_lock);
+    if (wrong_group_mrs) goto reject;
+    pthread_spin_lock(&slab->lock);
+    mrs = memory_range_set_get(request->ns, rsid);
+    if (!mrs || (mrs->numr != 2 && !(grouped && mrs->numr == 3)) ||
+        qatomic_read(&mrs->in_use) != retained || mrs->mr_len[0] <= 0 ||
+        mrs->mr_len[1] < (grouped ? sizeof(struct cemu_sparf_group_result) : sizeof(struct cemu_sparf_writeback_result))) {
+        pthread_spin_unlock(&slab->lock);
+        goto reject;
+    }
+    qatomic_inc(&mrs->in_use);
+    pinned = true;
+    pthread_spin_unlock(&slab->lock);
+    status = NVME_INVALID_FIELD;
+    work = g_new0(SparfWritebackRequest, 1);
+    work->grouped = grouped;
+    if (grouped) {
+        if (le32_to_cpu(command->dlen) < sizeof(struct cemu_sparf_group_header) ||
+            le32_to_cpu(command->dlen) > sizeof(struct cemu_sparf_group_header) +
+                CEMU_SPARF_GROUP_MAX_EXTENTS * sizeof(struct cemu_sparf_group_extent)) goto reject;
+        uintptr_t input = (uintptr_t)mrs->mr_addr[0], output = (uintptr_t)mrs->mr_addr[1];
+        if (input <= output ? output - input < mrs->mr_len[0] : input - output < mrs->mr_len[1]) goto reject;
+        if (mrs->numr == 3) {
+            if (mrs->mr_len[2] <= 0 || mrs->mr_len[1] < sizeof(struct cemu_sparf_group_result) +
+                sizeof(struct cemu_sparf_group_progress)) goto reject;
+            uintptr_t storage = (uintptr_t)mrs->mr_addr[2];
+            for (int index = 0; index < 2; ++index) {
+                uintptr_t other = (uintptr_t)mrs->mr_addr[index];
+                if (storage <= other ? other - storage < mrs->mr_len[2] : storage - other < mrs->mr_len[index]) goto reject;
+            }
+        }
+    } else {
+        work->plan = sparf_wb_plan(request->data_buffer, le32_to_cpu(command->dlen),
+                              mrs->mr_len[0], nvm->backend->size);
+        if (!work->plan) goto reject;
+        if (work->plan->profile && mrs->mr_len[1] < sizeof(struct cemu_sparf_writeback_result) +
+                                             sizeof(struct cemu_sparf_writeback_diagnostics)) goto reject;
+    }
+    work->completion = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
+    if (!work->completion) goto reject;
+    if (!namespace->sparf_writeback_queue) {
+        namespace->sparf_writeback_queue = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
+        if (!namespace->sparf_writeback_queue) goto reject;
+        QemuThread thread;
+        qemu_sem_init(&namespace->sparf_writeback_wakeup, 0);
+        qemu_thread_create(&thread, "cemu-kv-writeback", sparf_writeback_worker, namespace, QEMU_THREAD_DETACHED);
+    }
+    sched_alloc_job(namespace, request);
+    if (!request->job) goto reject;
+    ComputeJob *job = request->job;
+    job->program = program;
+    job->args.numr = mrs->numr;
+    job->args.mr_addr = mrs->mr_addr;
+    job->args.mr_len = mrs->mr_len;
+    job->args.data_buffer = request->data_buffer;
+    job->args.buffer_len = le32_to_cpu(command->dlen);
+    job->mr_backend = g_new0(SsdBackend *, mrs->numr);
+    for (int index = 0; index < mrs->numr; ++index) job->mr_backend[index] = mrs->mr[index].backend;
+    work->job = job;
+    work->rsid = rsid;
+    work->queued_host_ns = work->plan && work->plan->profile ? monotonic_ns() : 0;
+    while (femu_ring_enqueue(namespace->sparf_writeback_queue, (void *)&work, 1) != 1) usleep(10);
+    qemu_sem_post(&namespace->sparf_writeback_wakeup);
+    return NVME_SUCCESS;
+reject:
+    if (work) {
+        sparf_wb_free(work->plan);
+        if (work->completion) femu_ring_free(work->completion);
+        g_free(work);
+    }
+    if (pinned) {
+        pthread_spin_lock(&slab->lock);
+        qatomic_dec(&mrs->in_use);
+        pthread_spin_unlock(&slab->lock);
+    }
+    if (referenced) qatomic_dec(&program->jobs_running);
+    if (active) qatomic_set(&namespace->sparf_writeback_active, 0);
+    g_free(request->data_buffer);
+    request->data_buffer = NULL;
+    return status;
 }
 
 static int compute_io_cmd(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
@@ -2635,6 +3258,14 @@ static int compute_decode_params(const cJSON *json, NvmeNamespace *ns)
 
     DECODE_PARAM(json, "nr_cu", Number, params->nr_cu, 4);
     DECODE_PARAM(json, "nr_thread", Number, params->nr_thread, 4);
+    double sparf_engines;
+    DECODE_PARAM(json, "sparf_engines", Number, sparf_engines, 1);
+    if (!isfinite(sparf_engines) || sparf_engines < 1 || sparf_engines > 64 ||
+        sparf_engines != (unsigned int)sparf_engines) {
+        femu_err("sparf_engines must be an integer in [1, 64]\n");
+        return -1;
+    }
+    params->sparf_engines = sparf_engines;
     DECODE_PARAM(json, "time_slice", Number, params->csf_sched_option.time_slice, 200000);
     DECODE_PARAM(json, "context_switch_time", Number, params->csf_sched_option.context_switch_time, 200);
     DECODE_PARAM(json, "csf_runtime_scale", Number, params->csf_runtime_scale, 3);
@@ -2652,6 +3283,7 @@ static int compute_encode_params(cJSON *json, NvmeNamespace *ns)
 
     ENCODE_PARAM(json, "nr_cu", Number, params->nr_cu);
     ENCODE_PARAM(json, "nr_thread", Number, params->nr_thread);
+    ENCODE_PARAM(json, "sparf_engines", Number, params->sparf_engines);
     ENCODE_PARAM(json, "time_slice", Number, params->csf_sched_option.time_slice);
     ENCODE_PARAM(json, "context_switch_time", Number, params->csf_sched_option.context_switch_time);
     ENCODE_PARAM(json, "csf_runtime_scale", Number, params->csf_runtime_scale);

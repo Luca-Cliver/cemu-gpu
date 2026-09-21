@@ -142,9 +142,8 @@ static void ssd_init_lines(NvmNamespace *nns)
     lm->full_line_cnt = 0;
 }
 
-static void ssd_init_write_pointer(NvmNamespace *nns)
+static void ssd_init_write_pointer(NvmNamespace *nns, struct write_pointer *wpp)
 {
-    struct write_pointer *wpp = &nns->wp;
     struct line_mgmt *lm = &nns->lm;
     struct line *curline = NULL;
 
@@ -157,7 +156,7 @@ static void ssd_init_write_pointer(NvmNamespace *nns)
     wpp->ch = 0;
     wpp->lun = 0;
     wpp->pg = 0;
-    wpp->blk = 0;
+    wpp->blk = curline->id;
     wpp->pl = 0;
 }
 
@@ -182,10 +181,9 @@ static struct line *get_next_free_line(NvmNamespace *nns)
     return curline;
 }
 
-static void ssd_advance_write_pointer(NvmNamespace *nns)
+static void ssd_advance_write_pointer(NvmNamespace *nns, struct write_pointer *wpp)
 {
     NvmParams *params = nns->params;
-    struct write_pointer *wpp = &nns->wp;
     struct line_mgmt *lm = &nns->lm;
 
     check_addr(wpp->ch, params->nchs);
@@ -237,9 +235,8 @@ static void ssd_advance_write_pointer(NvmNamespace *nns)
     }
 }
 
-static struct ppa get_new_page(NvmNamespace *nns)
+static struct ppa get_new_page(const struct write_pointer *wpp)
 {
-    struct write_pointer *wpp = &nns->wp;
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
@@ -326,6 +323,47 @@ static void ssd_init_rmap(NvmNamespace *nns)
     }
 }
 
+static void ssd_init_kv_tags(NvmNamespace *nns)
+{
+    const char *mode = getenv("CEMU_SPARF_FTL_PLACEMENT");
+    const char *trace = getenv("CEMU_SPARF_FTL_TRACE");
+    uint64_t pages = nns->params->tt_pgs;
+    bool placement = mode && !strcmp(mode, "kv_group");
+    bool tracing = trace && trace[0];
+    if (!placement && !tracing) return;
+    nns->kv_lpn_kind = g_malloc(pages);
+    if (tracing) {
+        nns->kv_lpn_stream = g_malloc0(sizeof(*nns->kv_lpn_stream) * pages);
+        nns->kv_lpn_cookie = g_malloc0(sizeof(*nns->kv_lpn_cookie) * pages);
+        nns->kv_lpn_group = g_malloc0(sizeof(*nns->kv_lpn_group) * pages);
+        nns->kv_lpn_page = g_malloc0(sizeof(*nns->kv_lpn_page) * pages);
+    }
+    memset(nns->kv_lpn_kind, UINT8_MAX, nns->params->tt_pgs);
+}
+
+static bool kv_group_placement_enabled(void)
+{
+    static gsize initialized;
+    static bool enabled;
+    if (g_once_init_enter(&initialized)) {
+        const char *mode = getenv("CEMU_SPARF_FTL_PLACEMENT");
+        enabled = mode && !strcmp(mode, "kv_group");
+        femu_log("CEMU SparF FTL placement: %s", enabled ? "kv_group" : "fifo");
+        g_once_init_leave(&initialized, 1);
+    }
+    return enabled;
+}
+
+static struct write_pointer *kv_write_pointer(NvmNamespace *nns, uint32_t kind)
+{
+    if (kind > CEMU_KV_PAGE_TOKEN_V) return &nns->wp;
+    if (!nns->kv_wp_initialized[kind]) {
+        ssd_init_write_pointer(nns, &nns->kv_wp[kind]);
+        nns->kv_wp_initialized[kind] = true;
+    }
+    return &nns->kv_wp[kind];
+}
+
 static int cache_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr) {
     return (next > curr);
 }
@@ -367,7 +405,8 @@ void ftl_init(NvmeNamespace *ns)
     ssd_init_lines(nns);
 
     /* initialize write pointer, this is how we allocate new pages for writes */
-    ssd_init_write_pointer(nns);
+    ssd_init_write_pointer(nns, &nns->wp);
+    ssd_init_kv_tags(nns);
 
     nns->cache_pq = pqueue_init(1024ULL*128, cache_cmp_pri, cache_get_pri, cache_set_pri, cache_get_pos, cache_set_pos);
     if (!nns->cache_pq) {
@@ -624,9 +663,15 @@ static uint64_t gc_write_page(NvmNamespace *nns, struct ppa *old_ppa)
     struct ppa new_ppa;
     struct nand_lun *new_lun;
     uint64_t lpn = get_rmap_ent(nns, old_ppa);
+    uint8_t kind;
+    struct write_pointer *wpp = &nns->wp;
 
     assert(valid_lpn(nns, lpn));
-    new_ppa = get_new_page(nns);
+    kind = nns->kv_lpn_kind ? nns->kv_lpn_kind[lpn] : UINT8_MAX;
+    if (kv_group_placement_enabled() && kind <= CEMU_KV_PAGE_TOKEN_V) {
+        wpp = kv_write_pointer(nns, kind);
+    }
+    new_ppa = get_new_page(wpp);
     /* update maptbl */
     set_maptbl_ent(nns, lpn, &new_ppa);
     /* update rmap */
@@ -635,7 +680,7 @@ static uint64_t gc_write_page(NvmNamespace *nns, struct ppa *old_ppa)
     mark_page_valid(nns, &new_ppa);
 
     /* need to advance the write pointer here */
-    ssd_advance_write_pointer(nns);
+    ssd_advance_write_pointer(nns, wpp);
 
     if (nns->params->enable_gc_delay) {
         struct nand_cmd gcw;
@@ -759,7 +804,13 @@ static int do_gc(NvmNamespace *nns, bool force)
     return 0;
 }
 
-static uint64_t ssd_read(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_t stime)
+static FILE *kv_trace_file(void);
+static void kv_trace_read(FILE *trace, NvmNamespace *nns, uint64_t lpn,
+                          const struct ppa *ppa, uint64_t wait_ns,
+                          uint64_t service_ns);
+
+static uint64_t ssd_read(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_t stime,
+                         FemuReadObservation *observation)
 {
     NvmParams *params = nns->params;
     uint64_t lba = slba;
@@ -769,15 +820,25 @@ static uint64_t ssd_read(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_
     uint64_t end_lpn = (lba + nsecs - 1) / params->secs_per_pg;
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
+    FILE *kv_trace = kv_trace_file();
 
     if (end_lpn >= params->tt_pgs) {
         femu_err("ssd_read start_lpn=%"PRIu64",tt_pgs=%lld\n", start_lpn, nns->params->tt_pgs);
     }
 
+    if (observation && !observation->lun_pages) {
+        observation->channels = params->nchs;
+        observation->luns_per_channel = params->luns_per_ch;
+        observation->page_bytes = params->secsz * params->secs_per_pg;
+        observation->page_read_ns = params->pg_rd_lat;
+        observation->lun_pages = g_new0(uint64_t, params->nchs * params->luns_per_ch);
+        observation->lun_initial_wait_ns = g_new0(uint64_t, params->nchs * params->luns_per_ch);
+    }
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(nns, lpn);
         if (!mapped_ppa(&ppa) || !valid_ppa(nns, &ppa)) {
+            if (observation) observation->unmapped_pages++;
             femu_log("%s,lpn(%" PRId64 ") not mapped to valid ppa!\n", nns->ssdname, lpn);
             // ppa.ppa = lpn;
             // printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", nns->ssdname, lpn);
@@ -791,6 +852,11 @@ static uint64_t ssd_read(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_
         srd.cmd = NAND_READ;
         srd.stime = stime;
         sublat = ssd_advance_status(nns, &ppa, &srd);
+        femu_observe_page_read(observation,
+            ppa.g.ch * params->luns_per_ch + ppa.g.lun, params->pg_rd_lat, sublat);
+        kv_trace_read(kv_trace, nns, lpn, &ppa,
+                      sublat > params->pg_rd_lat ? sublat - params->pg_rd_lat : 0,
+                      params->pg_rd_lat);
         maxlat = MAX(sublat, maxlat);
     }
 
@@ -799,7 +865,83 @@ static uint64_t ssd_read(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_
     return maxlat;
 }
 
-static uint64_t ssd_write(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_t stime)
+static FILE *kv_trace_file(void)
+{
+    static FILE *trace;
+    static gsize initialized;
+    if (g_once_init_enter(&initialized)) {
+        const char *path = getenv("CEMU_SPARF_FTL_TRACE");
+        if (path && path[0]) {
+            trace = fopen(path, "w");
+            if (trace) setvbuf(trace, NULL, _IOLBF, 0);
+        }
+        g_once_init_leave(&initialized, 1);
+    }
+    return trace;
+}
+
+static const CemuKvPageTag *kv_page_tag_for_lba(const CemuKvPageTag *tags,
+                                                uint32_t count, uint64_t lba)
+{
+    uint32_t first = 0, last = count;
+    while (first < last) {
+        uint32_t middle = first + (last - first) / 2;
+        if (tags[middle].slba < lba) first = middle + 1;
+        else last = middle;
+    }
+    return first < count && tags[first].slba == lba ? &tags[first] : NULL;
+}
+
+static void kv_trace_write(FILE *trace, NvmNamespace *nns, const CemuKvPageTag *tag, uint64_t lpn,
+                           const struct ppa *ppa)
+{
+    if (!trace || !tag || tag->kind > CEMU_KV_PAGE_TOKEN_V) return;
+    fprintf(trace,
+            "op=write controller=%d nsid=%u cookie=%" PRIu64
+            " lpn=%" PRIu64 " slba=%" PRIu64 " kind=%u stream=%" PRIu64
+            " group=%" PRIu64 " page_in_group=%u ppa=0x%016" PRIx64
+            " ch=%u lun=%u pl=%u blk=%u pg=%u\n",
+            nns->namespace->ctrl->drive_id, nns->namespace->id, tag->cookie,
+            lpn, tag->slba, tag->kind, tag->stream, tag->group,
+            tag->page_in_group, ppa->ppa, ppa->g.ch, ppa->g.lun,
+            ppa->g.pl, ppa->g.blk, ppa->g.pg);
+}
+
+static bool kv_trace_reads_enabled(void)
+{
+    static gsize initialized;
+    static bool enabled;
+    if (g_once_init_enter(&initialized)) {
+        const char *value = getenv("CEMU_SPARF_FTL_TRACE_READS");
+        enabled = value && (!strcmp(value, "1") || !strcmp(value, "true"));
+        g_once_init_leave(&initialized, 1);
+    }
+    return enabled;
+}
+
+static void kv_trace_read(FILE *trace, NvmNamespace *nns, uint64_t lpn,
+                          const struct ppa *ppa, uint64_t wait_ns,
+                          uint64_t service_ns)
+{
+    uint8_t kind = nns->kv_lpn_kind ? nns->kv_lpn_kind[lpn] : UINT8_MAX;
+    if (!trace || !kv_trace_reads_enabled()) return;
+    fprintf(trace,
+            "op=read controller=%d nsid=%u cookie=%" PRIu64
+            " lpn=%" PRIu64 " kind=%u stream=%" PRIu64
+            " group=%" PRIu64 " page_in_group=%u ppa=0x%016" PRIx64
+            " ch=%u lun=%u pl=%u blk=%u pg=%u wait_ns=%" PRIu64
+            " service_ns=%" PRIu64 "\n",
+            nns->namespace->ctrl->drive_id, nns->namespace->id,
+            nns->kv_lpn_cookie ? nns->kv_lpn_cookie[lpn] : 0,
+            lpn, kind, nns->kv_lpn_stream ? nns->kv_lpn_stream[lpn] : 0,
+            nns->kv_lpn_group ? nns->kv_lpn_group[lpn] : 0,
+            nns->kv_lpn_page ? nns->kv_lpn_page[lpn] : 0, ppa->ppa,
+            ppa->g.ch, ppa->g.lun,
+            ppa->g.pl, ppa->g.blk, ppa->g.pg, wait_ns, service_ns);
+}
+
+static uint64_t ssd_write(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64_t stime,
+                          const CemuKvPageTag *kv_pages, uint32_t nr_kv_pages)
 {
     uint64_t lba = slba;
     NvmParams *params = nns->params;
@@ -809,6 +951,8 @@ static uint64_t ssd_write(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
+    FILE *kv_trace = kv_trace_file();
+    bool placement = kv_group_placement_enabled();
     int r;
     // int cache_used = 0;
     // uint64_t nand_max_lat = 0;
@@ -848,7 +992,31 @@ static uint64_t ssd_write(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64
         }
 
         /* new write */
-        ppa = get_new_page(nns);
+        const CemuKvPageTag *tag = (placement || kv_trace) ?
+            kv_page_tag_for_lba(kv_pages, nr_kv_pages, lpn * params->secs_per_pg) : NULL;
+        struct write_pointer *wpp = &nns->wp;
+        if (placement && tag &&
+            tag->kind <= CEMU_KV_PAGE_TOKEN_V) {
+            wpp = kv_write_pointer(nns, tag->kind);
+        }
+        if (tag && tag->kind <= CEMU_KV_PAGE_TOKEN_V && nns->kv_lpn_kind) {
+            nns->kv_lpn_kind[lpn] = tag->kind;
+            if (nns->kv_lpn_stream) {
+                nns->kv_lpn_stream[lpn] = tag->stream;
+                nns->kv_lpn_cookie[lpn] = tag->cookie;
+                nns->kv_lpn_group[lpn] = tag->group;
+                nns->kv_lpn_page[lpn] = tag->page_in_group;
+            }
+        } else if (nns->kv_lpn_kind) {
+            nns->kv_lpn_kind[lpn] = UINT8_MAX;
+            if (nns->kv_lpn_stream) {
+                nns->kv_lpn_stream[lpn] = 0;
+                nns->kv_lpn_cookie[lpn] = 0;
+                nns->kv_lpn_group[lpn] = 0;
+                nns->kv_lpn_page[lpn] = 0;
+            }
+        }
+        ppa = get_new_page(wpp);
         /* update maptbl */
         set_maptbl_ent(nns, lpn, &ppa);
         /* update rmap */
@@ -856,8 +1024,12 @@ static uint64_t ssd_write(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64
 
         mark_page_valid(nns, &ppa);
 
+        if (kv_trace) {
+            kv_trace_write(kv_trace, nns, tag, lpn, &ppa);
+        }
+
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(nns);
+        ssd_advance_write_pointer(nns, wpp);
 
         struct nand_cmd swr;
         swr.type = USER_IO;
@@ -947,9 +1119,10 @@ static uint64_t memory_copy_nvm(NvmeNamespace *ns, NvmeRequest *req)
         }
 #else
         if (req->is_write)
-            lat = ssd_write(nvm_ns(sns), slba, nlb, req->stat.stime);
+            lat = ssd_write(nvm_ns(sns), slba, nlb, req->stat.stime,
+                            req->kv_pages, req->nr_kv_pages);
         else
-            lat = ssd_read(nvm_ns(sns), slba, nlb, req->stat.stime);
+            lat = ssd_read(nvm_ns(sns), slba, nlb, req->stat.stime, req->read_observation);
 #endif
         femu_debug("memory_copy nvm%sfdm: lat %zu, cache left %d, stime %lu, slba %lu, nlb %u, snsid %u, soff %lu, nbyte %lu\n",
                     req->is_write ? "<-" : "->", lat, nvm_ns(sns)->cache_used, req->stat.stime, slba, nlb, snsid, off, nbyte);
@@ -1070,9 +1243,10 @@ static void *ftl_thread(void *arg)
                 struct memory_copy_req *mreq = &memcpy_queue.reqs[memcpy_queue.head];
                 req = mreq->req;
                 if (mreq->is_write) {
-                    lat = ssd_write(nvm_ns(ns), mreq->slba, mreq->nlb, mreq->ts);
+                    lat = ssd_write(nvm_ns(ns), mreq->slba, mreq->nlb, mreq->ts,
+                                    req->kv_pages, req->nr_kv_pages);
                 } else {
-                    lat = ssd_read(nvm_ns(ns), mreq->slba, mreq->nlb, mreq->ts);
+                    lat = ssd_read(nvm_ns(ns), mreq->slba, mreq->nlb, mreq->ts, req->read_observation);
                 }
                 req->stat.rw.nand_lat = MAX(req->stat.rw.nand_lat, lat);
                 // femu_log("ftl memory_copy_req: is_last %d, nr_pollers %d\n", mreq->is_last, n->nr_pollers);
@@ -1147,11 +1321,12 @@ static void *ftl_thread(void *arg)
                 switch (req->cmd.opcode) {
                 case NVME_CMD_WRITE:
                     req->status = nvme_rw(req->ns, &req->cmd, req);
-                    lat = ssd_write(nns, req->slba, req->nlb, req->stat.stime);
+                    lat = ssd_write(nns, req->slba, req->nlb, req->stat.stime,
+                                    req->kv_pages, req->nr_kv_pages);
                     break;
                 case NVME_CMD_READ:
                     req->status = nvme_rw(req->ns, &req->cmd, req);
-                    lat = ssd_read(nns, req->slba, req->nlb, req->stat.stime);
+                    lat = ssd_read(nns, req->slba, req->nlb, req->stat.stime, NULL);
                     break;
                 case NVME_CMD_DSM:
                     lat = 0;

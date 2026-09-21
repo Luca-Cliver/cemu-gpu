@@ -195,12 +195,20 @@ typedef struct NvmParams {
 typedef struct NvmNamespace {
     struct line_mgmt lm;
     struct write_pointer wp;
+    struct write_pointer kv_wp[3];
+    bool kv_wp_initialized[3];
     char *ssdname;
+    NvmeNamespace *namespace;
     struct ssd_channel *ch;
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
+    uint8_t *kv_lpn_kind;
+    uint64_t *kv_lpn_stream;
+    uint64_t *kv_lpn_cookie;
+    uint64_t *kv_lpn_group;
+    uint32_t *kv_lpn_page;
     int cache_used;
     pqueue_t *cache_pq;
     QemuThread ftl_thread;

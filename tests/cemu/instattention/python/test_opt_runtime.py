@@ -13,6 +13,7 @@ from opt_runtime import (
     OptCheckpointLoader,
     OptConfig,
     OptDecodeRunner,
+    OptMultiBatchDecodeRunner,
     OptGenerationRunner,
     OptOperations,
     OptMultiBatchPrefillRunner,
@@ -128,6 +129,40 @@ class OptRuntimeTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary_directory.cleanup()
+
+    def test_query_dependent_async_microbatches_preserve_transformer_results(self):
+        events = []
+
+        class AsyncBackend(OptTorchAttentionBackend):
+            supports_async_decode = True
+
+            def submit_decode(self, layer, query, valid_tokens):
+                events.append(("submit", layer))
+                request = Future()
+                request.set_result(self.decode(layer, query, valid_tokens))
+                return request
+
+            def wait_decode(self, request):
+                events.append(("wait", None))
+                return request.result()
+
+            def prefetch_decode(self, *args):
+                raise AssertionError("query-dependent KV cannot use dense prefetch")
+
+        with OptCheckpointLoader(self.config, self.model_directory, device=TEST_DEVICE) as loader:
+            prompt = torch.tensor([[2, 4, 5], [2, 6, 7]], dtype=torch.long)
+            prefill = OptPrefillRunner(self.config, loader).run(prompt, collect_kv_cache=True)
+            expected = OptDecodeRunner(self.config, loader,
+                OptTorchAttentionBackend(self.config, prefill.kv_cache)).run(
+                    prefill.next_token_ids, token_position=3)
+            partitions = partition_kv_cache_by_batch(self.config, prefill.kv_cache, microbatch_size=1)
+            backends = [AsyncBackend(self.config, cache) for cache in partitions]
+            actual = OptMultiBatchDecodeRunner(self.config, loader, backends, gpu_batch_size=1).run(
+                prefill.next_token_ids, token_position=3)
+            torch.testing.assert_close(actual.logits, expected.logits)
+            torch.testing.assert_close(actual.next_token_ids, expected.next_token_ids)
+        self.assertEqual([event[0] for event in events],
+                         ["submit", "submit", "wait", "wait"] * self.config.num_hidden_layers)
 
     def test_prefill_and_decode_match_extended_prefill(self):
         loader = OptCheckpointLoader(
