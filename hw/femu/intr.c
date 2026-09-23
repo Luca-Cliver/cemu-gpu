@@ -42,6 +42,13 @@ static void nvme_remove_kvm_msi_virq(NvmeCQueue *cq)
     cq->virq = -1;
 }
 
+void nvme_native_release_irq(NvmeCQueue *cq)
+{
+    if (cq->cqid && cq->irq_enabled && cq->virq >= 0) {
+        nvme_remove_kvm_msi_virq(cq);
+    }
+}
+
 static int nvme_set_guest_notifier(FemuCtrl *n, EventNotifier *notifier,
                                    uint32_t qid)
 {
@@ -56,10 +63,15 @@ static void nvme_clear_guest_notifier(FemuCtrl *n)
     for (qid = 1; qid <= n->nr_io_queues; qid++) {
         cq = n->cq[qid];
         if (!cq) {
+            if (n->native_kv) {
+                continue;
+            }
             break;
         }
 
-        if (cq->irq_enabled) {
+        if (n->native_kv) {
+            nvme_native_release_irq(cq);
+        } else if (cq->irq_enabled) {
             nvme_remove_kvm_msi_virq(cq);
         }
     }
@@ -203,6 +215,9 @@ int nvme_setup_virq(FemuCtrl *n, NvmeCQueue *cq)
 {
     int ret;
 
+    if (n->native_kv && cq->cqid && cq->irq_enabled && !kvm_enabled()) {
+        return -1;
+    }
     if (cq->cqid && cq->irq_enabled) {
         ret = nvme_add_kvm_msi_virq(n, cq);
         if (ret < 0) {
@@ -221,6 +236,9 @@ int nvme_setup_virq(FemuCtrl *n, NvmeCQueue *cq)
         n->vector_poll_started = true;
         if (msix_set_vector_notifiers(&n->parent_obj, nvme_vector_unmask,
                                       nvme_vector_mask, nvme_vector_poll)) {
+            if (n->native_kv) {
+                n->vector_poll_started = false;
+            }
             femu_err("nvme: msix_set_vector_notifiers failed\n");
             return -1;
         }

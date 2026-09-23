@@ -147,6 +147,14 @@ uint16_t femu_nvme_rw_check_req(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 
 void nvme_free_sq(NvmeSQueue *sq, FemuCtrl *n)
 {
+    if (n->native_kv) {
+        if (sq->phys_contig && sq->dma_addr_hva) {
+            dma_memory_unmap(pci_get_address_space(&n->parent_obj),
+                             (void *)sq->dma_addr_hva, sq->size * n->sqe_size,
+                             DMA_DIRECTION_TO_DEVICE, sq->size * n->sqe_size);
+        }
+        pthread_spin_destroy(&sq->lock);
+    }
     n->sq[sq->sqid] = NULL;
     g_free(sq->io_req);
     if (sq->prp_list) {
@@ -164,7 +172,7 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
     uint8_t stride = n->db_stride;
     int dbbuf_entry_sz = 1 << (2 + stride);
     AddressSpace *as = pci_get_address_space(&n->parent_obj);
-    dma_addr_t sqsz = (dma_addr_t)size;
+    dma_addr_t sqsz = n->native_kv ? (dma_addr_t)size * n->sqe_size : size;
     NvmeCQueue *cq;
 
     sq->ctrl = n;
@@ -176,6 +184,12 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
     if (sq->phys_contig) {
         sq->dma_addr = dma_addr;
         sq->dma_addr_hva = (uint64_t)dma_memory_map(as, dma_addr, &sqsz, 0, MEMTXATTRS_UNSPECIFIED);
+        if (n->native_kv && (!sq->dma_addr_hva || sqsz != (dma_addr_t)size * n->sqe_size)) {
+            if (sq->dma_addr_hva) {
+                dma_memory_unmap(as, (void *)sq->dma_addr_hva, sqsz, DMA_DIRECTION_TO_DEVICE, 0);
+            }
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
     } else {
         sq->prp_list = nvme_setup_discontig(n, dma_addr, size, n->sqe_size);
         if (!sq->prp_list) {
@@ -213,6 +227,10 @@ uint16_t nvme_init_sq(NvmeSQueue *sq, FemuCtrl *n, uint64_t dma_addr, uint16_t
         sq->db_addr_hva = n->dbs_addr_hva + 2 * sqid * dbbuf_entry_sz;
         sq->eventidx_addr = n->eis_addr + 2 * sqid * dbbuf_entry_sz;
         sq->eventidx_addr = n->eis_addr_hva + 2 * sqid + dbbuf_entry_sz;
+        if (n->native_kv) {
+            sq->eventidx_addr = n->eis_addr + 2 * sqid * dbbuf_entry_sz;
+            sq->eventidx_addr_hva = n->eis_addr_hva + 2 * sqid * dbbuf_entry_sz;
+        }
         femu_debug("SQ[%d],db=%" PRIu64 ",ei=%" PRIu64 "\n", sqid, sq->db_addr,
                 sq->eventidx_addr);
     }
@@ -234,6 +252,9 @@ uint16_t nvme_init_cq(NvmeCQueue *cq, FemuCtrl *n, uint64_t dma_addr, uint16_t
     cq->size = size;
     cq->phase = 1;
     cq->irq_enabled = irq_enabled;
+    if (n->native_kv) {
+        cq->virq = -1;
+    }
     cq->vector = vector;
     cq->head = cq->tail = 0;
     cq->phys_contig = contig;
@@ -241,11 +262,17 @@ uint16_t nvme_init_cq(NvmeCQueue *cq, FemuCtrl *n, uint64_t dma_addr, uint16_t
     uint8_t stride = n->db_stride;
     int dbbuf_entry_sz = 1 << (2 + stride);
     AddressSpace *as = pci_get_address_space(&n->parent_obj);
-    dma_addr_t cqsz = (dma_addr_t)size;
+    dma_addr_t cqsz = n->native_kv ? (dma_addr_t)size * n->cqe_size : size;
 
     if (cq->phys_contig) {
         cq->dma_addr = dma_addr;
         cq->dma_addr_hva = (uint64_t)dma_memory_map(as, dma_addr, &cqsz, 1, MEMTXATTRS_UNSPECIFIED);
+        if (n->native_kv && (!cq->dma_addr_hva || cqsz != (dma_addr_t)size * n->cqe_size)) {
+            if (cq->dma_addr_hva) {
+                dma_memory_unmap(as, (void *)cq->dma_addr_hva, cqsz, DMA_DIRECTION_FROM_DEVICE, 0);
+            }
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
     } else {
         cq->prp_list = nvme_setup_discontig(n, dma_addr, size, n->cqe_size);
         if (!cq->prp_list) {
@@ -271,6 +298,14 @@ uint16_t nvme_init_cq(NvmeCQueue *cq, FemuCtrl *n, uint64_t dma_addr, uint16_t
 
 void nvme_free_cq(NvmeCQueue *cq, FemuCtrl *n)
 {
+    if (n->native_kv) {
+        nvme_native_release_irq(cq);
+    }
+    if (n->native_kv && cq->phys_contig && cq->dma_addr_hva) {
+        dma_memory_unmap(pci_get_address_space(&n->parent_obj),
+                         (void *)cq->dma_addr_hva, cq->size * n->cqe_size,
+                         DMA_DIRECTION_FROM_DEVICE, cq->size * n->cqe_size);
+    }
     n->cq[cq->cqid] = NULL;
     msix_vector_unuse(&n->parent_obj, cq->vector);
     if (cq->prp_list) {
@@ -305,4 +340,3 @@ void nvme_set_ctrl_name(FemuCtrl *n, const char *mn, const char *sn, int *dev_id
     subnqn = g_strdup_printf("nqn.2021-05.org.femu:%s", serial);
     strpadcpy((char *)id->subnqn, sizeof(id->subnqn), subnqn, '\0');
 }
-

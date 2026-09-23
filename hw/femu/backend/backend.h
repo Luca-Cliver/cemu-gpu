@@ -11,6 +11,7 @@ typedef struct QEMUSGList QEMUSGList;
 typedef enum BackendType{
     FEMU_DRAM_BACKEND,
     FEMU_FILE_BACKEND,
+    FEMU_NEW_FILE_BACKEND,
 } BackendType;
 
 /* SSD Backend */
@@ -28,6 +29,7 @@ typedef struct SsdBackend {
 int init_dram_backend(SsdBackend *b);
 void free_dram_backend(SsdBackend *b);
 int init_file_backend(SsdBackend *b, const char *path);
+int init_new_file_backend(SsdBackend *b, const char *path);
 void free_file_backend(SsdBackend *b);
 
 int backend_cuda_sync_init(SsdBackend *b);
@@ -43,10 +45,12 @@ int init_backend(SsdBackend **b, BackendType type, char *path, int64_t nbytes);
 void free_backend(SsdBackend *b);
 
 int backend_rw(SsdBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write);
-void backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
+int backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
                            uint64_t data_size, int is_write);
+int backend_rw_internal_checked(SsdBackend *b, void *buf, uint64_t data_offset,
+                                uint64_t data_size, bool is_write);
 void *backend_get_ptr(SsdBackend *b, uint64_t offset);
-void backend_copy_internal(SsdBackend *b, uint64_t doff, uint64_t soff,
+int backend_copy_internal(SsdBackend *b, uint64_t doff, uint64_t soff,
                            uint64_t data_size);
 void backend_fill(SsdBackend *b, uint64_t offset, uint64_t len);
 static inline void *backend_addr(SsdBackend *b, uint64_t offset)

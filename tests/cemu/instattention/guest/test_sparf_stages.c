@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include "hw/femu/sparf_workflow_abi.h"
+#include "hw/femu/sparf_storage.h"
 
 struct ubpf_jit_args {
     int numr;
@@ -35,6 +36,8 @@ typedef struct {
     uint64_t destination_offset;
 } SparfLogicalSpan;
 typedef struct {
+    bool internal;
+    uint64_t internal_model_ns;
     void *request;
     GArray *spans;
     uint8_t *source, *destination;
@@ -53,6 +56,8 @@ static bool queue_model;
 static uint64_t virtual_now = 1000000, nand_available;
 static uint64_t read_starts[3], read_finishes[3];
 static uint64_t (*kernel)(struct ubpf_jit_args *);
+static CemuSparfStorageRead storage_read;
+static void *storage_opaque;
 static int backend_cuda_prepare_host(SsdBackend *b, void *p, uint64_t n) { return 0; }
 static int backend_cuda_prepare_device(SsdBackend *b, void *p, uint64_t n) { return 0; }
 static void backend_cuda_mark_host_dirty(SsdBackend *b, void *p, uint64_t n) {}
@@ -137,6 +142,11 @@ static void sparf_clear_read(SparfRead *read)
 }
 static bool sparf_finish_read(SparfRead *read, struct rte_ring *ring, uint64_t *latency)
 {
+    if (read->internal) {
+        *latency = read->internal_model_ns;
+        sparf_clear_read(read);
+        return true;
+    }
     if (read->spans && !read->spans->len) {
         *latency = 0;
         sparf_clear_read(read);
@@ -160,7 +170,9 @@ static uint64_t checked_kernel(struct ubpf_jit_args *args)
     const struct cemu_sparf_attention_metadata *config = args->data_buffer;
     /* This is an ordering assertion: V is in flight during QK; it must have
      * completed before PV. It does not assert real-time overlap. */
-    assert(active_ring->pending == (config->phase == CEMU_SPARF_PHASE_EXACT_QK && expected_v_pending));
+    if (!storage_read) {
+        assert(active_ring->pending == (config->phase == CEMU_SPARF_PHASE_EXACT_QK && expected_v_pending));
+    }
     return fail_kernel == 1 || fail_kernel == (int)config->phase ? UINT64_MAX : kernel(args);
 }
 #include "hw/femu/csd/sparf_group_attention.h"
@@ -192,6 +204,12 @@ const char *get_read_observation_json(void)
 void configure_grouped_session(void *session)
 {
     grouped_session = session;
+}
+
+void configure_storage(CemuSparfStorageRead read, void *opaque)
+{
+    storage_read = read;
+    storage_opaque = opaque;
 }
 
 int grouped_test_lease(void *metadata, int release)
@@ -259,7 +277,10 @@ uint64_t execute_autonomous(void **ranges, long long *lengths, void *metadata, i
     SparfAutonomous state = { 0 };
     struct cemu_sparf_workflow_header *header = metadata;
     struct cemu_sparf_group_binding binding = {0};
-    if (header->flags & CEMU_SPARF_WORKFLOW_GROUPED) {
+    if (storage_read) {
+        state.storage_read = storage_read;
+        state.storage_opaque = storage_opaque;
+    } else if (header->flags & CEMU_SPARF_WORKFLOW_GROUPED) {
         memcpy(&binding, (uint8_t *)metadata + sizeof(*header), sizeof(binding));
         if (!sparf_group_bind(grouped_session, header, &binding)) return UINT64_MAX;
         state.group_session = grouped_session;

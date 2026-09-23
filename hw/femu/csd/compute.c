@@ -11,6 +11,8 @@
 #include "hw/femu/sparf_workflow_abi.h"
 #include "sparf_writeback.h"
 #include "sparf_group_buffer.h"
+#include "sparf_wait.h"
+#include "../bbssd/instattention_attention.h"
 #include "hw/femu/inc/slab.h"
 #include "hw/femu/nvme-def.h"
 #include "hw/femu/nvme.h"
@@ -334,6 +336,8 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
     bool autonomous = header.version == CEMU_SPARF_AUTONOMOUS_VERSION;
     bool buffered = header.flags & CEMU_SPARF_WORKFLOW_BUFFERED;
     bool grouped = header.flags & CEMU_SPARF_WORKFLOW_GROUPED;
+    bool native = header.flags & CEMU_SPARF_WORKFLOW_NATIVE;
+    if (native != controller->native_kv || (native && (!grouped || !autonomous))) return false;
     if (grouped && (!autonomous || buffered || extents || header.token_head_stride ||
         header.token_batch_stride || header.token_layer_stride || header.channel_stride ||
         header.channel_head_stride || header.channel_batch_stride || header.channel_layer_stride ||
@@ -344,7 +348,7 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         (staged && (header.reserved[0] < CEMU_SPARF_STAGE_SELECT ||
                     header.reserved[0] > CEMU_SPARF_STAGE_PV || !header.reserved[1])) ||
         numr != (staged ? CEMU_SPARF_STAGED_RANGES : CEMU_SPARF_WORKFLOW_RANGES) ||
-        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED)) ||
+        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED | CEMU_SPARF_WORKFLOW_NATIVE)) ||
         (!grouped && (!header.token_k_extents || !header.channel_k_extents || !header.token_v_extents)) ||
         header.token_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.channel_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
@@ -416,6 +420,11 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         return false;
     }
     if (grouped) {
+        if (native) {
+            struct cemu_sparf_native_binding binding;
+            memcpy(&binding, (const uint8_t *)data + sizeof(header), sizeof(binding));
+            return binding.task && binding.generation && !binding.reserved;
+        }
         struct cemu_sparf_group_binding binding;
         memcpy(&binding, (const uint8_t *)data + sizeof(header), sizeof(binding));
         return binding.cookie != 0;
@@ -525,6 +534,7 @@ static void init_program_slab(void *elem, void *arg)
 {
     struct ProgramInitArgs *args = (struct ProgramInitArgs *)arg;
     Program *p = (Program *)elem;
+    memset(p, 0, sizeof(*p));
     p->nsid = args->nsid;
     p->pind = args->pind++;
     p->state = PROGRAM_STATE_INVALID;
@@ -544,7 +554,7 @@ static void init_mrs_slab(void *elem, void *arg)
 static void compute_init(NvmeNamespace *ns, Error **errp)
 {
     ComputeParams *param = ns->params;
-    ComputeNamespace *cns = malloc(sizeof(ComputeNamespace));
+    ComputeNamespace *cns = g_new0(ComputeNamespace, 1);
     ns->private = cns;
     cns->ns = ns;
     cns->params = param;
@@ -571,14 +581,16 @@ static void compute_init(NvmeNamespace *ns, Error **errp)
 
     cns->to_csd = g_malloc0(sizeof(struct rte_ring *) * param->nr_thread);
     cns->compute_threads = g_malloc0(sizeof(QemuThread) * param->nr_thread);
-    struct csd_thread_arg* args = g_malloc0(sizeof(struct csd_thread_arg) * param->nr_thread);
+    struct csd_thread_arg* args = ns->ctrl->native_kv ? NULL :
+        g_malloc0(sizeof(struct csd_thread_arg) * param->nr_thread);
     for (int i = 0; i < param->nr_thread; i++) {
         cns->to_csd[i] = femu_ring_create(FEMU_RING_TYPE_SP_SC, FEMU_MAX_INF_REQS);
         char name[32];
         sprintf(name, "FEMU-CSD-Thread-%d", i);
-        args[i].ns = ns;
-        args[i].id = i;
-        qemu_thread_create(&cns->compute_threads[i], name, compute_thread, &args[i],
+        struct csd_thread_arg *argument = ns->ctrl->native_kv ? g_new0(struct csd_thread_arg, 1) : &args[i];
+        argument->ns = ns;
+        argument->id = i;
+        qemu_thread_create(&cns->compute_threads[i], name, compute_thread, argument,
                            QEMU_THREAD_JOINABLE);
     }
 
@@ -630,8 +642,12 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             uint32_t len = le32_to_cpu(mr[i].len);
             uint64_t sb = le64_to_cpu(mr[i].sb);
             NvmeNamespace *mns = nvme_find_namespace(n, nsid);
-            if (mns == NULL) {
+            if (mns == NULL || (n->native_kv && (mns->csi != NVME_CSI_MEMORY || !len ||
+                sb > mns->backend->size || len > mns->backend->size - sb))) {
                 free(mrs->mr);
+                g_free(mrs->mr_addr);
+                g_free(mrs->mr_len);
+                mrs->numr = 0;
                 slab_free(memory_range_set_slab(ns), mrs, 1);
                 return NVME_INVALID_MEMORY_NS;
             }
@@ -876,6 +892,12 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     Program *program = program_get(ns, pind);
 
     pthread_mutex_lock(&program->lock);
+    if (n->native_kv && sel == 0 &&
+        (ptype != PROGRAM_TYPE_SHARED_LIB || indirect || loff ||
+         !psize || psize > 4096 || numb != psize || program->code)) {
+        pthread_mutex_unlock(&program->lock);
+        return NVME_INVALID_FIELD;
+    }
     if (sel == 0) {
         // load program
         if (qatomic_load_acquire(&program->jobs_running) != 0) {
@@ -909,6 +931,7 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
             program->target = target;
             qatomic_set(&program->jobs_running, 0);
             program->code = malloc(psize);
+            if (n->native_kv) program->load_size = 0;
             program->state = PROGRAM_STATE_LOADING;
             program->runtime = runtime;
             program->runtime_scale = runtime_scale / 10.0;
@@ -937,6 +960,16 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
             pthread_mutex_unlock(&program->lock);
             femu_err("load_program: dma_write_prp error\n");
             return NVME_DNR;
+        }
+        if (n->native_kv) {
+            char *separator = memchr(program->code, 0, psize);
+            if (!separator || separator == program->code ||
+                separator + 1 == (char *)program->code + psize ||
+                !separator[1] ||
+                !memchr(separator + 1, 0, (char *)program->code + psize - separator - 1)) {
+                pthread_mutex_unlock(&program->lock);
+                return NVME_INVALID_PROGRAM_DATA;
+            }
         }
         program->load_size += numb;
 
@@ -976,11 +1009,15 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
             if (buffer) {
                 g_mutex_lock(&buffer->lock);
                 bool busy = buffer->users != 0;
+                bool undrained = !buffer->sealed;
                 g_mutex_unlock(&buffer->lock);
                 if (busy) {
                     pthread_mutex_unlock(&namespace->sparf_group_lock);
                     pthread_mutex_unlock(&program->lock);
                     return NVME_PROGRAM_IN_USE;
+                }
+                if (undrained) {
+                    femu_err("Unloading grouped program without completed DRAIN/CLOSE; aborting unpublished KV\n");
                 }
             }
             sparf_group_free(namespace->sparf_group_session);
@@ -993,6 +1030,7 @@ static uint16_t load_program(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         }
         program->state = PROGRAM_STATE_INVALID;
         free(program->code);
+        program->code = NULL;
         if (program->type == PROGRAM_TYPE_SHARED_LIB) {
             unload_shared_lib(program);
         } else if (program->type == PROGRAM_TYPE_EBPF) {
@@ -1063,6 +1101,9 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     uint64_t prp2 = le64_to_cpu(exec->prp2);
     uint32_t chunk_nlb = le32_to_cpu(exec->chunk_nlb) + 1;
     uint32_t runtime = le32_to_cpu(exec->runtime);
+    if (n->native_kv && (numr ||
+        dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) ||
+        cparam1 != CEMU_SPARF_WORKFLOW_COMMAND)) return NVME_INVALID_FIELD;
     SparfDispatchTrace dispatch = {0};
     if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND && sparf_timeline_fd() >= 0) {
         dispatch.host_entry = monotonic_ns();
@@ -1120,6 +1161,14 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
         }
     }
     req->data_buffer = data_buffer;
+    if (n->native_kv && (program->is_indirect || numr ||
+        cparam1 != CEMU_SPARF_WORKFLOW_COMMAND ||
+        dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) ||
+        ((struct cemu_sparf_workflow_header *)data_buffer)->version != CEMU_SPARF_AUTONOMOUS_VERSION)) {
+        g_free(req->data_buffer);
+        req->data_buffer = NULL;
+        return NVME_INVALID_FIELD;
+    }
     if (cparam1 == CEMU_SPARF_WRITEBACK_COMMAND || cparam1 == CEMU_SPARF_GROUP_COMMAND) {
         return sparf_submit_writeback(req, program, rsid);
     }
@@ -1705,6 +1754,8 @@ typedef struct SparfLogicalSpan {
 } SparfLogicalSpan;
 
 typedef struct SparfRead {
+    bool internal;
+    uint64_t internal_model_ns;
     NvmeRequest *request;
     GArray *physical_extents;
     GArray *spans;
@@ -1892,6 +1943,11 @@ static void sparf_clear_read(SparfRead *read)
 static bool sparf_finish_read(SparfRead *read, struct rte_ring *ring,
                               uint64_t *modeled_ns)
 {
+    if (read->internal) {
+        *modeled_ns = read->internal_model_ns;
+        sparf_clear_read(read);
+        return true;
+    }
     if (read->spans && !read->spans->len) {
         *modeled_ns = 0;
         sparf_clear_read(read);
@@ -2245,6 +2301,7 @@ static void *sparf_autonomous_main(void *opaque)
     uint64_t result = (uint64_t)-1;
     if (!completion) goto finish;
     while (state->resume != SPARF_RESUME_DONE) {
+        if (parent->ns->ctrl->native_kv && qatomic_read(&parent->ns->ctrl->native_stop)) break;
         if (state->resume == SPARF_RESUME_VALUE || state->wait == SPARF_WAIT_IO) {
             sparf_wait_physical(state);
             if (trace) {
@@ -2254,7 +2311,9 @@ static void *sparf_autonomous_main(void *opaque)
             }
         }
         if (state->wait == SPARF_WAIT_TIME) {
-            while (clock_ns() < state->deadline) usleep(10);
+            while (clock_ns() < state->deadline &&
+                   !(parent->ns->ctrl->native_kv && qatomic_read(&parent->ns->ctrl->native_stop))) usleep(10);
+            if (parent->ns->ctrl->native_kv && qatomic_read(&parent->ns->ctrl->native_stop)) break;
             if (trace) {
                 int index = state->resume == SPARF_RESUME_APPROX ? 0 :
                             state->resume == SPARF_RESUME_EXACT ? 1 : 2;
@@ -2318,6 +2377,10 @@ finish:
         memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
         sparf_group_unbind(state->group_session, header, &binding);
     }
+    if (state->storage_read) {
+        native_kv_attention_close(state->storage_opaque);
+        g_free(state->storage_opaque);
+    }
     g_free(state);
     parent->cqe.res64 = result;
     parent->stat.expire_time = clock_ns();
@@ -2337,8 +2400,10 @@ finish:
     }
     sched_release_autonomous(job);
     parent->job = NULL;
+    if (!(parent->ns->ctrl->native_kv && qatomic_read(&parent->ns->ctrl->native_stop))) {
+        while (femu_ring_enqueue(parent->ns->ctrl->to_poller[1], (void *)&parent, 1) != 1) usleep(10);
+    }
     qatomic_dec(&namespace->sparf_autonomous_active);
-    while (femu_ring_enqueue(parent->ns->ctrl->to_poller[1], (void *)&parent, 1) != 1) usleep(10);
     return NULL;
 }
 
@@ -2355,6 +2420,7 @@ static void *sparf_autonomous_worker(void *opaque)
     for (;;) {
         ComputeJob *job = NULL;
         qemu_sem_wait(&namespace->sparf_autonomous_wakeup);
+        if (qatomic_read(&namespace->native_shutdown)) return NULL;
         if (femu_ring_dequeue(namespace->sparf_autonomous_queue, (void *)&job, 1) == 1) {
             job->permited_cu_mask = UINT64_C(1) << (worker->index % namespace->ce->nr_cu);
             if (job->sparf_autonomous->timeline) {
@@ -2391,10 +2457,74 @@ static bool sparf_autonomous_start_workers(ComputeNamespace *namespace)
         char name[32];
         snprintf(name, sizeof(name), "cemu-sparf-%u", index);
         qemu_thread_create(&worker->thread, name,
-                           sparf_autonomous_worker, worker, QEMU_THREAD_DETACHED);
+                           sparf_autonomous_worker, worker,
+                           namespace->ns->ctrl->native_kv ? QEMU_THREAD_JOINABLE : QEMU_THREAD_DETACHED);
     }
     pthread_mutex_unlock(&namespace->sparf_autonomous_lock);
     return true;
+}
+
+void compute_native_quiesce(NvmeNamespace *ns)
+{
+    ComputeNamespace *namespace = compute_ns(ns);
+    bool locked = qemu_mutex_iothread_locked();
+    if (locked) qemu_mutex_unlock_iothread();
+    while (qatomic_read(&namespace->sparf_autonomous_active)) g_usleep(10);
+    if (locked) qemu_mutex_lock_iothread();
+}
+
+static void compute_native_exit(NvmeNamespace *ns)
+{
+    if (!ns->ctrl->native_kv) return;
+    ComputeNamespace *namespace = compute_ns(ns);
+    if (!namespace) return;
+    compute_native_quiesce(ns);
+    qatomic_set(&namespace->native_shutdown, true);
+    if (namespace->sparf_autonomous_queue) {
+        for (unsigned int index = 0; index < namespace->params->sparf_engines; index++)
+            qemu_sem_post(&namespace->sparf_autonomous_wakeup);
+        for (unsigned int index = 0; index < namespace->params->sparf_engines; index++)
+            qemu_thread_join(&namespace->sparf_autonomous_workers[index].thread);
+        femu_ring_free(namespace->sparf_autonomous_queue);
+        qemu_sem_destroy(&namespace->sparf_autonomous_wakeup);
+    }
+    qemu_thread_join(namespace->sched_thread);
+    for (unsigned int index = 0; index < namespace->params->nr_thread; index++) {
+        qemu_thread_join(&namespace->compute_threads[index]);
+        femu_ring_free(namespace->to_csd[index]);
+    }
+    for (unsigned int index = 1; index <= MAX_PIND; index++) {
+        Program *program = program_get(ns, index);
+        if (program->type == PROGRAM_TYPE_SHARED_LIB && program->shared_lib.so_handle)
+            unload_shared_lib(program);
+        g_free(program->code);
+        pthread_mutex_destroy(&program->lock);
+    }
+    for (unsigned int index = 1; index <= MAX_RSID; index++) {
+        MemoryRangeSet *mrs = memory_range_set_get(ns, index);
+        if (mrs->numr) {
+            g_free(mrs->mr);
+            g_free(mrs->mr_addr);
+            g_free(mrs->mr_len);
+        }
+    }
+    g_free(namespace->sparf_autonomous_workers);
+    g_free(namespace->compute_threads);
+    g_free(namespace->sched_thread);
+    g_free(namespace->to_csd);
+    pthread_mutex_destroy(&namespace->sparf_autonomous_lock);
+    pthread_mutex_destroy(&namespace->sparf_group_lock);
+    Slab *slabs[] = { &namespace->programs, &namespace->mrs,
+        &namespace->ce->job_slab, &namespace->ce->job_group_slab };
+    for (unsigned int index = 0; index < G_N_ELEMENTS(slabs); index++) {
+        pthread_spin_destroy(&slabs[index]->lock);
+        g_free(slabs[index]->mem);
+        g_free(slabs[index]->free_list);
+    }
+    g_free(namespace->ce->cu);
+    g_free(namespace->ce);
+    g_free(namespace);
+    ns->private = NULL;
 }
 
 static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, uint16_t rsid)
@@ -2407,6 +2537,7 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
     void **device_addresses = NULL;
     bool admitted = false, referenced = false, pinned = false;
     SparfGroupSession *group_session = NULL;
+    NativeKvAttention *native_attention = NULL;
     uint16_t status = NVME_INVALID_FIELD;
     if (!rsid || rsid > MAX_RSID || le32_to_cpu(command->numr) ||
         program->is_indirect ||
@@ -2444,7 +2575,17 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
                                   mrs->mr_len, request->data_buffer,
                                   le32_to_cpu(command->dlen), request->ns->ctrl)) goto reject;
     struct cemu_sparf_workflow_header *header = request->data_buffer;
-    if (header->flags & CEMU_SPARF_WORKFLOW_GROUPED) {
+    if (header->flags & CEMU_SPARF_WORKFLOW_NATIVE) {
+        struct cemu_sparf_native_binding binding;
+        NvmeNamespace *nvm = nvme_find_namespace(request->ns->ctrl, 1);
+        CemuKvIdentity identity = { .controller = request->ns->ctrl->drive_id, .namespace_id = 1 };
+        memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
+        identity.task = binding.task;
+        identity.generation = binding.generation;
+        native_attention = g_new0(NativeKvAttention, 1);
+        if (native_kv_attention_open(nvm_ns(nvm)->native_tail, &identity, binding.batch_first,
+                                     header, native_attention) != CEMU_KV_OK) goto reject;
+    } else if (header->flags & CEMU_SPARF_WORKFLOW_GROUPED) {
         struct cemu_sparf_group_binding binding;
         memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
         pthread_mutex_lock(&namespace->sparf_group_lock);
@@ -2485,6 +2626,10 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
     job->args.buffer_len = le32_to_cpu(command->dlen);
     job->sparf_autonomous = g_new0(SparfAutonomous, 1);
     job->sparf_autonomous->group_session = group_session;
+    if (native_attention) {
+        job->sparf_autonomous->storage_read = native_kv_attention_read;
+        job->sparf_autonomous->storage_opaque = native_attention;
+    }
     job->sparf_autonomous->rsid = rsid;
     if (sparf_auto_log_fd() >= 0) {
         SparfAutonomousTrace *trace = g_new0(SparfAutonomousTrace, 1);
@@ -2506,6 +2651,10 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
     qemu_sem_post(&namespace->sparf_autonomous_wakeup);
     return NVME_SUCCESS;
 reject:
+    if (native_attention) {
+        native_kv_attention_close(native_attention);
+        g_free(native_attention);
+    }
     if (group_session) {
         struct cemu_sparf_workflow_header *header = request->data_buffer;
         struct cemu_sparf_group_binding binding;
@@ -2536,7 +2685,8 @@ typedef struct SparfWritebackRequest {
 } SparfWritebackRequest;
 
 static bool sparf_group_transfer(NvmeNamespace *namespace, struct rte_ring *completion,
-                                SparfWritebackPlan *plan, bool write, uint64_t *start, uint64_t *end)
+                                SparfWritebackPlan *plan, bool write, uint64_t *start, uint64_t *end,
+                                const gint *cancelled)
 {
     uint64_t host_start = plan->profile ? monotonic_ns() : 0;
     NvmeNamespace *nvm = nvme_find_namespace(namespace->ctrl, 1);
@@ -2556,6 +2706,7 @@ static bool sparf_group_transfer(NvmeNamespace *namespace, struct rte_ring *comp
     request->cmd.nsid = cpu_to_le32(3);
     request->mem_ctrl = namespace->ctrl;
     request->sdaddr = plan->image;
+    request->sparf_cancelled = cancelled;
     request->is_write = write;
     request->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
     request->nr_sres = extents->len;
@@ -2576,14 +2727,15 @@ static bool sparf_group_transfer(NvmeNamespace *namespace, struct rte_ring *comp
         request->sres[index].cf2.nlb = cpu_to_le16(extent.nlb - 1);
     }
     g_array_free(extents, TRUE);
-    if (femu_ring_enqueue(namespace->ctrl->to_ftl[1], (void *)&request, 1) != 1) {
+    if ((cancelled && g_atomic_int_get(cancelled)) ||
+        femu_ring_enqueue(namespace->ctrl->to_ftl[1], (void *)&request, 1) != 1) {
         attention_free_read(request);
         return false;
     }
     bool success = attention_wait_read(completion, request);
     *end = request->stat.expire_time;
     uint64_t data_ready = plan->profile ? monotonic_ns() : 0;
-    if (success) while (clock_ns() < *end) usleep(10);
+    if (success) success = sparf_wait_target(*end, clock_ns, cancelled);
     if (plan->profile) {
         uint64_t target_wait = monotonic_ns() - data_ready;
         if (write) {
@@ -2602,7 +2754,7 @@ static bool sparf_wb_transfer(void *opaque, SparfWritebackPlan *plan, bool write
                               uint64_t *start, uint64_t *end)
 {
     SparfWritebackRequest *work = opaque;
-    return sparf_group_transfer(work->job->req->ns, work->completion, plan, write, start, end);
+    return sparf_group_transfer(work->job->req->ns, work->completion, plan, write, start, end, NULL);
 }
 
 typedef struct SparfGroupBackground {
@@ -2610,13 +2762,21 @@ typedef struct SparfGroupBackground {
     struct rte_ring *completion;
     SsdBackend *backend;
     uint16_t rsid;
+    gint cancelled;
 } SparfGroupBackground;
 
 static bool sparf_group_background_transfer(void *opaque, SparfWritebackPlan *plan, bool write,
                                             uint64_t *start, uint64_t *end)
 {
     SparfGroupBackground *background = opaque;
-    return sparf_group_transfer(background->namespace, background->completion, plan, write, start, end);
+    return sparf_group_transfer(background->namespace, background->completion, plan, write, start, end,
+                                &background->cancelled);
+}
+
+static void sparf_group_background_cancel(void *opaque)
+{
+    SparfGroupBackground *background = opaque;
+    g_atomic_int_set(&background->cancelled, 1);
 }
 
 static void sparf_group_background_dirty(void *opaque, uint8_t *address, uint64_t bytes)
@@ -2678,7 +2838,7 @@ static void *sparf_writeback_worker(void *opaque)
                             job->args.data_buffer, job->args.buffer_len, nvm->backend->size,
                             parameters->secsz * parameters->secs_per_pg, job->args.mr_addr[2], job->args.mr_len[2],
                             sparf_group_background_transfer, sparf_group_background_dirty,
-                            sparf_group_background_release, background);
+                            sparf_group_background_cancel, sparf_group_background_release, background);
                     }
                     success = namespace->sparf_group_session != NULL;
                     if (success) {
@@ -3184,13 +3344,14 @@ static void *compute_thread(void *arg)
     ComputeNamespace *cns = compute_ns(ns);
     FemuCtrl *n = ns->ctrl;
     int id = ((struct csd_thread_arg *)arg)->id;
+    if (n->native_kv) g_free(arg);
 
     static Slab indirect_thread_pool;
     if (id == 0)
         slab_init(&indirect_thread_pool, sizeof(QemuThread),
                 MAX_INDIRECT_JOBS, NULL, NULL);
 
-    while (!ns->ctrl->dataplane_started) {
+    while (!ns->ctrl->dataplane_started && !qatomic_read(&cns->native_shutdown)) {
         usleep(100000);
     }
 
@@ -3200,7 +3361,7 @@ static void *compute_thread(void *arg)
 
     // int next_poller = 1;
 
-    while (1) {
+    while (!qatomic_read(&cns->native_shutdown)) {
         if (femu_ring_empty(to_csd))
             continue;
 
@@ -3297,7 +3458,7 @@ static int compute_encode_params(cJSON *json, NvmeNamespace *ns)
 static CommandSetOps compute_ns_ops = {
     .state            = NULL,
     .init             = compute_init,
-    .exit             = NULL,
+    .exit             = compute_native_exit,
     .rw_check_req     = NULL,
     .admin_cmd        = compute_admin_cmd,
     .io_cmd           = compute_io_cmd,

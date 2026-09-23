@@ -6,6 +6,10 @@
 /* bb <=> black-box */
 static void bb_init(NvmeNamespace *ns, Error **errp)
 {
+    if (ns->ctrl->native_kv) {
+        bb_native_namespace_init(ns, errp);
+        return;
+    }
     NvmNamespace *nns = ns->private = g_malloc0(sizeof(NvmNamespace));
     nns->params = ns->params;
     nns->namespace = ns;
@@ -28,6 +32,10 @@ static void bb_init(NvmeNamespace *ns, Error **errp)
 
 static void bb_exit(NvmeNamespace *ns)
 {
+    if (ns->ctrl->native_kv) {
+        bb_native_namespace_exit(ns);
+        return;
+    }
     NvmNamespace *nns = ns->private;
 
     for (int i = 1; i <= ns->ctrl->nr_pollers; i++) {
@@ -92,6 +100,9 @@ static void bb_flip(NvmeNamespace *ns, NvmeCmd *cmd)
 
 static int bb_io_cmd(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
 {
+    if (ns->ctrl->native_kv) {
+        return bb_native_submit(ns, cmd, req);
+    }
     NvmNamespace *nns = ns->private;
     int rc = 0;
 
@@ -183,6 +194,28 @@ static int bb_decode_params(const cJSON *json, NvmeNamespace *ns)
     DECODE_PARAM(json, "pg_wr_lat", Number, params->pg_wr_lat, NAND_PROG_LATENCY);
     DECODE_PARAM(json, "blk_er_lat", Number, params->blk_er_lat, NAND_ERASE_LATENCY);
     DECODE_PARAM(json, "ch_xfer_lat", Number, params->ch_xfer_lat, 0);
+
+    if (ns->ctrl && ns->ctrl->native_kv) {
+        int factors[] = { params->secsz, params->secs_per_pg, params->pgs_per_blk,
+                          params->pls_per_lun, params->luns_per_ch, params->nchs };
+        uint64_t stripe = 1;
+
+        for (size_t index = 0; index < G_N_ELEMENTS(factors); index++) {
+            if (factors[index] <= 0 || (uint64_t)factors[index] > INT64_MAX / stripe) {
+                return -1;
+            }
+            stripe *= factors[index];
+        }
+        if (!ns->size || ns->size > INT64_MAX || ns->size % stripe ||
+            ns->size / stripe == 0 || ns->size / stripe > 65536 ||
+            params->secsz != 512 || params->secs_per_pg != 8 ||
+            params->nchs > 128 || params->luns_per_ch > 256 ||
+            params->pls_per_lun > 256 || params->pgs_per_blk > 65536 ||
+            (uint64_t)params->pgs_per_blk * (ns->size / stripe) > INT_MAX ||
+            (uint64_t)params->nchs * params->luns_per_ch * params->pgs_per_blk * 8 > INT_MAX) {
+            return -1;
+        }
+    }
 
     // TODO: blks_per_pl should be calculated by ns size
     params->blks_per_pl = ns->size / ((uint64_t)params->secs_per_pg *

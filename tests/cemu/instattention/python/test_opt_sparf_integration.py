@@ -25,9 +25,13 @@ class OptSparfIntegrationTest(unittest.TestCase):
         args = self.arguments()
         self.assertFalse(args.sparf_autonomous)
         self.assertFalse(args.sparf_device_writeback)
+        self.assertFalse(args.sparf_native)
 
     def test_invalid_modes_fail_before_device_or_checkpoint_access(self):
         cases = (
+            (["--sparf-native"], "native KV requires"),
+            (["--attention-mode", "sparf", "--functional", "--sparf-autonomous",
+              "--sparf-native", "--sparf-grouped"], "native KV requires"),
             (["--sparf-autonomous"], "requires SparF"),
             (["--attention-mode", "sparf", "--sparf-autonomous", "--sparf-staged"], "cannot be combined"),
             (["--attention-mode", "sparf", "--sparf-autonomous", "--benchmark"], "requires --functional"),
@@ -45,6 +49,13 @@ class OptSparfIntegrationTest(unittest.TestCase):
     def test_combined_mode_reaches_gpu_check(self):
         args = self.arguments("--attention-mode", "sparf", "--functional", "--sparf-autonomous",
                               "--sparf-device-writeback", "--sparf-kv-buffer-tokens", "6")
+        with patch.object(pipeline, "parse_args", return_value=args), \
+             patch.object(pipeline.torch.cuda, "is_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Guest GPU"):
+                pipeline.main()
+
+    def test_native_mode_reaches_gpu_check(self):
+        args = self.arguments("--attention-mode", "sparf", "--functional", "--sparf-autonomous", "--sparf-native")
         with patch.object(pipeline, "parse_args", return_value=args), \
              patch.object(pipeline.torch.cuda, "is_available", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "Guest GPU"):

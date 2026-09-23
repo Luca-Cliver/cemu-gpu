@@ -555,6 +555,119 @@ static uint64_t ssd_advance_status(NvmNamespace *nns, struct ppa *ppa, struct
     return lat;
 }
 
+static int native_page_transfer(void *opaque, void *buffer, uint64_t offset,
+                                 size_t bytes, bool write)
+{
+    NvmNamespace *nns = opaque;
+
+    if (nns->maptbl || nns->rmap || nns->lm.lines) {
+        return -EINVAL;
+    }
+    return backend_rw_internal_checked(nns->namespace->backend, buffer,
+                                        offset, bytes, write);
+}
+
+static bool native_page_schedule(void *opaque, const CemuKvPhysicalPage *physical,
+                                  bool write, uint64_t start_ns, uint64_t *ready_ns)
+{
+    NvmNamespace *nns = opaque;
+    struct ppa page = { .ppa = 0 };
+    struct nand_cmd command = { .type = USER_IO, .cmd = write ? NAND_WRITE : NAND_READ };
+    struct nand_lun *lun;
+    uint64_t start, latency;
+    int duration = write ? nns->params->pg_wr_lat : nns->params->pg_rd_lat;
+
+    if (nns->maptbl || nns->rmap || nns->lm.lines || !physical || !ready_ns ||
+        physical->channel >= (uint32_t)nns->params->nchs ||
+        physical->lun >= (uint32_t)nns->params->luns_per_ch ||
+        physical->plane >= (uint32_t)nns->params->pls_per_lun ||
+        physical->block >= (uint32_t)nns->params->blks_per_pl ||
+        physical->page >= (uint32_t)nns->params->pgs_per_blk || duration < 0) {
+        return false;
+    }
+    page.g.ch = physical->channel;
+    page.g.lun = physical->lun;
+    page.g.pl = physical->plane;
+    page.g.blk = physical->block;
+    page.g.pg = physical->page;
+    start_ns = start_ns ? start_ns : clock_ns();
+    lun = get_lun(nns, &page);
+    start = MAX(start_ns, lun->next_lun_avail_time);
+    if (start > INT64_MAX || (uint64_t)duration > INT64_MAX - start) {
+        return false;
+    }
+    command.stime = start_ns;
+    latency = ssd_advance_status(nns, &page, &command);
+    *ready_ns = start_ns + latency;
+    return true;
+}
+
+CemuKvStatus bb_native_io_create(NvmeNamespace *ns, size_t max_tasks,
+                                 size_t max_pages, size_t memory_budget_bytes,
+                                 CemuKvIo **result)
+{
+    static const CemuKvIoOps operations = {
+        .transfer = native_page_transfer,
+        .schedule = native_page_schedule,
+    };
+    CemuKvMapConfig config;
+    NvmNamespace *nns;
+    NvmParams *params;
+    uint64_t page_bytes;
+    CemuKvStatus status;
+
+    if (!ns || ns->csi != NVME_CSI_NVM || !ns->private || !ns->ctrl ||
+        !ns->backend || !ns->backend->logical_space || ns->backend->size <= 0 ||
+        !result) {
+        return CEMU_KV_INVALID;
+    }
+    nns = nvm_ns(ns);
+    params = nns->params;
+    if (!params || !nns->ch || nns->namespace != ns || nns->native_io_used || nns->maptbl ||
+        nns->rmap || nns->lm.lines || params->secsz <= 0 || params->secs_per_pg <= 0 ||
+        params->pg_wr_lat < 0 || params->pg_rd_lat < 0) {
+        return CEMU_KV_INVALID;
+    }
+    page_bytes = (uint64_t)params->secsz * params->secs_per_pg;
+    if (page_bytes > UINT32_MAX) {
+        return CEMU_KV_INVALID;
+    }
+    config = (CemuKvMapConfig){
+        .controller = ns->ctrl->drive_id, .namespace_id = ns->id,
+        .nand = { .channels = params->nchs, .luns_per_channel = params->luns_per_ch,
+                  .planes_per_lun = params->pls_per_lun,
+                  .blocks_per_plane = params->blks_per_pl,
+                  .pages_per_block = params->pgs_per_blk, .page_bytes = page_bytes },
+        .backend_bytes = ns->backend->size,
+        .max_tasks = max_tasks, .max_pages = max_pages,
+        .memory_budget_bytes = memory_budget_bytes,
+    };
+    status = cemu_kv_io_create(&config, &operations, nns, result);
+    if (status == CEMU_KV_OK) {
+        g_mutex_init(&nns->native_io_lock);
+        nns->native_io = *result;
+        nns->native_io_used = true;
+    }
+    return status;
+}
+
+void bb_native_io_destroy(NvmeNamespace *ns)
+{
+    NvmNamespace *nns;
+
+    if (!ns || ns->csi != NVME_CSI_NVM || !ns->private) {
+        return;
+    }
+    nns = nvm_ns(ns);
+    if (!nns->native_io_used) {
+        return;
+    }
+    g_mutex_lock(&nns->native_io_lock);
+    cemu_kv_io_destroy(nns->native_io);
+    nns->native_io = NULL;
+    g_mutex_unlock(&nns->native_io_lock);
+}
+
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(NvmNamespace *nns, struct ppa *ppa)
 {
@@ -1059,6 +1172,24 @@ static uint64_t ssd_write(NvmNamespace *nns, uint64_t slba, uint16_t nlb, uint64
     return maxlat;
 }
 
+static bool sparf_internal_cancelled(const NvmeRequest *request)
+{
+    return request->sparf_cancelled && g_atomic_int_get(request->sparf_cancelled);
+}
+
+static bool memory_copy_pending_ready(const NvmeRequest *request, uint64_t now)
+{
+    return sparf_internal_cancelled(request) || now >= request->stat.stime;
+}
+
+static void sparf_cancel_internal_io(NvmeRequest *request)
+{
+    request->status = NVME_CMD_ABORT_REQ | NVME_DNR;
+    request->cqe.n.result = 0;
+    request->stat.pcie_lat = 0;
+    request->stat.expire_time = clock_ns();
+}
+
 #ifdef CEMU_THROTTLE_INTERNAL
 static uint64_t memory_copy_nvm(NvmeNamespace *ns, NvmeRequest *req, struct memory_copy_queue *memcpy_queue)
 #else
@@ -1074,6 +1205,10 @@ static uint64_t memory_copy_nvm(NvmeNamespace *ns, NvmeRequest *req)
     uint64_t maxlat = 0;
     femu_debug("memory_copy nr_sres %d\n", req->nr_sres);
     for (int i = 0; i < req->nr_sres; i++) {
+        if (sparf_internal_cancelled(req)) {
+            sparf_cancel_internal_io(req);
+            return 0;
+        }
         femu_debug("memory_copy i %d\n", i);
         NvmeCopyFormat2 *sre = &req->sres[i].cf2;
         uint64_t slba = le64_to_cpu(sre->slba);
@@ -1093,9 +1228,13 @@ static uint64_t memory_copy_nvm(NvmeNamespace *ns, NvmeRequest *req)
         femu_debug("memory_copy off %lu, nbyte %lu, sdaddr 0x%p\n", off, nbyte, sdaddr);
         if (req->is_write && memory_backend &&
             backend_cuda_prepare_host(memory_backend, sdaddr, nbyte) != 0) {
-            return NVME_DNR;
+            req->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            return maxlat;
         }
-        backend_rw_internal(sns->backend, sdaddr, off, nbyte, req->is_write);
+        if (backend_rw_internal(sns->backend, sdaddr, off, nbyte, req->is_write)) {
+            req->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            return maxlat;
+        }
         if (!req->is_write && memory_backend) {
             backend_cuda_mark_host_dirty(memory_backend, sdaddr, nbyte);
         }
@@ -1288,7 +1427,7 @@ static void *ftl_thread(void *arg)
                 ts = clock_ns();
                 for (int j = 0; j < 8192; j++) {
                     if (pending_queue_flag[j]) {
-                        if (ts >= pending_queue[j]->stat.stime) {
+                        if (memory_copy_pending_ready(pending_queue[j], ts)) {
                             req = pending_queue[j];
                             pending_queue[j] = NULL;
                             pending_queue_flag[j] = 0;
@@ -1313,7 +1452,10 @@ static void *ftl_thread(void *arg)
                 }
             }
 
-            if (is_pending) {
+            if (sparf_internal_cancelled(req)) {
+                sparf_cancel_internal_io(req);
+                lat = 0;
+            } else if (is_pending) {
                 lat = memory_copy_nvm(req->ns, req);
                 // free(req->sres);
             } else if (req->ns == ns) {

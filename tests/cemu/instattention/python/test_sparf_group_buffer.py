@@ -41,6 +41,11 @@ class GroupBufferTest(unittest.TestCase):
         cls.library.group_buffer_test_wait_write.argtypes = [ctypes.c_void_p]
         cls.library.group_buffer_test_wait_write.restype = ctypes.c_int
         cls.library.group_buffer_test_free.argtypes = [ctypes.c_void_p]
+        cls.library.group_buffer_test_target.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        cls.library.group_buffer_test_target_entered.argtypes = [ctypes.c_void_p]
+        cls.library.group_buffer_test_target_entered.restype = ctypes.c_int
+        cls.library.group_buffer_test_abort.argtypes = [ctypes.c_void_p]
+        cls.library.group_buffer_test_abort.restype = ctypes.c_uint64
         cls.library.group_buffer_test_totals.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.library.group_buffer_test_write_stats.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.library.group_buffer_test_lun_pages.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
@@ -78,6 +83,72 @@ class GroupBufferTest(unittest.TestCase):
                          self.values[:, start:stop].transpose(1, 0, 2))).tobytes()
         return self.execute(command(APPEND_BATCH, self.cookie, position=start,
                                     count=stop - start, argument=len(self.keys)), data)
+
+    def test_abort_discards_unsealed_tail_without_drain(self):
+        self.register()
+        self.assertEqual(self.append_batch(0, 15)[0], 1)
+        self.assertEqual(self.library.group_buffer_test_abort(self.context), 0)
+        totals = np.zeros(2, np.uint64)
+        self.library.group_buffer_test_totals(self.context, totals.ctypes.data)
+        np.testing.assert_array_equal(totals, [0, 0])
+
+    def test_abort_cancels_frozen_target_without_publishing(self):
+        self.register()
+        self.library.group_buffer_test_target(self.context, 1)
+        self.assertEqual(self.append_batch(0, 16)[0], 1)
+        deadline = time.monotonic() + 2
+        while not self.library.group_buffer_test_target_entered(self.context):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+        published = []
+        worker = threading.Thread(target=lambda: published.append(
+            self.library.group_buffer_test_abort(self.context)), daemon=True)
+        worker.start()
+        try:
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive(), "cleanup waited for frozen target time")
+            self.assertEqual(published, [0])
+        finally:
+            self.library.group_buffer_test_target(self.context, 0)
+            worker.join(timeout=2)
+
+    def test_abort_waits_for_inflight_transfer_before_freeing(self):
+        self.register()
+        self.library.group_buffer_test_gate(self.context, 1, 0)
+        self.assertEqual(self.append_batch(0, 16)[0], 1)
+        self.assertEqual(self.library.group_buffer_test_wait_write(self.context), 1)
+        published = []
+        worker = threading.Thread(target=lambda: published.append(
+            self.library.group_buffer_test_abort(self.context)), daemon=True)
+        worker.start()
+        try:
+            worker.join(timeout=0.05)
+            self.assertTrue(worker.is_alive(), "freed storage before transfer returned")
+        finally:
+            self.library.group_buffer_test_gate(self.context, 0, 0)
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(published, [0])
+
+    def test_drain_waits_for_target_and_publishes_normally(self):
+        self.register()
+        self.library.group_buffer_test_target(self.context, 1)
+        self.assertEqual(self.append_batch(0, 16)[0], 1)
+        completed = []
+        worker = threading.Thread(target=lambda: completed.append(
+            self.execute(command(DRAIN, self.cookie))[0]), daemon=True)
+        worker.start()
+        try:
+            worker.join(timeout=0.05)
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(completed, [])
+        finally:
+            self.library.group_buffer_test_target(self.context, 0)
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(completed, [1])
+        for stream in range(2):
+            np.testing.assert_array_equal(self.progress(stream)[:6], [16, 16, 16, 16, 1, 0])
 
     def test_batch_wrap_tail_and_terminal_drain(self):
         self.register(batch_pages=256)

@@ -197,7 +197,10 @@ static uint16_t memory_copy(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         }
         sns = nvme_find_namespace(n, snsid);
         femu_debug("memory_copy fdm->fdm: soff %lu, doff %lu, nbyte %lu, stime %zu\n", off, sdaddr, nbyte, req->stat.stime);
-        backend_rw_internal(sns->backend, data, off, nbyte, 1);
+        if (backend_rw_internal(sns->backend, data, off, nbyte, 1)) {
+            req->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            return 1;
+        }
         data += nbyte;
         copyed += nbyte;
     }
@@ -226,6 +229,10 @@ static int memory_io_cmd(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         req->status = memory_fill(ns, cmd, req);
         break;
     case NVME_CMD_MEMORY_COPY:
+        if (ns->ctrl->native_kv) {
+            req->status = NVME_INVALID_OPCODE;
+            return 1;
+        }
         req->is_write = 1;
         return memory_copy(ns, cmd, req);
     case NVME_CMD_MEMORY_READ:
@@ -250,13 +257,22 @@ static void memory_init(NvmeNamespace *ns, Error **err)
     MemoryNamespace *mns = malloc(sizeof(MemoryNamespace));
     ns->private = mns;
     // nvme_init_slm(n, ns);
-    init_backend(&ns->backend, FEMU_DRAM_BACKEND, NULL, ns->size);
+    if (!ns->ctrl->native_kv)
+        init_backend(&ns->backend, FEMU_DRAM_BACKEND, NULL, ns->size);
+}
+
+static void memory_exit(NvmeNamespace *ns)
+{
+    if (ns->ctrl->native_kv) {
+        free(ns->private);
+        ns->private = NULL;
+    }
 }
 
 CommandSetOps memory_command_set_ops = {
     .state            = NULL,
     .init             = memory_init,
-    .exit             = NULL,
+    .exit             = memory_exit,
     .rw_check_req     = NULL,
     .admin_cmd        = NULL,
     .io_cmd           = memory_io_cmd,

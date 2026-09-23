@@ -944,6 +944,7 @@ typedef struct NvmeRequest {
     int                     p2p_req;
     void                    *sdaddr;    // copy source address
     SsdBackend              *sdaddr_backend; // NULL for private CSD buffers
+    const gint              *sparf_cancelled;
     /* Borrowed by a private SparF read until its FTL completion. */
     FemuReadObservation     *read_observation;
     CemuKvPageTag           *kv_pages;
@@ -1371,8 +1372,21 @@ typedef struct FemuCtrl {
 
     // config file path
     char*            config_file;
+    char*            dump_config_file;
     char*            nvm_backend_file;
+    uint64_t         native_kv_buffer_budget;
+    uint32_t         native_kv_page_limit;
+    char            *ftl_mode;
+    bool            native_kv;
+    bool            native_stop;
+    bool            native_ready;
+    uint64_t        native_inflight;
+    void            *native_poller_args;
+    QemuMutex       native_lock;
 } FemuCtrl;
+
+void nvme_native_stop(FemuCtrl *n);
+void nvme_native_release_irq(NvmeCQueue *cq);
 
 typedef struct NvmePollerThreadArgument {
     FemuCtrl        *n;

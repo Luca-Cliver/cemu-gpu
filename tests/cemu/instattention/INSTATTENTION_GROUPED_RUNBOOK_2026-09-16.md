@@ -1,5 +1,10 @@
 # Grouped OPT runbook
 
+This is the existing pool/extent-backed grouped mode, not the proposed native KV FTL.
+See the [development baseline](../../../docs/cemu/DEVELOPMENT_HISTORY.md) and
+[FTL work log](FTL_WORKLOG.md) for current evidence and implementation status.
+Recheck GPU ownership, mounts, ratio coverage and capacity before using these example commands.
+
 This run uses the new device-owned grouped KV path. It is opt-in; omit
 `SPARF_GROUPED=1` to run the old SparF path for A/B. Do not run it until QEMU
 has been rebuilt and the VM has been restarted with that binary.

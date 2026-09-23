@@ -4,7 +4,7 @@
 下文包含 G3 存储逻辑及后续跨 head 批量写回。OPT runner 已通过 `SPARF_GROUPED=1` 可选接入。
 
 状态：生产设备逻辑和 QEMU 入口已实现，Host 回归测试通过；用户提供的 Guest 集成日志也已通过。
-后续 Attention 桥接也已获用户反馈通过，最新边界和待办见 [INSTATTENTION_HANDOFF_2026-09-15.md](INSTATTENTION_HANDOFF_2026-09-15.md)。
+后续 Attention 桥接及 OPT 接入的基线见 [开发历史](../../../docs/cemu/DEVELOPMENT_HISTORY.md)，新 FTL 待办见 [FTL 工作记录](FTL_WORKLOG.md)。
 此路径接在 G2 分组页目录之后，不替换旧 spans/compact、非 grouped SparF 路径，也不修改 freezing。
 没有宣称已经完整复现 InstAttention，更不以运行时间接近论文作为本阶段通过条件。
 
@@ -77,6 +77,14 @@ Guest 适配器用锁串行保护共享 MR0 的整个事务；后台任务不依
 后台写不执行算子、不申请 CU、不冻结 VM。它复用旧 `sparf_wb_transfer` 拆出的公共传输函数，
 保持原实际 IO、FTL 排队和 `clock_ns() < expire_time` 的等待，不删模拟耗时，不跳过 NVM。
 终结 DRAIN 计入测试完整完成边界；APPEND 返回只表示数据接收，不表示已经持久化。
+
+正常 DRAIN/CLOSE 仍排空全部已接受数据并等待目标时间。底层 `sparf_group_free` 则只负责
+取消和释放，不再隐式 drain：它停止新写批次、取消未来目标时间的等待，收回已提交 FTL
+请求的所有权并 join 后才释放 scratch/MRS 引用；取消批次不发布 committed 前缀。
+只对 grouped 后台请求设置取消标志；尚在 FTL 限速等待队列的取消请求可不等未来时钟，
+由 FTL 回送取消完成。普通请求没有此标志，保持原有调度条件。
+直接 UNLOAD 未排空会话属于放弃未发布 KV，会输出警告，不能当作持久化成功。
+取消不强行中断尚未返回的真实 FTL IO，也不修改原生 CEMU 线程退出或 VM freezing。
 
 ## 4. ABI 扩展
 

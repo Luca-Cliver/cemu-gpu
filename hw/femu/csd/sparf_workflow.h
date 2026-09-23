@@ -5,6 +5,7 @@
 #define FEMU_CSD_SPARF_WORKFLOW_H
 
 #include "sparf_autonomous_trace.h"
+#include "hw/femu/sparf_storage.h"
 
 typedef struct SparfScoreIndex {
     float score;
@@ -23,6 +24,8 @@ enum SparfWait {
 
 typedef struct SparfAutonomous {
     SparfGroupSession *group_session;
+    CemuSparfStorageRead storage_read;
+    void *storage_opaque;
     enum SparfResume resume;
     enum SparfWait wait;
     uint64_t deadline;
@@ -37,6 +40,45 @@ typedef struct SparfAutonomous {
     uint16_t rsid;
     SparfAutonomousTrace *timeline;
 } SparfAutonomous;
+
+static bool sparf_start_bound_read(ComputeJob *job, SparfAutonomous *state,
+    const struct cemu_sparf_workflow_header *header, const uint32_t *indices,
+    uint32_t kind, uint32_t destination_range, struct rte_ring *ring,
+    uint64_t start, SparfRead *read, FemuReadObservation *observation)
+{
+    if (!state->storage_read) {
+        return sparf_start_grouped_read(job, state->group_session, header, indices,
+            kind, destination_range, ring, start, read, observation);
+    }
+    uint64_t vectors = (uint64_t)header->batch_size * header->num_query_heads;
+    uint32_t element = header->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+    uint64_t bytes = kind == CEMU_SPARF_GROUP_CHANNEL_K ?
+        vectors * header->top_r * header->valid_tokens * element :
+        vectors * (header->top_k + (kind == CEMU_SPARF_GROUP_TOKEN_V)) * header->head_dim * element;
+    CemuSparfStorageResult result = {0};
+
+    if (job->args.mr_len[destination_range] < 0 || bytes > (uint64_t)job->args.mr_len[destination_range] ||
+        backend_cuda_prepare_host(job->mr_backend[destination_range], job->args.mr_addr[destination_range], bytes)) {
+        return false;
+    }
+    bool success = state->storage_read(state->storage_opaque, header, indices, kind,
+        job->args.mr_addr[destination_range], bytes, start, &result);
+    backend_cuda_mark_host_dirty(job->mr_backend[destination_range], job->args.mr_addr[destination_range], bytes);
+    if (!success || result.ready_ns < start) {
+        return false;
+    }
+    *read = (SparfRead){ .internal = true, .internal_model_ns = result.ready_ns - start };
+    if (observation) {
+        observation->model_start_ns = start;
+        observation->model_end_ns = result.ready_ns;
+        observation->submitted_bytes = result.flash_bytes;
+        observation->tail_bytes = result.tail_bytes;
+        observation->logical_bytes = result.output_bytes - result.tail_bytes;
+        observation->pages = result.pages;
+        observation->ranges = result.batches;
+    }
+    return true;
+}
 
 static void sparf_trace_stamp(SparfTraceStamp *stamp)
 {
@@ -230,7 +272,7 @@ static uint64_t run_sparf_workflow(ComputeJob *job, uint64_t *modeled_runtime,
     struct cemu_sparf_workflow_trace trace = { 0 };
     memcpy(&header, job->args.data_buffer, sizeof(header));
     bool grouped = header.flags & CEMU_SPARF_WORKFLOW_GROUPED;
-    if (grouped && (!autonomous || !autonomous->group_session)) return (uint64_t)-1;
+    if (grouped && (!autonomous || (!autonomous->group_session && !autonomous->storage_read))) return (uint64_t)-1;
     struct cemu_sparf_buffer_tail tail = { header.valid_tokens, 0 };
     if (header.flags & CEMU_SPARF_WORKFLOW_BUFFERED) {
         if (job->args.buffer_len < sizeof(header) + sizeof(tail)) return (uint64_t)-1;
@@ -365,7 +407,7 @@ static uint64_t run_sparf_workflow(ComputeJob *job, uint64_t *modeled_runtime,
         }
         if (grouped) {
             g_array_free(channel_spans, TRUE);
-            if (!sparf_start_grouped_read(job, autonomous->group_session, &header, channels,
+            if (!sparf_start_bound_read(job, autonomous, &header, channels,
                 CEMU_SPARF_GROUP_CHANNEL_K, 1, ring, model_cursor, &channel_read,
                 read_observations[0])) goto out;
         } else if (!sparf_start_read(job, ring, channel_k_map, header.channel_k_extents,
@@ -505,7 +547,7 @@ resume_key_start:
             timeline->reads[1].submitted.virtual_ns = model_cursor;
         }
         if (grouped) {
-            if (!sparf_start_grouped_read(job, autonomous->group_session, &header, tokens,
+            if (!sparf_start_bound_read(job, autonomous, &header, tokens,
                 CEMU_SPARF_GROUP_TOKEN_K, 2, ring, model_cursor, &key_read,
                 read_observations[1])) goto out;
         } else if (!sparf_start_read(job, ring, token_k_map, header.token_k_extents,
@@ -560,7 +602,7 @@ resume_exact:
             timeline->reads[2].submitted.virtual_ns = model_cursor;
         }
         if (grouped) {
-            if (!sparf_start_grouped_read(job, autonomous->group_session, &header, tokens,
+            if (!sparf_start_bound_read(job, autonomous, &header, tokens,
                 CEMU_SPARF_GROUP_TOKEN_V, 3, ring, model_cursor, &value_read,
                 read_observations[2])) goto out;
         } else if (!sparf_start_read(job, ring, token_v_map, header.token_v_extents,

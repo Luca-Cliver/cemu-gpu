@@ -10,6 +10,14 @@
 #define CEMU_SPARF_WORKFLOW_TRACE 1U
 #define CEMU_SPARF_WORKFLOW_BUFFERED 2U
 #define CEMU_SPARF_WORKFLOW_GROUPED 4U
+#define CEMU_SPARF_WORKFLOW_NATIVE 8U
+
+struct cemu_sparf_native_binding {
+    uint32_t task;
+    uint32_t generation;
+    uint32_t batch_first;
+    uint32_t reserved;
+};
 
 struct cemu_sparf_group_binding {
     uint64_t cookie;

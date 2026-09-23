@@ -635,7 +635,7 @@ void *sched_thread(void *arg)
     pqueue_t *pq = pqueue_init(cns->params->nr_cu, pqueue_cmppri, pqueue_getpri_cu,
             pqueue_setpri_cu, pqueue_getpos_cu, pqueue_setpos_cu);
 
-    while (!ns->ctrl->dataplane_started) {
+    while (!ns->ctrl->dataplane_started && !qatomic_read(&cns->native_shutdown)) {
         usleep(100000);
     }
 
@@ -648,7 +648,7 @@ void *sched_thread(void *arg)
         pqueue_insert(pq, cu);
     }
 
-    while (1) {
+    while (!qatomic_read(&cns->native_shutdown)) {
         // add newly arrived job to compute unit's job queue
         // return mask of cu that needs reschedule (preemption occurred)
         uint64_t cu_mask = enqueue_staged_job(cns, ce);
@@ -656,6 +656,9 @@ void *sched_thread(void *arg)
         // cu is the compute unit with the earliest next_sched_time
         cu = pqueue_peek(pq);
         now = clock_ns();
+        if (ns->ctrl->native_kv && qatomic_read(&ns->ctrl->native_stop)) {
+            cu_mask = UINT64_MAX;
+        }
         if (now >= cu->next_sched_time) {
             cu_mask = mask_cu(cu_mask, cu->id);
         }
@@ -683,7 +686,8 @@ void *sched_thread(void *arg)
                 if (next_job) {
                     // exec time comes from functional simulation
                     uint64_t exec_time = job_exec_time(next_job);
-                    if (next_job->runtime >= exec_time) {
+                    if (next_job->runtime >= exec_time ||
+                        (ns->ctrl->native_kv && qatomic_read(&ns->ctrl->native_stop))) {
                         // job has finished
                         job_finish(ce, scheduler, next_job, now);
                         last_job = NULL;
@@ -721,4 +725,6 @@ void *sched_thread(void *arg)
             }
         }
     }
+    pqueue_free(pq);
+    return NULL;
 }

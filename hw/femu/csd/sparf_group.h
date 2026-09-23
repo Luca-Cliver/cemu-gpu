@@ -41,6 +41,7 @@ typedef struct SparfGroupBuffer {
     bool stop;
     SparfWritebackTransfer transfer;
     void (*dirty)(void *, uint8_t *, uint64_t);
+    GDestroyNotify cancel;
     GDestroyNotify release;
     void *opaque;
 } SparfGroupBuffer;

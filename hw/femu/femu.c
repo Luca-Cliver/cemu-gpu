@@ -4,6 +4,8 @@
 #include "./nvme.h"
 #include "./statistics/statistics.h"
 #include "./param.h"
+#include "bbssd/bb.h"
+#include "csd/compute.h"
 #include "qemu/uuid.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +24,10 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
 {
     int i;
 
+    if (n->native_kv) {
+        nvme_native_stop(n);
+    }
+
     /* Coperd: pause nvme poller at earliest convenience */
     n->dataplane_started = false;
 
@@ -31,12 +37,12 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
         femu_debug("disabling NVMe Controller ...\n");
     }
 
-    if (shutdown) {
+    if (shutdown || n->native_kv) {
         femu_debug("%s,clear_guest_notifier\n", __func__);
         nvme_clear_virq(n);
     }
 
-    if (shutdown) {
+    if (shutdown && !n->native_kv) {
         femu_log("nr_tt_ios: %lu, nr_tt_late_ios: %lu, %f%%\n", n->nr_tt_ios, n->nr_tt_late_ios, n->nr_tt_late_ios * 100.0 / n->nr_tt_ios);
         femu_log("max_processed: %lu\n", n->stat->max_processed);
         int64_t stop = clock_ns();
@@ -60,6 +66,17 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
     n->bar.cc = 0;
     n->features.temp_thresh = 0x14d;
     n->temp_warn_issued = 0;
+    if (n->native_kv) {
+        AddressSpace *space = pci_get_address_space(&n->parent_obj);
+        if (n->dbs_addr_hva) {
+            dma_memory_unmap(space, (void *)n->dbs_addr_hva, n->page_size,
+                             DMA_DIRECTION_TO_DEVICE, n->page_size);
+        }
+        if (n->eis_addr_hva) {
+            dma_memory_unmap(space, (void *)n->eis_addr_hva, n->page_size,
+                             DMA_DIRECTION_FROM_DEVICE, n->page_size);
+        }
+    }
     n->dbs_addr = 0;
     n->dbs_addr_hva = 0;
     n->eis_addr = 0;
@@ -428,11 +445,14 @@ static SsdBackend *init_nvm_backend(FemuCtrl *n, NvmeNamespace *ns)
 
     if (ns->csi == NVME_CSI_NVM && n->nvm_backend_file &&
         n->nvm_backend_file[0]) {
-        type = FEMU_FILE_BACKEND;
+        type = n->native_kv ? FEMU_NEW_FILE_BACKEND : FEMU_FILE_BACKEND;
         path = n->nvm_backend_file;
     }
     if (init_backend(&mbe, type, path, ns->size) != 0) {
         femu_err("Failed to initialize namespace %u backend\n", ns->id);
+        if (n->native_kv) {
+            return NULL;
+        }
         abort();
     }
 
@@ -465,11 +485,18 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
         ns->util = bitmap_new(num_blks);
         ns->uncorrectable = bitmap_new(num_blks);
         ns->backend = init_nvm_backend(n, ns);
+        if (!ns->backend) {
+            error_setg(errp, "Native KV requires a new exclusive backend file; existing paths are refused");
+            return -1;
+        }
     }
 
     // TODO: different ns impl, open-channel, fpga...
     if (ns->ops->init) {
         ns->ops->init(ns, errp);
+        if (errp && *errp) {
+            return -1;
+        }
     }
 
     return 0;
@@ -490,6 +517,19 @@ static int nvme_init_namespaces(FemuCtrl *n, Error **errp)
 
 static void nvme_delete_namespace(NvmeNamespace *ns)
 {
+    if (ns->ctrl->native_kv) {
+        if (ns->ops->exit) {
+            ns->ops->exit(ns);
+        }
+        if (ns->backend) {
+            free_backend(ns->backend);
+            ns->backend = NULL;
+        }
+        g_free(ns->util);
+        g_free(ns->uncorrectable);
+        g_free(ns->params);
+        return;
+    }
     if (ns->backend) {
         free_backend(ns->backend);
     }
@@ -584,7 +624,9 @@ static void nvme_init_ctrl(FemuCtrl *n)
     n->bar.intmc = n->bar.intms = 0;
     n->temperature = NVME_TEMPERATURE;
 
-    nvme_init_ctrl_str(n);
+    if (!n->native_kv) {
+        nvme_init_ctrl_str(n);
+    }
 }
 
 static void nvme_init_cmb(FemuCtrl *n)
@@ -616,10 +658,12 @@ static void nvme_init_pci(FemuCtrl *n)
                           n->reg_size);
     pci_register_bar(&n->parent_obj, 0, PCI_BASE_ADDRESS_SPACE_MEMORY |
                      PCI_BASE_ADDRESS_MEM_TYPE_64, &n->iomem);
-    memory_region_init_io(&n->slm_mem, OBJECT(n), &slm_mmio_ops, n, "nvme-slm",
-                          n->namespaces[1].size);
-    pci_register_bar(&n->parent_obj, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
-                     PCI_BASE_ADDRESS_MEM_TYPE_64, &n->slm_mem);
+    if (n->num_namespaces == 3) {
+        memory_region_init_io(&n->slm_mem, OBJECT(n), &slm_mmio_ops, n, "nvme-slm",
+                              n->namespaces[1].size);
+        pci_register_bar(&n->parent_obj, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
+                         PCI_BASE_ADDRESS_MEM_TYPE_64, &n->slm_mem);
+    }
     if (msix_init_exclusive_bar(&n->parent_obj, n->nr_io_queues + 1, 4, NULL)) {
         return;
     }
@@ -632,17 +676,88 @@ static void nvme_init_pci(FemuCtrl *n)
 
 static void femu_realize(PCIDevice *pci_dev, Error **errp)
 {
-    // TODO: if set dump config file, override all parameters here
     FemuCtrl *n = FEMU(pci_dev);
+
+    if (n->dump_config_file && n->dump_config_file[0]) {
+        g_free(n->config_file);
+        n->config_file = g_strdup(n->dump_config_file);
+    }
+    if (!n->config_file || !n->config_file[0]) {
+        error_setg(errp, "A config_file or dump_config_file is required");
+        return;
+    }
+    n->native_ready = false;
+    if (n->ftl_mode && strcmp(n->ftl_mode, "femu") && strcmp(n->ftl_mode, "instattention")) {
+        error_setg(errp, "Unknown ftl_mode: %s", n->ftl_mode);
+        return;
+    }
+    n->native_kv = n->ftl_mode && !strcmp(n->ftl_mode, "instattention");
     if (parse_config(n)) {
+        if (n->native_kv) {
+            error_setg(errp, "Invalid native KV namespace geometry");
+            for (int index = 0; index < n->num_namespaces; index++) {
+                g_free(n->namespaces[index].params);
+            }
+            g_free(n->namespaces);
+            return;
+        }
         femu_err("parse config file err!");
         abort();
+    }
+
+    if (n->native_kv) {
+        bool csd = n->num_namespaces == 3 && n->namespaces[1].csi == NVME_CSI_MEMORY &&
+                   n->namespaces[2].csi == NVME_CSI_COMPUTE;
+        NvmParams *params = (n->num_namespaces == 1 || csd) ? n->namespaces[0].params : NULL;
+        if ((n->num_namespaces != 1 && !csd) || n->cmbsz || n->namespaces[0].csi != NVME_CSI_NVM ||
+            !n->nvm_backend_file || !n->nvm_backend_file[0] || !params ||
+            (uint64_t)params->secsz * params->secs_per_pg != 4096 ||
+            params->nchs <= 0 || params->nchs > 128 ||
+            params->luns_per_ch <= 0 || params->luns_per_ch > 256 ||
+            params->pls_per_lun <= 0 || params->pls_per_lun > 256 ||
+            params->blks_per_pl <= 0 || params->blks_per_pl > 65536 ||
+            params->pgs_per_blk <= 0 || params->pgs_per_blk > 65536 ||
+            params->pg_rd_lat < 0 || params->pg_wr_lat < 0 ||
+            !n->native_kv_page_limit || n->native_kv_page_limit > (1U << 24) ||
+            !n->native_kv_buffer_budget || n->native_kv_buffer_budget > 64 * GiB ||
+            n->pcie_bandwidth == 0) {
+            error_setg(errp, "Native KV requires one NVM namespace, optionally followed by FDM/compute, 4KiB NAND pages and a fresh backend path");
+            for (int index = 0; index < n->num_namespaces; index++) {
+                g_free(n->namespaces[index].params);
+            }
+            g_free(n->namespaces);
+            return;
+        }
+        n->nr_pollers = 1;
+        n->multipoller_enabled = 0;
+        n->cq_poller_enabled = 0;
+        n->oacs = 0;
+        n->oncs = 0;
+        if (csd) {
+            ComputeParams *compute = n->namespaces[2].params;
+            if (!compute->nr_thread || compute->nr_thread > 64 || !compute->nr_cu || compute->nr_cu > 64) {
+                error_setg(errp, "Native compute requires nr_thread and nr_cu in [1,64]");
+                for (int index = 0; index < n->num_namespaces; index++) g_free(n->namespaces[index].params);
+                g_free(n->namespaces);
+                return;
+            }
+        }
+        qemu_mutex_init(&n->native_lock);
+        nvme_init_ctrl_str(n);
     }
 
     nvme_check_size();
 
     if (nvme_check_constraints(n)) {
         femu_err("nvme_check_constraints failed!");
+        if (n->native_kv) {
+            error_setg(errp, "Invalid native NVMe controller parameters");
+            qemu_mutex_destroy(&n->native_lock);
+            for (int index = 0; index < n->num_namespaces; index++) {
+                g_free(n->namespaces[index].params);
+            }
+            g_free(n->namespaces);
+        }
         return;
     }
 
@@ -658,10 +773,39 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->aer_reqs = g_malloc0(sizeof(NvmeRequest*) * (n->aerl + 1));
     n->features.int_vector_config = g_malloc0(sizeof(*n->features.int_vector_config) * (n->nr_io_queues + 1));
 
-    nvme_init_namespaces(n, errp);
+    if (nvme_init_namespaces(n, errp)) {
+        if (n->native_kv) {
+            qatomic_set(&n->native_stop, true);
+            for (int index = n->num_namespaces - 1; index >= 0; index--) {
+                NvmeNamespace *ns = &n->namespaces[index];
+                if (ns->private && ns->ops->exit) ns->ops->exit(ns);
+                if (ns->backend) free_backend(ns->backend);
+                g_free(ns->util);
+                g_free(ns->uncorrectable);
+                g_free(ns->params);
+            }
+            qemu_mutex_destroy(&n->native_lock);
+            g_free(n->namespaces);
+            g_free(n->features.int_vector_config);
+            g_free(n->aer_reqs);
+            g_free(n->elpes);
+            g_free(n->cq);
+            g_free(n->sq);
+        }
+        return;
+    }
     nvme_init_pci(n);
     nvme_init_ctrl(n);
-    femu_stat_init(n);
+    if (n->native_kv) {
+        n->stat = g_new0(FemuStat, 1);
+        n->stat->capacity = FEMU_STAT_CAPACITY;
+        n->stat->start_time = clock_ns();
+        n->stat->alive = 1;
+        n->stat_shm_fd = -1;
+    } else {
+        femu_stat_init(n);
+    }
+    n->native_ready = n->native_kv;
 
     dump_config(n);
 }
@@ -689,11 +833,25 @@ static void femu_exit(PCIDevice *pci_dev)
 
     femu_debug("femu_exit starting!\n");
 
-    for (int i = 0; i < n->num_namespaces; i++) {
-        nvme_delete_namespace(&n->namespaces[i]);
+    if (n->native_kv) {
+        if (!n->native_ready) {
+            return;
+        }
+        nvme_clear_ctrl(n, true);
     }
-    nvme_clear_ctrl(n, true);
-    nvme_destroy_poller(n);
+
+    for (int i = 0; i < n->num_namespaces; i++) {
+        int index = n->native_kv ? n->num_namespaces - 1 - i : i;
+        nvme_delete_namespace(&n->namespaces[index]);
+    }
+    if (!n->native_kv) {
+        nvme_clear_ctrl(n, true);
+        nvme_destroy_poller(n);
+    } else {
+        qemu_mutex_destroy(&n->native_lock);
+        g_free(n->stat);
+        n->native_ready = false;
+    }
 
     g_free(n->namespaces);
     g_free(n->features.int_vector_config);
@@ -710,7 +868,11 @@ static void femu_exit(PCIDevice *pci_dev)
 
 static Property femu_props[] = {
     DEFINE_PROP_STRING("config_file", FemuCtrl, config_file),
+    DEFINE_PROP_STRING("dump_config_file", FemuCtrl, dump_config_file),
     DEFINE_PROP_STRING("nvm_backend_file", FemuCtrl, nvm_backend_file),
+    DEFINE_PROP_UINT64("native_kv_buffer_budget", FemuCtrl, native_kv_buffer_budget, 64 * MiB),
+    DEFINE_PROP_UINT32("native_kv_page_limit", FemuCtrl, native_kv_page_limit, 65536),
+    DEFINE_PROP_STRING("ftl_mode", FemuCtrl, ftl_mode),
     DEFINE_PROP_END_OF_LIST(),
 };
 

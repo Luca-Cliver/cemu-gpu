@@ -1,4 +1,6 @@
 #include "../nvme.h"
+#include "instattention_io.h"
+#include "instattention_buffer.h"
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
@@ -193,6 +195,14 @@ typedef struct NvmParams {
 } NvmParams;
 
 typedef struct NvmNamespace {
+    CemuKvIo *native_io;
+    GMutex native_io_lock;
+    bool native_io_used;
+    bool native_stop;
+    bool native_started;
+    uint64_t native_deadline;
+    uint8_t *native_buffer;
+    NativeKvBuffer *native_tail;
     struct line_mgmt lm;
     struct write_pointer wp;
     struct write_pointer kv_wp[3];
@@ -226,3 +236,44 @@ static inline NvmParams *nvm_params(NvmeNamespace *ns)
 }
 
 void ftl_init(NvmeNamespace *ns);
+CemuKvStatus bb_native_io_create(NvmeNamespace *ns, size_t max_tasks,
+                                 size_t max_pages, size_t memory_budget_bytes,
+                                 CemuKvIo **result);
+void bb_native_io_destroy(NvmeNamespace *ns);
+#define CEMU_NATIVE_INTERNAL_MAX_PAGES 256
+
+typedef struct CemuKvDevicePage {
+    CemuKvCoordinate coordinate;
+    uint32_t valid_tokens;
+    void *buffer;
+    size_t bytes;
+    CemuKvIoResult result;
+} CemuKvDevicePage;
+
+typedef struct CemuKvDeviceBatchResult {
+    uint32_t completed_pages;
+    uint64_t transferred_bytes;
+    uint64_t ready_ns;
+} CemuKvDeviceBatchResult;
+
+CemuKvStatus bb_native_kv_batch(NvmeNamespace *ns,
+                               const CemuKvIdentity *identity,
+                               CemuKvDevicePage *pages, uint32_t count,
+                               bool write, uint64_t start_ns,
+                               CemuKvDeviceBatchResult *result);
+CemuKvStatus bb_native_kv_register(NvmeNamespace *ns,
+                                  const CemuKvIdentity *identity,
+                                  const CemuKvGeometry *geometry);
+CemuKvStatus bb_native_kv_transfer(NvmeNamespace *ns,
+                                  const CemuKvIdentity *identity,
+                                  const CemuKvCoordinate *coordinate,
+                                  uint32_t valid_tokens, void *buffer,
+                                  size_t bytes, bool write, uint64_t start_ns,
+                                  CemuKvIoResult *result);
+CemuKvStatus bb_native_kv_snapshot(NvmeNamespace *ns, CemuKvMapStats *stats,
+                                  uint64_t *deadline);
+void bb_native_namespace_init(NvmeNamespace *ns, Error **errp);
+void bb_native_namespace_exit(NvmeNamespace *ns);
+void bb_native_start(NvmeNamespace *ns);
+void bb_native_stop(NvmeNamespace *ns);
+int bb_native_submit(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);

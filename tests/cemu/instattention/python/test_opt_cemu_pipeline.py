@@ -58,6 +58,7 @@ from experiments import PipelineTrace, SparfAttentionRuntimeModel, load_experime
 from experiments.softmax_ratio import SoftmaxRatioTable
 from cemu_flexgen.cemu_sparf_slot_scheduler import CemuSparfSlotScheduler
 from cemu_flexgen.sparf_device_writeback import SparfDeviceWriteback
+from cemu_flexgen.native_kv_store import NativeKvStore
 from phase_profiler import PhaseProfiler, profile_scope
 from runtime_common import partition_kv_cache_by_batch
 
@@ -145,6 +146,9 @@ def parse_args():
                         help="NVM namespace owning the private KV files for device writeback")
     parser.add_argument("--sparf-kv-buffer-tokens", type=nonnegative_integer, default=0,
                         help="bounded FDM KV tail per layer; 0 keeps synchronous publication")
+    parser.add_argument("--sparf-native", action="store_true")
+    parser.add_argument("--native-kv-device", default="/dev/ng0n1")
+    parser.add_argument("--native-kv-budget", type=positive_integer, default=64 * 1024**2)
     parser.add_argument("--sparf-grouped", action="store_true",
                         help="use the device-owned grouped KV pool (requires autonomous functional SparF)")
     parser.add_argument("--sparf-group-channels-per-page", type=positive_integer, default=8,
@@ -1026,6 +1030,10 @@ def main():
     if args.sparf_grouped and (args.attention_mode != "sparf" or not args.sparf_autonomous or
                                not args.functional):
         raise ValueError("grouped KV requires functional autonomous SparF")
+    if args.sparf_native and (args.sparf_grouped or args.attention_mode != "sparf" or
+                             not args.sparf_autonomous or not args.functional or
+                             args.sparf_kv_buffer_tokens or args.sparf_device_writeback):
+        raise ValueError("native KV requires functional autonomous SparF without legacy/grouped storage")
     if args.sparf_grouped and (args.sparf_kv_buffer_tokens or args.sparf_device_writeback):
         raise ValueError("grouped KV cannot be combined with the legacy KV buffer or writeback")
     if args.sparf_grouped and args.sparf_group_pool_bytes and args.sparf_group_pool_bytes % 4096:
@@ -1047,7 +1055,7 @@ def main():
         raise RuntimeError("PyTorch cannot access the Guest GPU")
 
     model_directory = require_directory("model directory", args.model_dir)
-    nvm_root = require_directory("NVM directory", args.nvm_dir)
+    nvm_root = Path(tempfile.gettempdir()) if args.sparf_native else require_directory("NVM directory", args.nvm_dir)
     fdm_root = require_directory("FDM directory", args.fdm_dir)
     default_program = (
         f"./build/{'sparf_attention' if args.attention_mode == 'sparf' else 'dense_attention'}"
@@ -1236,6 +1244,13 @@ def main():
         nvm_path = Path(nvm_directory)
         fdm_path = Path(fdm_directory)
         grouped_store = None
+        if args.sparf_native:
+            grouped_store = NativeKvStore(
+                SparfGroupLayout(config.head_dim, args.sparf_group_channels_per_page, dtype=layout_dtype),
+                args.batch_size, config.num_hidden_layers, config.num_key_value_heads,
+                max_seq_len, gpu_batch_size, device_path=args.native_kv_device,
+                control_path=args.control, namespace_path=args.namespace,
+                budget=args.native_kv_budget, batch_pages=args.sparf_group_write_batch_pages)
         if grouped_capacity is not None:
             grouped_store = SparfGroupedDevice(
                 SparfGroupLayout(
@@ -1398,6 +1413,7 @@ def main():
             for backend in cemu_backends:
                 backend_stack.enter_context(backend)
             if args.attention_mode == "sparf":
+                log(f"[opt-cemu] KV storage={'native FTL/token-channel addressing' if args.sparf_native else 'legacy/grouped'}")
                 log(f"[opt-cemu] SparF ready: devices={len(sparf_devices)}, "
                     f"staged={args.sparf_staged}, autonomous={args.sparf_autonomous}, "
                     f"ranges_per_device={12 if args.sparf_staged else 11}, "

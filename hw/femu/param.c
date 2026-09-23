@@ -120,11 +120,16 @@ static void add_femu_prop(cJSON *base, const struct FemuCtrl *femu_ctrl)
     cJSON *json = cJSON_AddObjectToObject(base, "femu_property");
 
     ENCODE_PARAM(json, "serial", String, femu_ctrl->serial);
+    ENCODE_PARAM(json, "queues", Number, femu_ctrl->nr_io_queues);
     ENCODE_PARAM(json, "entries", Number, femu_ctrl->max_q_ents);
+    ENCODE_PARAM(json, "multipoller_enabled", Number, femu_ctrl->multipoller_enabled);
     ENCODE_PARAM(json, "cq_poller_enabled", Number, femu_ctrl->cq_poller_enabled);
     ENCODE_PARAM(json, "max_cqes", Number, femu_ctrl->max_cqes);
+    ENCODE_PARAM(json, "max_sqes", Number, femu_ctrl->max_sqes);
     ENCODE_PARAM(json, "stride", Number, femu_ctrl->db_stride);
+    ENCODE_PARAM(json, "aerl", Number, femu_ctrl->aerl);
     ENCODE_PARAM(json, "acl", Number, femu_ctrl->acl);
+    ENCODE_PARAM(json, "elpe", Number, femu_ctrl->elpe);
     ENCODE_PARAM(json, "mdts", Number, femu_ctrl->mdts);
     ENCODE_PARAM(json, "cqr", Number, femu_ctrl->cqr);
     ENCODE_PARAM(json, "vwc", Number, femu_ctrl->vwc);
@@ -225,7 +230,9 @@ static cJSON *load_config(const char *config_path)
 
 static int parse_femu_parameters(const cJSON *param, FemuCtrl *params)
 {
-    DECODE_PARAM(param, "serial", String, params->serial, NULL);
+    const char *serial;
+
+    DECODE_PARAM(param, "serial", String, serial, NULL);
     DECODE_PARAM(param, "queues", Number, params->nr_io_queues, 8);
     DECODE_PARAM(param, "entries", Number, params->max_q_ents, 0x7ff);
     DECODE_PARAM(param, "multipoller_enabled", Number, params->multipoller_enabled, 0);
@@ -279,6 +286,8 @@ static int parse_femu_parameters(const cJSON *param, FemuCtrl *params)
     DECODE_PARAM(param, "zns_read", Number, params->zns_params.zns_read, 40000);
     DECODE_PARAM(param, "zns_write", Number, params->zns_params.zns_write, 200000);
 
+    g_free(params->serial);
+    params->serial = g_strdup(serial);
     params->nr_pollers = params->multipoller_enabled ? params->nr_io_queues : 1;
 
     return 0;
@@ -328,8 +337,15 @@ int parse_config(FemuCtrl *n) {
     }
 
     // FEMU paramter
-    const cJSON *params = cJSON_GetObjectItemCaseSensitive(config_json, "parameters");
-    parse_femu_parameters(params, n);
+    const cJSON *params = cJSON_GetObjectItemCaseSensitive(config_json,
+                                                        "femu_property");
+    if (params == NULL) {
+        params = cJSON_GetObjectItemCaseSensitive(config_json, "parameters");
+    }
+    if ((params && !cJSON_IsObject(params)) || parse_femu_parameters(params, n)) {
+        cJSON_Delete(config_json);
+        return -1;
+    }
 
     // NVMe namespaces
     const cJSON *namespaces = cJSON_GetObjectItemCaseSensitive(config_json, "namespaces");
@@ -348,6 +364,7 @@ int parse_config(FemuCtrl *n) {
         }
 
         struct NvmeNamespace *ns = &n->namespaces[nsid++];
+        ns->ctrl = n;
 
         // parse namespace type
         ns->csi = nvme_csi_from_str(type->valuestring);
@@ -362,7 +379,15 @@ int parse_config(FemuCtrl *n) {
         if (cJSON_HasObjectItem(namespace, "size")) {
             cJSON *size = cJSON_GetObjectItemCaseSensitive(namespace, "size");
             if (cJSON_IsNumber(size)) {
-                ns_size = size->valueint;
+                double value = cJSON_GetNumberValue(size);
+
+                if (!(value >= 0 && value < (double)SSIZE_MAX) ||
+                    value != (ssize_t)value) {
+                    femu_err("parse_config: invalid namespace.size!\n");
+                    cJSON_Delete(config_json);
+                    return -1;
+                }
+                ns_size = (ssize_t)value;
             } else if (cJSON_IsString(size)) {
                 ns_size = parse_size_str(size->valuestring);
             } else {
@@ -383,7 +408,10 @@ int parse_config(FemuCtrl *n) {
         // parse namespace parameters
         if (ns->ops->decode_params) {
             cJSON *param = cJSON_GetObjectItemCaseSensitive(namespace, "parameters");
-            ns->ops->decode_params(param, ns);
+            if (ns->ops->decode_params(param, ns)) {
+                cJSON_Delete(config_json);
+                return -1;
+            }
         }
     }
 

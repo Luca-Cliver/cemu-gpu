@@ -38,6 +38,46 @@ instattention-device-test: instattention
 instattention-layout-test:
 	python3 $(INSTATTENTION_DIR)/python/test_kv_layout.py
 
+.PHONY: instattention-native-address-test instattention-native-mapping-test instattention-native-io-test
+
+.PHONY: instattention-native-contract-test instattention-native-csd-qtest instattention-native-regression-test
+instattention-native-address-test instattention-native-mapping-test instattention-native-io-test: instattention-native-contract-test
+
+instattention-native-contract-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_native_kv_contracts.py
+
+instattention-native-csd-qtest:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_native_csd_pipeline.py
+
+instattention-native-regression-test:
+	PYTHONPATH="$(INSTATTENTION_DIR)/python:$(INSTATTENTION_BUILD_DIR):$$PYTHONPATH" \
+		$(PYTHON) -m unittest \
+			test_native_kv_contracts test_native_kv_client \
+			test_instattention_qemu_io test_instattention_native_attention \
+			test_instattention_native_qtest test_native_csd_pipeline \
+			test_opt_runtime test_opt_sparf_integration \
+			test_sparf_group_buffer test_sparf_grouped_backend \
+			test_sparf_group_attention test_sparf_stages
+
+.PHONY: instattention-native-qemu-io-test
+instattention-native-qemu-io-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_instattention_qemu_io.py
+
+.PHONY: instattention-native-attention-test
+instattention-native-attention-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_instattention_native_attention.py
+
+.PHONY: instattention-native-qtest instattention-native-device-test
+instattention-native-qtest:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/test_instattention_native_qtest.py
+
+instattention-native-device-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/native_kv_client.py --device "$(or $(NVM_DEVICE),/dev/ng0n1)"
+
+.PHONY: instattention-native-buffer-device-test
+instattention-native-buffer-device-test:
+	$(PYTHON) $(INSTATTENTION_DIR)/python/native_kv_client.py --device "$(or $(NVM_DEVICE),/dev/ng0n1)" --buffer-test
+
 .PHONY: instattention-attention-phases-test instattention-attention-phases-device-test instattention-attention-workflow-device-test instattention-sparf-test instattention-sparf-kv-test instattention-sparf-device-test
 
 instattention-attention-phases-test:
@@ -289,6 +329,9 @@ instattention-opt-reference-test:
 instattention-opt-cemu-gpu-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_opt_cemu_pipeline.py \
 		--model-dir "$(MODEL_DIR)" \
+		$(if $(filter 1 true yes,$(SPARF_NATIVE)),--sparf-native) \
+		$(if $(NATIVE_KV_DEVICE),--native-kv-device "$(NATIVE_KV_DEVICE)") \
+		$(if $(NATIVE_KV_BUDGET),--native-kv-budget "$(NATIVE_KV_BUDGET)") \
 		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
 		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
 		--csd-target "$(if $(CSD_TARGET),$(CSD_TARGET),cuda)" \

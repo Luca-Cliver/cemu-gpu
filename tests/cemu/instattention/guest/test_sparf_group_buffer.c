@@ -1,4 +1,12 @@
 #include "hw/femu/csd/sparf_group_buffer.h"
+#include "hw/femu/csd/sparf_wait.h"
+
+static gint target_clock = 1000;
+
+static int64_t buffered_clock(void)
+{
+    return g_atomic_int_get(&target_clock);
+}
 
 typedef struct GroupBufferTest {
     SparfGroupSession *session;
@@ -11,6 +19,10 @@ typedef struct GroupBufferTest {
     bool blocked;
     bool entered;
     bool fail;
+    gint cancelled;
+    gint target_wait;
+    gint target_entered;
+    uint64_t published_bytes;
     uint64_t read_bytes;
     uint64_t write_bytes;
     uint64_t write_calls;
@@ -62,7 +74,43 @@ static bool buffered_transfer(void *opaque, SparfWritebackPlan *plan, bool write
         else test->read_bytes += (uint64_t)plan->sectors->len * 512;
     }
     g_mutex_unlock(&test->lock);
+    if (success && write && g_atomic_int_get(&test->target_wait)) {
+        g_atomic_int_set(&test->target_entered, 1);
+        success = sparf_wait_target(*end, buffered_clock, &test->cancelled);
+    }
     return success;
+}
+
+static void buffered_cancel(void *opaque)
+{
+    GroupBufferTest *test = opaque;
+    g_atomic_int_set(&test->cancelled, 1);
+}
+
+static void buffered_release(void *opaque)
+{
+    GroupBufferTest *test = opaque;
+    test->published_bytes = test->session->buffer->write_bytes;
+}
+
+void group_buffer_test_target(void *opaque, int blocked)
+{
+    GroupBufferTest *test = opaque;
+    g_atomic_int_set(&target_clock, blocked ? 1000 : 2000);
+    g_atomic_int_set(&test->target_wait, 1);
+}
+
+int group_buffer_test_target_entered(void *opaque)
+{
+    return g_atomic_int_get(&((GroupBufferTest *)opaque)->target_entered);
+}
+
+uint64_t group_buffer_test_abort(void *opaque)
+{
+    GroupBufferTest *test = opaque;
+    sparf_group_free(test->session);
+    test->session = NULL;
+    return test->published_bytes;
 }
 
 void *group_buffer_test_new(uint8_t *nvm, uint64_t size, uint8_t *storage, uint64_t storage_bytes)
@@ -118,7 +166,7 @@ int group_buffer_test_run(void *opaque, const void *metadata, uint32_t length,
     if (header.operation == CEMU_SPARF_GROUP_REGISTER_BUFFER) {
         if (test->session) return 0;
         test->session = sparf_group_buffer_register(metadata, length, test->size, 4096,
-            test->storage, test->storage_bytes, buffered_transfer, NULL, NULL, test);
+            test->storage, test->storage_bytes, buffered_transfer, NULL, buffered_cancel, buffered_release, test);
         success = test->session != NULL;
     } else success = sparf_group_buffer_execute(&test->session, metadata, length, input, bytes,
         test->size, 4096, buffered_transfer, test, &result, &progress);

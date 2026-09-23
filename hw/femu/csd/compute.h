@@ -102,6 +102,7 @@ typedef struct ComputeParams {
 } ComputeParams;
 
 typedef struct ComputeNamespace {
+    bool native_shutdown;
     Slab programs;
     Slab mrs;                                   // memory range set
     NvmeNamespace *ns;
@@ -123,6 +124,8 @@ typedef struct ComputeNamespace {
     struct rte_ring *sparf_writeback_queue;
     QemuSemaphore sparf_writeback_wakeup;
 } ComputeNamespace;
+
+void compute_native_quiesce(NvmeNamespace *ns);
 
 static inline Slab *program_slab(NvmeNamespace *ns)
 {

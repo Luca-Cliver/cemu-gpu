@@ -1,8 +1,8 @@
 # G4：分组目录与设备尾部接入 SparF Attention
 
 状态：设备读取入口、原自主调度器、Python 小测试适配器已连接；Host 测试通过，用户已反馈 Guest 新测试通过。
-本次反馈未附完整 trace，因此不据此宣称重叠比例或模拟时间已校准。最新交接见 [INSTATTENTION_HANDOFF_2026-09-15.md](INSTATTENTION_HANDOFF_2026-09-15.md)。
-没有切换 OPT runner，也没有修改 freezing、计算时间补偿或 FTL 完成时间等待。
+该阶段反馈未附完整 trace，因此不据此宣称重叠比例或模拟时间已校准。后续 OPT 接入和验证见 [开发历史](../../../docs/cemu/DEVELOPMENT_HISTORY.md)。
+最初 G4 批次未切换 OPT runner；后续已可选接入 grouped OPT。freezing、计算时间补偿和 FTL 完成时间等待保持原机制，新 FTL 另见 [工作记录](FTL_WORKLOG.md)。
 
 ## 数据流
 

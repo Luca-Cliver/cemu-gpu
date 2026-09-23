@@ -189,12 +189,19 @@ class CemuSparfDevice:
                 self._device.write_tensor(6, np.ascontiguousarray(current_value, dtype=query.dtype))
         with profile_scope(self.profiler, "decode.metadata_wall"):
             if self.grouped_store is not None:
-                metadata = pack_grouped_sparf_workflow(
-                    self.layout, layer, valid_tokens, self.query_heads, self.top_r, top_k,
-                    self.grouped_store.cookie, request_stream_base,
-                    approximate_runtime_ns=runtimes[0], exact_qk_runtime_ns=runtimes[1],
-                    pv_runtime_ns=runtimes[2], scale=1.0,
-                )
+                pack_native = getattr(self.grouped_store, "pack_workflow", None)
+                if callable(pack_native):
+                    metadata = pack_native(
+                        self.layout, layer, valid_tokens, self.query_heads, self.top_r, top_k,
+                        request_stream_base, approximate_runtime_ns=runtimes[0],
+                        exact_qk_runtime_ns=runtimes[1], pv_runtime_ns=runtimes[2], scale=1.0)
+                else:
+                    metadata = pack_grouped_sparf_workflow(
+                        self.layout, layer, valid_tokens, self.query_heads, self.top_r, top_k,
+                        self.grouped_store.cookie, request_stream_base,
+                        approximate_runtime_ns=runtimes[0], exact_qk_runtime_ns=runtimes[1],
+                        pv_runtime_ns=runtimes[2], scale=1.0,
+                    )
             else:
                 maps = self._resolve_maps(self.paths if cache_paths is None else cache_paths)
                 metadata = pack_sparf_workflow(

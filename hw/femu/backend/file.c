@@ -5,7 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-int init_file_backend(SsdBackend *b, const char *path)
+static int init_file_backend_flags(SsdBackend *b, const char *path, bool exclusive)
 {
     struct stat stat_buffer;
 
@@ -14,7 +14,8 @@ int init_file_backend(SsdBackend *b, const char *path)
         return -1;
     }
 
-    b->fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    b->fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC |
+                       (exclusive ? O_EXCL | O_NOFOLLOW : 0), 0644);
     if (b->fd < 0) {
         femu_err("Failed to open SSD backend file %s: %s\n",
                  path, strerror(errno));
@@ -54,6 +55,16 @@ int init_file_backend(SsdBackend *b, const char *path)
     femu_log("Using file-backed NVM: %s, size=%" PRId64 " bytes\n",
              path, b->size);
     return 0;
+}
+
+int init_file_backend(SsdBackend *b, const char *path)
+{
+    return init_file_backend_flags(b, path, false);
+}
+
+int init_new_file_backend(SsdBackend *b, const char *path)
+{
+    return init_file_backend_flags(b, path, true);
 }
 
 void free_file_backend(SsdBackend *b)

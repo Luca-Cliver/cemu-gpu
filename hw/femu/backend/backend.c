@@ -1,5 +1,6 @@
 #include "./backend.h"
 #include "../nvme.h"
+#include "mapped_io.h"
 #include <dlfcn.h>
 
 typedef int (*cuda_set_decive_fn)(int);
@@ -592,6 +593,9 @@ int init_backend(SsdBackend **mbe, BackendType type, char *path, int64_t nbytes)
     case FEMU_FILE_BACKEND:
         ret = init_file_backend(b, path);
         break;
+    case FEMU_NEW_FILE_BACKEND:
+        ret = init_new_file_backend(b, path);
+        break;
     default:
         femu_err("Unknown backend type!\n");
         abort();
@@ -612,6 +616,7 @@ void free_backend(SsdBackend *b)
         free_dram_backend(b);
         break;
     case FEMU_FILE_BACKEND:
+    case FEMU_NEW_FILE_BACKEND:
         free_file_backend(b);
         break;
     default:
@@ -672,27 +677,35 @@ int backend_rw(SsdBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write)
     return 0;
 }
 
-void backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
+static int checked_prepare_host(void *opaque, void *pointer, uint64_t bytes)
+{
+    return backend_cuda_prepare_host(opaque, pointer, bytes);
+}
+
+static void checked_mark_host_dirty(void *opaque, void *pointer, uint64_t bytes)
+{
+    backend_cuda_mark_host_dirty(opaque, pointer, bytes);
+}
+
+int backend_rw_internal_checked(SsdBackend *b, void *buf, uint64_t data_offset,
+                                uint64_t data_size, bool is_write)
+{
+    static const CemuMappedIoOps operations = {
+        .prepare_host = checked_prepare_host,
+        .mark_host_dirty = checked_mark_host_dirty,
+    };
+
+    if (!b || b->size < 0) {
+        return -EINVAL;
+    }
+    return cemu_mapped_io(b->logical_space, b->size, buf, data_offset, data_size,
+                          is_write, &operations, b);
+}
+
+int backend_rw_internal(SsdBackend *b, void *buf, uint64_t data_offset,
                          uint64_t data_size, int is_write)
 {
-    void *src, *dest;
-    if (is_write) {
-        src = buf;
-        dest = b->logical_space + data_offset;
-    } else {
-        if (backend_cuda_prepare_host(b, b->logical_space + data_offset,
-                                      data_size) != 0) {
-            return;
-        }
-        src = b->logical_space + data_offset;
-        dest = buf;
-    }
-    memmove(dest, src, data_size);
-
-    if(is_write) {
-        backend_cuda_mark_host_dirty(b, b->logical_space + data_offset,
-                                     data_size);
-    }
+    return backend_rw_internal_checked(b, buf, data_offset, data_size, is_write);
 }
 
 void *backend_get_ptr(SsdBackend *b, uint64_t offset)
@@ -700,16 +713,20 @@ void *backend_get_ptr(SsdBackend *b, uint64_t offset)
     return b->logical_space + offset;
 }
 
-void backend_copy_internal(SsdBackend *b, uint64_t doff, uint64_t soff,
+int backend_copy_internal(SsdBackend *b, uint64_t doff, uint64_t soff,
                            uint64_t data_size)
 {
-    if (backend_cuda_prepare_host(b, b->logical_space + soff,
-                                  data_size) != 0) {
-        return;
+    if (!b || !b->logical_space || b->size < 0 || doff > (uint64_t)b->size ||
+        data_size > (uint64_t)b->size - doff) {
+        return -EINVAL;
     }
     void *dest = b->logical_space + doff;
-    memmove(dest, b->logical_space + soff, data_size);
+    int status = backend_rw_internal_checked(b, dest, soff, data_size, false);
+    if (status) {
+        return status;
+    }
     backend_cuda_mark_host_dirty(b, dest, data_size);
+    return 0;
 }
 
 void backend_fill(SsdBackend *b, uint64_t offset, uint64_t len)

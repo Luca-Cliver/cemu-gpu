@@ -141,7 +141,7 @@ static void *sparf_group_buffer_worker(void *opaque)
         bool success = buffer->transfer(buffer->opaque, plan, true, &start, &end);
         sparf_wb_free(plan);
         g_mutex_lock(&buffer->lock);
-        if (success) {
+        if (success && !buffer->stop) {
             for (guint index = 0; index < pending->len; ++index) {
                 SparfGroupPending item = g_array_index(pending, SparfGroupPending, index);
                 SparfGroupStream *stream = &buffer->streams[item.stream];
@@ -180,10 +180,11 @@ static void sparf_group_buffer_cleanup(SparfGroupSession *session)
 {
     SparfGroupBuffer *buffer = session->buffer;
     g_mutex_lock(&buffer->lock);
-    sparf_group_buffer_drain(session);
     buffer->stop = true;
+    if (!buffer->sealed) session->failed = true;
     g_cond_broadcast(&buffer->wake);
     g_mutex_unlock(&buffer->lock);
+    if (buffer->cancel) buffer->cancel(buffer->opaque);
     g_thread_join(buffer->worker);
     if (buffer->release) buffer->release(buffer->opaque);
     g_mutex_clear(&buffer->lock);
@@ -197,7 +198,7 @@ static void sparf_group_buffer_cleanup(SparfGroupSession *session)
 static SparfGroupSession *sparf_group_buffer_register(const void *metadata, uint32_t length,
     uint64_t nvm_bytes, uint32_t page_bytes, uint8_t *storage, uint64_t storage_bytes,
     SparfWritebackTransfer transfer, void (*dirty)(void *, uint8_t *, uint64_t),
-    GDestroyNotify release, void *opaque)
+    GDestroyNotify cancel, GDestroyNotify release, void *opaque)
 {
     struct cemu_sparf_group_header header;
     if (!metadata || length < sizeof(header) || !storage || !transfer) return NULL;
@@ -242,6 +243,7 @@ static SparfGroupSession *sparf_group_buffer_register(const void *metadata, uint
     buffer->scratch = storage + streams * per_stream;
     buffer->transfer = transfer;
     buffer->dirty = dirty;
+    buffer->cancel = cancel;
     buffer->release = release;
     buffer->opaque = opaque;
     for (uint32_t index = 0; index < streams; ++index) {

@@ -97,7 +97,7 @@ CPU 对照将 `CSD_TARGET=cpu`、`PROGRAM=./build/sparf_attention.so`，其余�
 `CEMU_SPARF_AUTONOMOUS_TIMELINE` 仍只记录 Attention v3，不会自动记录这条 IO 写回命令。
 # OPT 应用接入（可选实验路径）
 
-后续布局迁移设计见 [SPARF_GROUPED_KV_DESIGN.md](SPARF_GROUPED_KV_DESIGN.md)。当前 spans/compact 都仍为旧文件布局的扇区读改写；新分组追加布局仅有 Host 参考测试，以下命令不会启用它。
+后续布局迁移和页契约已归入 [开发历史](../../../docs/cemu/DEVELOPMENT_HISTORY.md)。本文 spans/compact 仍为旧文件布局的扇区读改写；后来实现的 grouped 追加路径见 [SPARF_GROUP_BUFFER.md](SPARF_GROUP_BUFFER.md)，以下命令不会自动启用它。
 
 现在可在 `test_opt_cemu_pipeline.py` 中组合启用：
 

@@ -1,11 +1,11 @@
 # CEMU InstAttention SparF workflow
 
-An experimental single-request autonomous mode is available as ABI v3; see
-[SPARF_AUTONOMOUS.md](SPARF_AUTONOMOUS.md) for constraints and the small Guest test.
-
-The current behavior gaps and proposed device-autonomous pipeline are documented
-in [INSTATTENTION_BEHAVIOR_ALIGNMENT_PLAN.md](INSTATTENTION_BEHAVIOR_ALIGNMENT_PLAN.md).
-That document is a design plan, not an implemented replacement; freezing remains unchanged.
+This document describes the original file-backed SparF modes and their diagnostics.
+ABI v3's initial autonomous interface is described in [SPARF_AUTONOMOUS.md](SPARF_AUTONOMOUS.md).
+Later grouped OPT integration and multi-slot submission are summarized in the
+[development history](../../../docs/cemu/DEVELOPMENT_HISTORY.md).
+The separate KV FTL is planned in [FTL_WORKLOG.md](FTL_WORKLOG.md), not yet implemented;
+freezing remains unchanged.
 
 The optional bounded FDM KV buffer and background publication path is described
 in [SPARF_BUFFERING.md](SPARF_BUFFERING.md). It preserves the synchronous baseline

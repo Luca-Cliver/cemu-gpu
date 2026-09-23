@@ -8,6 +8,10 @@ softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files(
   # 'ocssd/oc12.c', 'ocssd/oc20.c',
   'zns/zns.c',
   'bbssd/bb.c', 'bbssd/ftl.c',
+  'bbssd/instattention_mapping.c', 'bbssd/instattention_io.c',
+  'bbssd/instattention_native.c', 'bbssd/instattention_device.c',
+  'bbssd/instattention_buffer.c',
+  'bbssd/instattention_attention.c',
   'csd/memory.c', 'csd/compute.c', 'csd/sched.c', 'csd/sched_fifo.c',
   'csd/sched_rr.c', 'csd/sched_grouped_fifo.c',
   'csd/sched_grouped_rr.c', 'statistics/statistics.c'))
