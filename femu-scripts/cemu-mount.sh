@@ -1,5 +1,24 @@
 #!/bin/bash
 
+if grep -qw cemu_native_opt_smoke=1 /proc/cmdline; then
+	set -e
+	mountpoint -q /sys || mount -t sysfs sysfs /sys
+	mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+	mkdir -p /root/CEMU /root/models /root/cemu-logs
+	mountpoint -q /root/CEMU || mount -t 9p -o ro,trans=virtio,version=9p2000.L cemusrc /root/CEMU
+	mountpoint -q /root/models || mount -t 9p -o ro,trans=virtio,version=9p2000.L modelsrc /root/models
+	mountpoint -q /root/cemu-logs || mount -t 9p -o trans=virtio,version=9p2000.L logsrc /root/cemu-logs
+	for fdm in /dev/nvme*m2; do
+		[[ -b "$fdm" ]] || continue
+		controller=${fdm#/dev/nvme}
+		dir="/mnt/fdm${controller%m2}"
+		mkdir -p "$dir"
+		mountpoint -q "$dir" || mount -t fdmfs "$fdm" "$dir"
+	done
+	echo 'Native KV: shares/FDM mounted; skipped NVM formatting and placeholder files.'
+	exit 0
+fi
+
 nr_dev=$(ls /sys/class/nvme | wc -l)
 echo "Found $nr_dev NVMe Drives"
 CEMU_NVM_BENCHMARK="${CEMU_NVM_BENCHMARK:-1}"

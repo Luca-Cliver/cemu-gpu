@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
-from analyze_sparf_autonomous import SCHEMA, analyze, select_records, summarize_reads, summarize_concurrency
+from analyze_sparf_autonomous import SCHEMA, analyze, select_records, summarize_reads, summarize_concurrency, summarize_boundaries
 
 
 def stamp(time):
@@ -35,6 +35,29 @@ def sample():
 
 
 class AutonomousTimelineTest(unittest.TestCase):
+    def test_boundaries_work_without_lun_diagnostics(self):
+        summary = summarize_boundaries(analyze(sample()))
+        self.assertEqual(summary["requests"], 1)
+        self.assertEqual(summary["engine_queue_virtual_ns"], 10)
+        self.assertEqual(summary["engine_queue_host_ns"], 30)
+        self.assertEqual(summary["read_boundaries"]["channel_k"], {
+            "model_ns": 70, "host_submit_to_observed_ns": 30,
+            "host_observed_to_ready_ns": 210, "virtual_deadline_to_ready_ns": 10,
+        })
+        self.assertEqual(summary["compute_boundaries"]["qk"], {
+            "functional_host_ns": 0, "functional_virtual_ns": 0,
+            "end_to_submit_virtual_ns": 10, "submit_to_complete_virtual_ns": 80,
+            "complete_to_observed_virtual_ns": 10,
+        })
+
+    def test_frozen_functional_time_is_not_virtual_time(self):
+        rows = sample()
+        rows[1]["computes"][0]["functional_end"]["host_ns"] += 9
+        summary = summarize_boundaries(analyze(rows))
+        phase = summary["compute_boundaries"]["approx"]
+        self.assertEqual(phase["functional_host_ns"], 9)
+        self.assertEqual(phase["functional_virtual_ns"], 0)
+
     def test_concurrent_engines_and_cu_occupancy(self):
         first = sample()
         second = deepcopy(first)

@@ -2602,6 +2602,9 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
             device_addresses[range] = backend_cuda_ensure_device_ptr(
                 backends[range], mrs->mr_addr[range], mrs->mr_len[range]);
             if (!device_addresses[range]) {
+                femu_err("SparF autonomous: CUDA mirror preparation failed, program=%u, rsid=%u, range=%u, cuda_sync=%d, bytes=%lld\n",
+                         program->pind, rsid, range, backends[range]->cuda_sync,
+                         (long long)mrs->mr_len[range]);
                 status = NVME_INTERNAL_DEV_ERROR;
                 goto reject;
             }

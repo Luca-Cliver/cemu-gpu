@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2240" height="4644" viewBox="0 0 2240 4644">
+<style>text {font-family:"Noto Sans CJK SC",sans-serif;}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#315d86"/></marker><marker id="openarrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#315d86" stroke-width="1.5"/></marker></defs>
+<rect x="0" y="0" width="2240" height="4644" rx="0" fill="#ffffff" stroke="none"/>
+<text x="70" y="76" fill="#20344c" font-size="41" text-anchor="start" font-weight="700"><tspan x="70" dy="0">03  父 Execute：冻结、功能执行与目标等待</tspan></text>
+<text x="72" y="124" fill="#60738b" font-size="24" text-anchor="start"><tspan x="72" dy="0">CEMU · native KV / autonomous SparF · 单 microbatch 串行路径</tspan></text>
+<text x="72" y="168" fill="#20344c" font-size="23" text-anchor="start"><tspan x="72" dy="0">T = 执行区间   W = 等待区间   R / D = 模型预算 / deadline；未填写实测值，纵向长度不表示时间比例。</tspan></text>
+<text x="72" y="207" fill="#60738b" font-size="23" text-anchor="start"><tspan x="72" dy="0">G：Guest 调用时间   H：Host 实际时间   V：QEMU 虚拟时间   C：GPU stream 时间</tspan></text>
+<rect x="44" y="420" width="2152" height="762" rx="8" fill="#e9f2ff" stroke="#cad7e5"/>
+<rect x="44" y="1338" width="2152" height="378" rx="8" fill="#e9f2ff" stroke="#cad7e5"/>
+<rect x="44" y="1984" width="2152" height="410" rx="8" fill="#e9f2ff" stroke="#cad7e5"/>
+<rect x="44" y="2516" width="2152" height="546" rx="8" fill="#e9f2ff" stroke="#cad7e5"/>
+<rect x="44" y="3364" width="2152" height="326" rx="8" fill="#e9f2ff" stroke="#cad7e5"/>
+<rect x="44" y="3846" width="2152" height="378" rx="8" fill="#e9f2ff" stroke="#cad7e5"/>
+<path d="M 250.0 313 V 4534" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="50.0" y="243" width="400" height="70" rx="8" fill="#183c60" stroke="none"/>
+<text x="250.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="250.0" dy="0">Host autonomous worker</tspan></text>
+<path d="M 830.0 313 V 4534" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="630.0" y="243" width="400" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="830.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="830.0" dy="0">Guest vCPU / QEMU virtual clock</tspan></text>
+<path d="M 1410.0 313 V 4534" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1210.0" y="243" width="400" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="1410.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1410.0" dy="0">native gather / FDM</tspan></text>
+<path d="M 1990.0 313 V 4534" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1790.0" y="243" width="400" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="1990.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1990.0" dy="0">CU scheduler</tspan></text>
+<rect x="135.0" y="340" width="1970.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="372" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">engine started；后续仍是同一个父 Execute</tspan></text>
+<text x="60" y="451" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">冻结区间 · Host 继续执行，QEMU 虚拟时间停止</tspan></text>
+<text x="540.0" y="510" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">enter_compute_section：T_enter [H]</tspan></text>
+<path d="M 250.0 535 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="575.0" y="570" width="510" height="92" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="591.0" y="602" fill="#705315" font-size="23" text-anchor="start"><tspan x="591.0" dy="0">vCPU 暂停、V 停止；已提交的物理 GPU 工作</tspan><tspan x="591.0" dy="34">不会自动暂停</tspan></text>
+<text x="272.0" y="708" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">Q top-r：T_select [H]</tspan></text>
+<path d="M 250.0 734 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="810" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">native_kv_attention_read(channel-K)</tspan></text>
+<path d="M 250.0 835 H 1410.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1432.0" y="894" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1432.0" dy="0">committed 分流 → backend/tail → scatter M</tspan><tspan x="1432.0" dy="34">R1</tspan></text>
+<path d="M 1410.0 954 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="1030" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">数据字节已填好；返回 D_ch [V]</tspan></text>
+<path d="M 1410.0 1055 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="540.0" y="1114" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">leave_compute_section：T_leave [H]</tspan></text>
+<path d="M 250.0 1139 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="272.0" y="1226" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">WAIT_TIME：等 V 到 D_ch，W_ch_ready [H/V</tspan><tspan x="272.0" dy="34">]</tspan></text>
+<path d="M 250.0 1286 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="60" y="1369" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">冻结区间 · Host 继续执行，QEMU 虚拟时间停止</tspan></text>
+<text x="540.0" y="1428" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">enter_compute_section</tspan></text>
+<path d="M 250.0 1453 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="272.0" y="1512" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">approximate / softmax / top-k / alpha：T_ap</tspan><tspan x="272.0" dy="34">prox_func [H]</tspan></text>
+<path d="M 250.0 1572 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="540.0" y="1648" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">leave_compute_section</tspan></text>
+<path d="M 250.0 1673 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1120.0" y="1760" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">sched_submit_internal(R_approx_eff)</tspan></text>
+<path d="M 250.0 1785 H 1990.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="1820" width="1970.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="1852" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">W_approx [H/V]：排队、模拟运行、完成观察</tspan></text>
+<text x="1120.0" y="1924" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">completion ring（有效预算为零则跳过提交）</tspan></text>
+<path d="M 1990.0 1949 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="60" y="2015" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">冻结区间 · Host 继续执行，QEMU 虚拟时间停止</tspan></text>
+<text x="540.0" y="2074" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">enter_compute_section</tspan></text>
+<path d="M 250.0 2099 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="2158" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">gather selected-K → MR2：T_k_gather [H]</tspan></text>
+<path d="M 250.0 2183 H 1410.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="2242" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">数据 + D_k [V]</tspan></text>
+<path d="M 1410.0 2267 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="540.0" y="2326" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">leave_compute_section</tspan></text>
+<path d="M 250.0 2351 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="272.0" y="2438" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">WAIT_TIME：等 V 到 D_k，W_k_ready [H/V]</tspan></text>
+<path d="M 250.0 2464 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="60" y="2547" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">冻结区间 · Host 继续执行，QEMU 虚拟时间停止</tspan></text>
+<text x="540.0" y="2606" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">enter_compute_section</tspan></text>
+<path d="M 250.0 2631 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="2690" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">gather selected-V → MR3：T_v_gather [H]</tspan></text>
+<path d="M 250.0 2715 H 1410.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="2774" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">数据 + D_v [V]</tspan></text>
+<path d="M 1410.0 2799 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="272.0" y="2858" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">run_sparf_phase(EXACT_QK) → MR8：T_exa</tspan><tspan x="272.0" dy="34">ct_func [H]</tspan></text>
+<path d="M 250.0 2918 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="540.0" y="2994" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">leave_compute_section</tspan></text>
+<path d="M 250.0 3019 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1120.0" y="3106" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">sched_submit_internal(R_exact_eff)</tspan></text>
+<path d="M 250.0 3131 H 1990.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="1295.0" y="3166" width="810.0" height="92" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="1311.0" y="3198" fill="#705315" font-size="23" text-anchor="start"><tspan x="1311.0" dy="0">V 的目标 deadline 与 exact 的模拟运行可重叠；功能 gather 在 exact 前已经</tspan><tspan x="1311.0" dy="34">返回</tspan></text>
+<text x="1120.0" y="3304" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">exact completion；W_exact [H/V]</tspan></text>
+<path d="M 1990.0 3329 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="60" y="3395" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">冻结区间 · Host 继续执行，QEMU 虚拟时间停止</tspan></text>
+<text x="540.0" y="3454" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">enter_compute_section</tspan></text>
+<path d="M 250.0 3479 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="830.0" y="3538" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="830.0" dy="0">MR4 mean → MR3 额外行；收尾 V 读取</tspan></text>
+<path d="M 250.0 3563 H 1410.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="540.0" y="3622" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">leave_compute_section</tspan></text>
+<path d="M 250.0 3647 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="272.0" y="3734" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">WAIT_TIME：只等 D_v 尚未到达的部分，W_v</tspan><tspan x="272.0" dy="34">_remaining [H/V]</tspan></text>
+<path d="M 250.0 3794 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="60" y="3877" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">冻结区间 · Host 继续执行，QEMU 虚拟时间停止</tspan></text>
+<text x="540.0" y="3936" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">enter_compute_section</tspan></text>
+<path d="M 250.0 3961 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="272.0" y="4020" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">run_sparf_phase(PV) → MR9；生成 trace：T</tspan><tspan x="272.0" dy="34">_pv_func [H]</tspan></text>
+<path d="M 250.0 4080 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="540.0" y="4156" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="540.0" dy="0">leave_compute_section</tspan></text>
+<path d="M 250.0 4181 H 830.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1120.0" y="4268" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">sched_submit_internal(R_pv_eff)</tspan></text>
+<path d="M 250.0 4293 H 1990.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1120.0" y="4352" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">PV completion；W_pv [H/V]</tspan></text>
+<path d="M 1990.0 4377 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="272.0" y="4436" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">DONE；释放引用；父请求送 to_poller</tspan></text>
+<path d="M 250.0 4462 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="70" y="4601" fill="#60738b" font-size="21" text-anchor="start"><tspan x="70" dy="0">来源：NATIVE_SERIAL_SEQUENCE.md · 2026-09-29 · 箭头为调用/完成关系；嵌套和重叠时间不可直接相加。</tspan></text>
+</svg>

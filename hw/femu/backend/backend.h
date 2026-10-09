@@ -32,6 +32,7 @@ int init_file_backend(SsdBackend *b, const char *path);
 int init_new_file_backend(SsdBackend *b, const char *path);
 void free_file_backend(SsdBackend *b);
 
+bool backend_cuda_sync_requested(void);
 int backend_cuda_sync_init(SsdBackend *b);
 void backend_cuda_sync_fini(SsdBackend *b);
 void *backend_cuda_ensure_device_ptr(SsdBackend *b, void *host_ptr, uint64_t len);

@@ -15,7 +15,7 @@ sys.path.insert(0, str(PROJECT_DIRECTORY / "build-guest"))
 sys.path.insert(0, str(PROJECT_DIRECTORY / "python"))
 
 from cemu_flexgen import CemuSparfDevice, KvLayoutConfig, SparfKvCacheLayout, SparfKvCacheStore, sparf_attention
-from test_cemu_attention_phases import require_fdmfs
+from device_test_support import require_fdmfs
 from cemu_flexgen.cemu_sparf_slot_scheduler import CemuSparfSlotScheduler
 
 

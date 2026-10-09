@@ -13,7 +13,7 @@ sys.path.insert(0, str(PROJECT / "build-guest"))
 from cemu_flexgen import CemuSparfDevice, KvLayoutConfig, SparfKvCacheLayout, sparf_attention
 from cemu_flexgen.sparf_group_device import SparfGroupedDevice
 from cemu_flexgen.sparf_group_layout import SparfGroupLayout
-from test_cemu_attention_phases import require_fdmfs
+from device_test_support import require_fdmfs
 
 
 def main():

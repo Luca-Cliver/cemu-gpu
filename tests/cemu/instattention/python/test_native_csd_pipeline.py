@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import ExitStack
 from pathlib import Path
 import struct
@@ -18,14 +19,21 @@ from cemu_flexgen.sparf_workflow_abi import SPARF_WORKFLOW_COMMAND, SparfWorkflo
 
 class NativeCsdPipelineTest(unittest.TestCase):
     def start_device(self, directory, stack):
-        kernel = Path(directory) / "sparf.so"
-        subprocess.run(["c++", "-std=c++17", "-shared", "-fPIC", "-O2",
-                        str(ROOT / "tests/cemu/kernel/sparf_attention.cc"), "-o", str(kernel)], check=True)
-        device = NativeQtest(directory, ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json")
+        cuda = os.environ.get("CEMU_NATIVE_QTEST_CUDA", "0") == "1"
+        if cuda:
+            kernel = ROOT / "tests/cemu/build/sparf_attention_devptr.so"
+            if not kernel.is_file():
+                raise FileNotFoundError(f"build CUDA operator first: {kernel}")
+        else:
+            kernel = Path(directory) / "sparf.so"
+            subprocess.run(["c++", "-std=c++17", "-shared", "-fPIC", "-O2",
+                            str(ROOT / "tests/cemu/kernel/sparf_attention.cc"), "-o", str(kernel)], check=True)
+        device = NativeQtest(directory, ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json",
+                             cuda=cuda)
         stack.callback(device.close)
         self.device = device
         packet = str(kernel).encode() + b"\0sparf_attention\0"
-        self.call(1, 0x22, (1 | (2 << 16), len(packet), 0, 0, len(packet), 0), 3, packet)
+        self.call(1, 0x22, (1 | (2 << 16) | (int(cuda) << 29), len(packet), 0, 0, len(packet), 0), 3, packet)
         self.call(0, 0x23, (1 | (1 << 16), 0, 0, 0, 0, 0), 3)
         lengths = [4096, 1048576, 1048576, 1048576, 4096, 4096, 4096, 4096, 16384, 4096, 4096]
         offsets = np.cumsum([0] + lengths[:-1]).tolist()

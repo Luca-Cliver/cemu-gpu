@@ -1,0 +1,22 @@
+event,host_ms_from_admitted,virtual_ms_from_admitted,note
+admitted,0.000000,0.000000,
+started,0.074677,0.075047,
+channel_k.submitted,2.010714,0.113191,V 是模型起点，不是与 H 严格配对的采样
+channel_k.observed,18.328607,0.141281,
+channel_k.ready,40.823699,22.489854,
+approx.functional_start,40.917283,22.491376,
+approx.functional_end,78.379347,22.491376,
+approx.observed_done,79.609435,23.720193,
+token_k.submitted,79.706694,23.721605,V 是模型起点，不是与 H 严格配对的采样
+token_k.observed,97.054820,23.737628,
+token_k.ready,126.330023,52.912327,
+token_v.submitted,126.453309,52.914220,V 是模型起点，不是与 H 严格配对的采样
+qk.functional_start,143.075567,52.914220,
+qk.functional_end,152.544811,52.914220,
+qk.observed_done,153.134494,53.502041,
+token_v.observed,153.135476,53.502872,
+token_v.ready,181.873360,82.112343,
+pv.functional_start,181.961997,82.113514,
+pv.functional_end,182.541876,82.113514,
+pv.observed_done,183.277688,82.469753,
+ready,183.282234,82.474129,

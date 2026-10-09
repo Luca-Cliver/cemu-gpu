@@ -1,0 +1,22 @@
+stage,clock,start_ms_from_admitted,end_ms_from_admitted,duration_ms,meaning
+channel-K 读,Host,2.010714,18.328607,16.317893,submitted→observed：观测窗口，不等同纯 gather
+channel-K 读,Host,18.328607,40.823699,22.495091999999996,observed→ready：后续等待/收尾窗口
+selected-K 读,Host,79.706694,97.05482,17.348126000000008,submitted→observed：观测窗口，不等同纯 gather
+selected-K 读,Host,97.05482,126.330023,29.27520299999999,observed→ready：后续等待/收尾窗口
+selected-V 读,Host,126.453309,153.135476,26.682167000000007,submitted→observed：观测窗口，不等同纯 gather
+selected-V 读,Host,153.135476,181.87336,28.73788399999998,observed→ready：后续等待/收尾窗口
+Approx functional,Host,40.917283,78.379347,37.462064,functional_start→functional_end
+Approx completion observation,Host,78.379347,79.609435,1.2300880000000092,功能结束→观察 CU 完成；含控制、等待及观察开销
+Approx functional,Virtual,22.491376,22.491376,0.0,该功能区间虚拟时间不推进
+QK functional,Host,143.075567,152.544811,9.469244000000003,functional_start→functional_end
+QK completion observation,Host,152.544811,153.134494,0.5896829999999795,功能结束→观察 CU 完成；含控制、等待及观察开销
+QK functional,Virtual,52.91422,52.91422,0.0,该功能区间虚拟时间不推进
+PV functional,Host,181.961997,182.541876,0.5798790000000054,functional_start→functional_end
+PV completion observation,Host,182.541876,183.277688,0.7358120000000099,功能结束→观察 CU 完成；含控制、等待及观察开销
+PV functional,Virtual,82.113514,82.113514,0.0,该功能区间虚拟时间不推进
+channel-K 读 target,Virtual,0.113191,22.488191,22.375,模型起点→deadline，不是纯 Host sleep
+selected-K 读 target,Virtual,23.721605,52.909105,29.187499999999996,模型起点→deadline，不是纯 Host sleep
+selected-V 读 target,Virtual,52.91422,82.10172,29.1875,模型起点→deadline，不是纯 Host sleep
+Approx scheduled,Virtual,22.542209,23.711981,1.1697720000000018,submit→completed；effective=1.167768 ms
+QK scheduled,Virtual,52.936642,53.491536,0.5548940000000044,submit→completed；effective=0.553512 ms
+PV scheduled,Virtual,82.125911,82.457786,0.3318749999999966,submit→completed；effective=0.331100 ms

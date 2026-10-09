@@ -39,8 +39,11 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
     uint8_t *buffer = nns->native_buffer;
     uint64_t start = req->stat.stime;
     uint64_t deadline = start;
+    uint64_t transfer_bytes = CEMU_NATIVE_KV_BYTES;
+    bool batch_append = cmd->opcode == CEMU_NATIVE_KV_BUFFER_APPEND_BATCH;
     bool write = cmd->opcode == CEMU_NATIVE_KV_REGISTER || cmd->opcode == CEMU_NATIVE_KV_WRITE ||
-                 cmd->opcode == CEMU_NATIVE_KV_BUFFER_REGISTER || cmd->opcode == CEMU_NATIVE_KV_BUFFER_APPEND;
+                 cmd->opcode == CEMU_NATIVE_KV_BUFFER_REGISTER || cmd->opcode == CEMU_NATIVE_KV_BUFFER_APPEND ||
+                 batch_append;
     bool data = cmd->opcode != CEMU_NATIVE_KV_BUFFER_DRAIN;
 
     req->status = NVME_INVALID_FIELD | NVME_DNR;
@@ -70,11 +73,20 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
         le64_to_cpu(cmd->mptr) ||
         (fields[0] & 0xffff) != CEMU_NATIVE_KV_VERSION ||
         (cmd->opcode != CEMU_NATIVE_KV_WRITE && cmd->opcode != CEMU_NATIVE_KV_BUFFER_APPEND &&
-         fields[0] >> 16)) {
+         !batch_append && fields[0] >> 16)) {
         return;
     }
+    if (batch_append) {
+        transfer_bytes = 2ULL * (fields[0] >> 16) * (fields[4] >> 16) *
+                         native_kv_buffer_row_bytes(nns->native_tail, false);
+        if (!native_kv_buffer_matches(nns->native_tail, &identity) || !transfer_bytes ||
+            transfer_bytes > CEMU_NATIVE_KV_APPEND_MAX_BYTES || nvme_check_mdts(ctrl, transfer_bytes)) {
+            return;
+        }
+        coordinate.kind = coordinate.channel = 0;
+    }
     if (write) {
-        req->status = dma_write_prp(ctrl, buffer, CEMU_NATIVE_KV_BYTES,
+        req->status = dma_write_prp(ctrl, buffer, transfer_bytes,
                                    le64_to_cpu(cmd->dptr.prp1), le64_to_cpu(cmd->dptr.prp2));
         if (req->status) {
             return;
@@ -86,6 +98,7 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
     case CEMU_NATIVE_KV_INFO: {
         CemuKvMapStats stats;
         uint64_t pending_deadline;
+        uint64_t append_limit = CEMU_NATIVE_KV_APPEND_MAX_BYTES;
 
         if (fields[1] || fields[2] || fields[3] || fields[4] || fields[5]) {
             break;
@@ -110,6 +123,10 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
         stq_le_p(buffer + 80, ctrl->native_kv_buffer_budget);
         stq_le_p(buffer + 88, ctrl->native_kv_page_limit);
         stq_le_p(buffer + 96, ctrl->num_namespaces == 3);
+        while (append_limit && nvme_check_mdts(ctrl, append_limit)) {
+            append_limit /= 2;
+        }
+        stq_le_p(buffer + 104, append_limit);
         status = CEMU_KV_OK;
         break;
     }
@@ -162,13 +179,15 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
             deadline = result.ready_ns;
         }
         break;
-    case CEMU_NATIVE_KV_BUFFER_APPEND: {
-        uint64_t bytes = (uint64_t)(fields[0] >> 16) * native_kv_buffer_row_bytes(nns->native_tail, false);
+    case CEMU_NATIVE_KV_BUFFER_APPEND:
+    case CEMU_NATIVE_KV_BUFFER_APPEND_BATCH: {
+        uint32_t heads = batch_append ? fields[4] >> 16 : 1;
+        uint64_t bytes = (uint64_t)heads * (fields[0] >> 16) * native_kv_buffer_row_bytes(nns->native_tail, false);
 
-        if (!native_kv_buffer_matches(nns->native_tail, &identity) || bytes > CEMU_NATIVE_KV_BYTES / 2) {
+        if (!native_kv_buffer_matches(nns->native_tail, &identity) || bytes > transfer_bytes / 2) {
             break;
         }
-        status = native_kv_buffer_append(nns->native_tail, &coordinate, fields[0] >> 16,
+        status = native_kv_buffer_append_batch(nns->native_tail, &coordinate, heads, fields[0] >> 16,
                                          buffer, buffer + bytes, bytes);
         break;
     }
@@ -236,7 +255,7 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
     req->stat.expire_time = deadline;
     req->stat.rw.nand_lat = deadline - start;
     req->stat.reqlat = deadline - start;
-    req->stat.data_size = status == CEMU_KV_OK && data ? CEMU_NATIVE_KV_BYTES : 0;
+    req->stat.data_size = status == CEMU_KV_OK && data ? transfer_bytes : 0;
     req->stat.pcie_lat = status == CEMU_KV_OK && data ? 1 : 0;
 }
 
@@ -351,7 +370,7 @@ void bb_native_namespace_init(NvmeNamespace *ns, Error **errp)
     if (status != CEMU_KV_OK) {
         goto fail;
     }
-    nns->native_buffer = g_try_malloc(CEMU_NATIVE_KV_BYTES);
+    nns->native_buffer = g_try_malloc(CEMU_NATIVE_KV_APPEND_MAX_BYTES);
     nns->to_ftl = g_new0(struct rte_ring *, 2);
     nns->to_ftl[1] = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
     if (!nns->native_buffer || !nns->to_ftl[1]) {
@@ -376,6 +395,7 @@ int bb_native_submit(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     case CEMU_NATIVE_KV_READ:
     case CEMU_NATIVE_KV_BUFFER_REGISTER:
     case CEMU_NATIVE_KV_BUFFER_APPEND:
+    case CEMU_NATIVE_KV_BUFFER_APPEND_BATCH:
     case CEMU_NATIVE_KV_BUFFER_READ:
     case CEMU_NATIVE_KV_BUFFER_STATUS:
     case CEMU_NATIVE_KV_BUFFER_DRAIN:

@@ -13,6 +13,8 @@ MAGIC = 0x31564B4E
 REGISTER, INFO, WRITE, READ = 0xC1, 0xC2, 0xC5, 0xC6
 BUFFER_REGISTER, BUFFER_STATUS, BUFFER_DRAIN = 0xC9, 0xCA, 0xCC
 BUFFER_APPEND, BUFFER_READ = 0xCD, 0xCE
+BUFFER_APPEND_BATCH = 0xD1
+APPEND_MAX_BYTES = 128 * 1024
 
 
 class Passthrough(ctypes.Structure):
@@ -46,13 +48,18 @@ class LinuxTransport:
             raise
 
     def __call__(self, opcode, fields, payload=None, namespace=1):
-        data = ctypes.create_string_buffer(PAGE_BYTES)
+        size = PAGE_BYTES
+        if opcode == BUFFER_APPEND_BATCH:
+            if payload is None or not 0 < len(payload) <= APPEND_MAX_BYTES:
+                raise ValueError("native batched APPEND requires a bounded payload")
+            size = len(payload)
+        data = ctypes.create_string_buffer(size)
         if payload is not None:
-            if len(payload) != PAGE_BYTES:
+            if len(payload) != size:
                 raise ValueError("native KV transfers exactly one page")
             data.raw = payload
         command = Passthrough(opcode=opcode, nsid=namespace,
-                              addr=ctypes.addressof(data), data_len=PAGE_BYTES,
+                              addr=ctypes.addressof(data), data_len=size,
                               timeout_ms=10000)
         if opcode in (0, BUFFER_DRAIN):
             command.addr = command.data_len = 0

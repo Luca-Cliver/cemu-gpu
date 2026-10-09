@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="1350" viewBox="0 0 2600 1350">
+<style>text{font-family:"Noto Sans CJK SC",sans-serif;}</style>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#58708c"/></marker></defs>
+<rect x="0" y="0" width="2600" height="1350" rx="0" fill="white" stroke="none"/>
+<text x="65" y="65" font-size="37" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">01  完整生成与 Prefill：沿时间轴看谁在做事、谁在等待</tspan></text>
+<text x="65" y="110" font-size="23" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">结构时间轴：从左到右表示先后，图块宽度不代表耗时。未取得同次运行的 Guest 逐段记录，以下时长均待测。</tspan></text>
+<text x="65" y="167" font-size="27" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">完整生成</tspan></text>
+<rect x="65" y="192" width="340" height="105" rx="9" fill="#dcecff" stroke="none"/>
+<text x="235.0" y="235.26" font-size="24" fill="#172b43" text-anchor="middle"><tspan x="235.0" dy="0">初始化 / 注册</tspan><tspan x="235.0" dy="34.8">输入与 embedding</tspan></text>
+<path d="M407,245 L422,245" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="425" y="192" width="560" height="105" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="705.0" y="235.26" font-size="24" fill="#172b43" text-anchor="middle"><tspan x="705.0" dy="0">Prefill：逐层 Attention + MLP</tspan><tspan x="705.0" dy="34.8">输出头产生第一个 token</tspan></text>
+<path d="M987,245 L1002,245" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="1005" y="192" width="1020" height="105" rx="9" fill="#dcecff" stroke="none"/>
+<text x="1515.0" y="235.26" font-size="24" fill="#172b43" text-anchor="middle"><tspan x="1515.0" dy="0">Decode：逐 token、逐层重复图 02</tspan><tspan x="1515.0" dy="34.8">每轮末尾输出头产生下一个 token</tspan></text>
+<path d="M2027,245 L2042,245" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="2045" y="192" width="490" height="105" rx="9" fill="#dcecff" stroke="none"/>
+<text x="2290.0" y="235.26" font-size="24" fill="#172b43" text-anchor="middle"><tspan x="2290.0" dy="0">最终 BUFFER_DRAIN</tspan><tspan x="2290.0" dy="34.8">剩余 tail 写完并 sealed</tspan></text>
+<text x="65" y="337" font-size="24" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">下方放大 Prefill 相邻两层：writer 为单线程；只画一种可能的重叠布局，实际重叠量取决于运行。</tspan></text>
+<path d="M300,380 L2520,380" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="2515" y="367" font-size="21" fill="#5c6e83" text-anchor="end"><tspan x="2515" dy="0">时间 →</tspan></text>
+<text x="65" y="470" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">Guest 主线程</tspan><tspan x="65" dy="34.8">与 GPU</tspan></text>
+<path d="M300,482 L2520,482" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<text x="65" y="625" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">Guest KV writer</tspan><tspan x="65" dy="34.8">单线程</tspan></text>
+<path d="M300,637 L2520,637" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<text x="65" y="788" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">Host tail / NAND</tspan><tspan x="65" dy="34.8">后台 worker</tspan></text>
+<path d="M300,800 L2520,800" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<rect x="303" y="425" width="434" height="107" rx="9" fill="#dcecff" stroke="none"/>
+<text x="520.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="520.0" dy="0">层 l：load_layer</tspan><tspan x="520.0" dy="31.9">prefill_attention()</tspan></text>
+<rect x="743" y="425" width="214.0" height="107" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="850.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="850.0" dy="0">提交 l 写任务</tspan><tspan x="850.0" dy="31.9">等 l−1 writer</tspan></text>
+<rect x="963" y="425" width="236.00000000000003" height="107" rx="9" fill="#dcecff" stroke="none"/>
+<text x="1081.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="1081.0" dy="0">层 l MLP</tspan><tspan x="1081.0" dy="31.9">run_mlp()</tspan></text>
+<rect x="1205.0" y="425" width="434" height="107" rx="9" fill="#dcecff" stroke="none"/>
+<text x="1422.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="1422.0" dy="0">层 l+1</tspan><tspan x="1422.0" dy="31.9">load + Attention</tspan></text>
+<rect x="1645.0" y="425" width="258.0" height="107" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="1774.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="1774.0" dy="0">提交 l+1</tspan><tspan x="1774.0" dy="31.9">等 l writer</tspan></text>
+<rect x="1909.0" y="425" width="214.0" height="107" rx="9" fill="#dcecff" stroke="none"/>
+<text x="2016.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="2016.0" dy="0">层 l+1</tspan><tspan x="2016.0" dy="31.9">MLP</tspan></text>
+<rect x="2129.0" y="425" width="390.0" height="107" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="2324.0" y="470.03000000000003" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="2324.0" dy="0">…末层 / 输出头</tspan><tspan x="2324.0" dy="31.9">等待最后 writer</tspan></text>
+<rect x="743" y="579" width="1005.9999999999999" height="112" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1246.0" y="626.1450000000001" font-size="23" fill="#172b43" text-anchor="middle"><tspan x="1246.0" dy="0">层 l：_kv() 导出 →（打包 → APPEND）循环 → _update_mean()</tspan><tspan x="1246.0" dy="33.35">Guest GPU → Guest CPU → ioctl(/dev/ng0n1) → Host tail</tspan></text>
+<rect x="1755.0" y="579" width="764.0" height="112" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="2137.0" y="626.53" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="2137.0" dy="0">层 l+1 writer（随后执行）</tspan><tspan x="2137.0" dy="31.9">上一层 writer 完成后才可处理下一任务</tspan></text>
+<path d="M746.5999999999999,532 L746.5999999999999,576" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<path d="M1752.0,579 L1752.0,535" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="1004.0" y="563" font-size="21" fill="#24765d" text-anchor="start"><tspan x="1004.0" dy="0">与主线程 MLP、下一层 Attention 可以重叠</tspan></text>
+<rect x="850.0" y="748" width="1518.0" height="108" rx="9" fill="#eadefa" stroke="none"/>
+<text x="1609.0" y="793.1450000000001" font-size="23" fill="#172b43" text-anchor="middle"><tspan x="1609.0" dy="0">tail 满组 → pack_batch() → bb_native_kv_batch(write) → 等写 deadline → 推进 committed</tspan><tspan x="1609.0" dy="33.35">后台与上方重叠；尾部不足组可以留在 tail，Attention 可直接从 tail 读取</tspan></text>
+<path d="M850.0,708 L2368.0,708" stroke="#5c6e83" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="65" y="911" font-size="27" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">这个阶段的“等多久”</tspan></text>
+<rect x="65" y="935" width="2470" height="72" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="82" y="965" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">GPU 计算</tspan></text>
+<text x="315" y="964" font-size="21" fill="#172b43" text-anchor="start"><tspan x="315" dy="0">prefill_attention()：LN / QKV / causal QK / softmax / PV / Wo；run_mlp()；末尾 run_output_head()</tspan></text>
+<text x="315" y="993" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="315" dy="0">T_attention / T_mlp / T_head：待测</tspan></text>
+<rect x="65" y="1013" width="2470" height="72" rx="9" fill="#ffffff" stroke="none"/>
+<text x="82" y="1043" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">writer 等待</tspan></text>
+<text x="315" y="1042" font-size="21" fill="#172b43" text-anchor="start"><tspan x="315" dy="0">wait_prefill(previous)：当前层提交后等上一层；末尾 wait_prefill(last)：等最后一层</tspan></text>
+<text x="315" y="1071" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="315" dy="0">W_join：只计到达 join 后仍未完成的部分</tspan></text>
+<rect x="65" y="1091" width="2470" height="72" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="82" y="1121" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">每个 APPEND</tspan></text>
+<text x="315" y="1120" font-size="21" fill="#172b43" text-anchor="start"><tspan x="315" dy="0">Guest ioctl 阻塞至 CQ；成功只表示 tail 接收。pending 后 sleep(100 μs 请求值)，再重试</tspan></text>
+<text x="315" y="1149" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="315" dy="0">W_append：待测；100 μs 不是固定总延迟</tspan></text>
+<rect x="65" y="1169" width="2470" height="72" rx="9" fill="#ffffff" stroke="none"/>
+<text x="82" y="1199" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">生成末尾 drain</tspan></text>
+<text x="315" y="1198" font-size="21" fill="#172b43" text-anchor="start"><tspan x="315" dy="0">全部 Decode 结束后 ioctl(BUFFER_DRAIN)；不足组补零写出，pending 重试至全部完成</tspan></text>
+<text x="315" y="1227" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="315" dy="0">W_drain：待测；不属于最后一个 Execute</tspan></text>
+<text x="65" y="1320" font-size="19" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">CEMU · native KV / autonomous SparF · 单 microbatch 串行路径 · 图表生成 2026-09-29</tspan></text>
+</svg>

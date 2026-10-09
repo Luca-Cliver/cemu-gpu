@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="1640" viewBox="0 0 2600 1640">
+<style>text{font-family:"Noto Sans CJK SC",sans-serif;}</style>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#58708c"/></marker></defs>
+<rect x="0" y="0" width="2600" height="1640" rx="0" fill="white" stroke="none"/>
+<text x="65" y="65" font-size="37" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">02  单层 Decode：调用、传输与等待放在同一条横向时间轴上</tspan></text>
+<text x="65" y="110" font-size="23" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">结构时间轴，宽度不按时长比例。τ0…τ10 为逻辑边界，不是已有时间戳；各段 Guest 耗时 Δ1…Δ10 均待测。</tspan></text>
+<text x="65" y="143" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">本层入口还需 weight_prefetcher.wait() 取得权重（待测）；下一层权重可提前加载。下方从 QKV 调用开始。</tspan></text>
+<text x="402.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="402.0" dy="0">01  GPU 投影</tspan></text>
+<path d="M290,203 L290,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="290" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="290" dy="0">τ0</tspan></text>
+<text x="402.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="402.0" dy="0">Δ1：待测</tspan></text>
+<text x="626.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="626.0" dy="0">02  KV 导出</tspan></text>
+<path d="M514,203 L514,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="514" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="514" dy="0">τ1</tspan></text>
+<text x="626.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="626.0" dy="0">Δ2：待测</tspan></text>
+<text x="850.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="850.0" dy="0">03  打包 / KV 追加</tspan></text>
+<path d="M738,203 L738,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="738" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="738" dy="0">τ2</tspan></text>
+<text x="850.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="850.0" dy="0">Δ3：待测</tspan></text>
+<text x="1074.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="1074.0" dy="0">04  Q / mean 准备</tspan></text>
+<path d="M962,203 L962,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="962" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="962" dy="0">τ3</tspan></text>
+<text x="1074.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="1074.0" dy="0">Δ4：待测</tspan></text>
+<text x="1298.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="1298.0" dy="0">05  slot / 请求准备</tspan></text>
+<path d="M1186,203 L1186,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1186" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1186" dy="0">τ4</tspan></text>
+<text x="1298.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="1298.0" dy="0">Δ5：待测</tspan></text>
+<text x="1522.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="1522.0" dy="0">06  输入上传</tspan></text>
+<path d="M1410,203 L1410,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1410" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1410" dy="0">τ5</tspan></text>
+<text x="1522.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="1522.0" dy="0">Δ6：待测</tspan></text>
+<text x="1746.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="1746.0" dy="0">07  执行 Attention</tspan></text>
+<path d="M1634,203 L1634,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1634" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1634" dy="0">τ6</tspan></text>
+<text x="1746.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="1746.0" dy="0">Δ7：待测</tspan></text>
+<text x="1970.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="1970.0" dy="0">08  结果回读</tspan></text>
+<path d="M1858,203 L1858,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1858" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1858" dy="0">τ7</tspan></text>
+<text x="1970.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="1970.0" dy="0">Δ8：待测</tspan></text>
+<text x="2194.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="2194.0" dy="0">09  输出回 GPU</tspan></text>
+<path d="M2082,203 L2082,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2082" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2082" dy="0">τ8</tspan></text>
+<text x="2194.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="2194.0" dy="0">Δ9：待测</tspan></text>
+<text x="2418.0" y="181" font-size="22" fill="#172b43" text-anchor="middle" font-weight="700"><tspan x="2418.0" dy="0">10  本层后半段</tspan></text>
+<path d="M2306,203 L2306,648" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2306" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2306" dy="0">τ9</tspan></text>
+<text x="2418.0" y="264" font-size="20" fill="#5c6e83" text-anchor="middle"><tspan x="2418.0" dy="0">Δ10：待测</tspan></text>
+<text x="2530" y="228" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2530" dy="0">τ10</tspan></text>
+<path d="M290,235 L2530,235" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="65" y="337" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">Guest 主线程</tspan></text>
+<path d="M290,315 L2530,315" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<text x="65" y="434" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">Guest GPU</tspan></text>
+<path d="M290,412 L2530,412" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<text x="65" y="531" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">slot workers</tspan></text>
+<path d="M290,509 L2530,509" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<text x="65" y="628" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">Host 设备侧</tspan></text>
+<path d="M290,606 L2530,606" stroke="#d6e0eb" stroke-width="2" fill="none"/>
+<rect x="294" y="290" width="216" height="74" rx="9" fill="#dcecff" stroke="none"/>
+<text x="402.0" y="318.91499999999996" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="402.0" dy="0">prepare_decode</tspan><tspan x="402.0" dy="30.45">_attention()</tspan></text>
+<rect x="518" y="290" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="626.0" y="318.91499999999996" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="626.0" dy="0">_kv() 导出 K/V</tspan><tspan x="626.0" dy="30.45">GPU → Guest CPU</tspan></text>
+<rect x="742" y="290" width="216" height="74" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="850.0" y="319.3" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="850.0" dy="0">逐包打包 + ioctl</tspan><tspan x="850.0" dy="29.0">至全部 APPEND 成功</tspan></text>
+<rect x="966" y="290" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1074.0" y="318.91499999999996" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="1074.0" dy="0">_update_mean()</tspan><tspan x="1074.0" dy="30.45">_decode_args()</tspan></text>
+<rect x="1190" y="290" width="888" height="74" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="1634.0" y="334.82" font-size="23" fill="#172b43" text-anchor="middle"><tspan x="1634.0" dy="0">run_decode()：获取 slot，随后 future.result() 阻塞；直到输出与 trace 收齐</tspan></text>
+<rect x="2086" y="290" width="216" height="74" rx="9" fill="#dcecff" stroke="none"/>
+<text x="2194.0" y="318.91499999999996" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="2194.0" dy="0">finish_decode</tspan><tspan x="2194.0" dy="30.45">_attention()</tspan></text>
+<rect x="2310" y="290" width="216" height="74" rx="9" fill="#dcecff" stroke="none"/>
+<text x="2418.0" y="318.91499999999996" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="2418.0" dy="0">Wo / 残差 / LN</tspan><tspan x="2418.0" dy="30.45">run_mlp()</tspan></text>
+<rect x="294" y="387" width="216" height="74" rx="9" fill="#dcecff" stroke="none"/>
+<text x="402.0" y="431.14" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="402.0" dy="0">LN / QKV</tspan></text>
+<rect x="518" y="387" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="626.0" y="430.8" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="626.0" dy="0">K/V → Guest CPU</tspan></text>
+<rect x="966" y="387" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1074.0" y="430.8" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1074.0" dy="0">Q → Guest CPU</tspan></text>
+<rect x="2086" y="387" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="2194.0" y="430.8" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="2194.0" dy="0">Attention 输出 H2D</tspan></text>
+<rect x="2310" y="387" width="216" height="74" rx="9" fill="#dcecff" stroke="none"/>
+<text x="2418.0" y="431.14" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="2418.0" dy="0">GPU 实际计算</tspan></text>
+<rect x="1190" y="484" width="216" height="74" rx="9" fill="#dcecff" stroke="none"/>
+<text x="1298.0" y="512.915" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="1298.0" dy="0">_prepare_decode</tspan><tspan x="1298.0" dy="30.45">预算 / 布局</tspan></text>
+<rect x="1414" y="484" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1522.0" y="513.3" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1522.0" dy="0">pwrite：MR0 / MR4</tspan><tspan x="1522.0" dy="29.0">然后 metadata</tspan></text>
+<rect x="1638" y="484" width="216" height="74" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="1746.0" y="512.915" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="1746.0" dy="0">Execute ioctl</tspan><tspan x="1746.0" dy="30.45">等待父命令 CQ</tspan></text>
+<rect x="1862" y="484" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1970.0" y="513.3" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1970.0" dy="0">pread：MR9 → MR10</tspan><tspan x="1970.0" dy="29.0">完成 future</tspan></text>
+<rect x="742" y="581" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="850.0" y="610.3" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="850.0" dy="0">PRP → wire → tail</tspan><tspan x="850.0" dy="29.0">接收成功 → CQ</tspan></text>
+<rect x="1414" y="581" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1522.0" y="609.915" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="1522.0" dy="0">memory_write()</tspan><tspan x="1522.0" dy="30.45">PRP → FDM</tspan></text>
+<rect x="1638" y="581" width="216" height="74" rx="9" fill="#eadefa" stroke="none"/>
+<text x="1746.0" y="609.915" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="1746.0" dy="0">SparF engine</tspan><tspan x="1746.0" dy="30.45">详细时间见图 03</tspan></text>
+<rect x="1862" y="581" width="216" height="74" rx="9" fill="#d7f0e5" stroke="none"/>
+<text x="1970.0" y="609.915" font-size="21" fill="#172b43" text-anchor="middle"><tspan x="1970.0" dy="0">memory_read()</tspan><tspan x="1970.0" dy="30.45">FDM → Guest</tspan></text>
+<path d="M1186,673 L1186,681" stroke="#5c6e83" stroke-width="2" fill="none"/>
+<path d="M1186,681 L2082,681" stroke="#5c6e83" stroke-width="2" fill="none"/>
+<path d="M2082,673 L2082,681" stroke="#5c6e83" stroke-width="2" fill="none"/>
+<text x="1634.0" y="712" font-size="22" fill="#5c6e83" text-anchor="middle"><tspan x="1634.0" dy="0">W_attention：包括 slot / worker 调度、上传、Execute 和回读</tspan></text>
+<path d="M1634,736 L1634,744" stroke="#8255ae" stroke-width="2" fill="none"/>
+<path d="M1634,744 L1858,744" stroke="#8255ae" stroke-width="2" fill="none"/>
+<path d="M1858,736 L1858,744" stroke="#8255ae" stroke-width="2" fill="none"/>
+<text x="1746.0" y="775" font-size="22" fill="#8255ae" text-anchor="middle"><tspan x="1746.0" dy="0">W_execute</tspan></text>
+<text x="65" y="789" font-size="23" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">Host buffer_worker：满组写 NAND 可横跨以上阶段；APPEND 不等待 NAND 全部写完。背景区间不能再与主线相加。</tspan></text>
+<text x="65" y="846" font-size="27" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">边界处调用什么 / 等到什么才继续</tspan></text>
+<rect x="65" y="867" width="2470" height="90" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="82" y="899" font-size="22" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">01–02  产生与导出 KV</tspan></text>
+<text x="405" y="899" font-size="21" fill="#172b43" text-anchor="start"><tspan x="405" dy="0">prepare_decode_attention() → append_decode() → _kv()；随后进入 NativeKvStore._append_heads()</tspan></text>
+<text x="405" y="934" font-size="21" fill="#5c6e83" text-anchor="start"><tspan x="405" dy="0">新 K/V 从 GPU 到 Guest CPU；第 03 段逐包打包、逐包 ioctl；同包只含同层、同 batch 的多个 head。</tspan></text>
+<rect x="65" y="963" width="2470" height="90" rx="9" fill="white" stroke="none"/>
+<text x="82" y="995" font-size="22" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">03  APPEND syscall</tspan></text>
+<text x="405" y="995" font-size="21" fill="#172b43" text-anchor="start"><tspan x="405" dy="0">ioctl(/dev/ng0n1, NVME_IOCTL_IO_CMD, BUFFER_APPEND_BATCH=0xD1)</tspan></text>
+<text x="405" y="1030" font-size="21" fill="#5c6e83" text-anchor="start"><tspan x="405" dy="0">NVMe SQ → native_execute() → PRP copy → tail ring → CQ；pending 时请求 sleep 100 μs 后重试。</tspan></text>
+<rect x="65" y="1059" width="2470" height="90" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="82" y="1091" font-size="22" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">04–06  请求与输入</tspan></text>
+<text x="405" y="1091" font-size="21" fill="#172b43" text-anchor="start"><tspan x="405" dy="0">_decode_args() → submit_decode() → _prepare_decode() → write_tensor() → pwrite(FDM fd)</tspan></text>
+<text x="405" y="1126" font-size="21" fill="#5c6e83" text-anchor="start"><tspan x="405" dy="0">Q 写 MR0、mean 写 MR4；fdmfs → NVMe ns2 → memory_write()。随后组织 Execute metadata。</tspan></text>
+<rect x="65" y="1155" width="2470" height="90" rx="9" fill="white" stroke="none"/>
+<text x="82" y="1187" font-size="22" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">07  父 Execute</tspan></text>
+<text x="405" y="1187" font-size="21" fill="#172b43" text-anchor="start"><tspan x="405" dy="0">execute_autonomous() → CemuClient.execute() → ioctl(/dev/ng0n3)</tspan></text>
+<text x="405" y="1222" font-size="21" fill="#5c6e83" text-anchor="start"><tspan x="405" dy="0">program_execute() → sparf_submit_autonomous() → engine → to_poller → CQ → ioctl 返回；输出仍在 FDM。</tspan></text>
+<rect x="65" y="1251" width="2470" height="90" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="82" y="1283" font-size="22" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">08  回读并唤醒</tspan></text>
+<text x="405" y="1283" font-size="21" fill="#172b43" text-anchor="start"><tspan x="405" dy="0">_collect_decode() → read_range() → pread(MR9)，再 pread(MR10)</tspan></text>
+<text x="405" y="1318" font-size="21" fill="#5c6e83" text-anchor="start"><tspan x="405" dy="0">必要时 Host CSD GPU → Host FDM RAM，再 PRP → Guest CPU；future 完成后模型主线程继续。</tspan></text>
+<rect x="65" y="1347" width="2470" height="90" rx="9" fill="white" stroke="none"/>
+<text x="82" y="1379" font-size="22" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="82" dy="0">09–10  完成本层</tspan></text>
+<text x="405" y="1379" font-size="21" fill="#172b43" text-anchor="start"><tspan x="405" dy="0">finish_decode_attention() → CPU→GPU → Wo / 残差 / LN → run_mlp()</tspan></text>
+<text x="405" y="1414" font-size="21" fill="#5c6e83" text-anchor="start"><tspan x="405" dy="0">下一层重复 01–10；层间还需取得权重。全部层结束后 run_output_head()，进入下一 token。</tspan></text>
+<rect x="65" y="1468" width="2470" height="107" rx="9" fill="#fff5df" stroke="none"/>
+<text x="85" y="1504" font-size="23" fill="#172b43" text-anchor="start"><tspan x="85" dy="0">如何填写时长：Δi = 同一 Guest 时钟下相邻边界之差；W_execute 是 Δ7 的调用包络，不能再与 Δ7 内部子段相加。</tspan></text>
+<text x="85" y="1543" font-size="21" fill="#172b43" text-anchor="start"><tspan x="85" dy="0">示例 B=4 / H=40 / d=128 / FP16：4 个 20 KiB APPEND 包；Q、mean、输出各 40 KiB。每个 40 KiB FDM 命令的模型增量为 20.48 μs，非 syscall 实测值。</tspan></text>
+<text x="65" y="1610" font-size="19" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">CEMU · native KV / autonomous SparF · 单 microbatch 串行路径 · 图表生成 2026-09-29</tspan></text>
+</svg>

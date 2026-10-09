@@ -111,17 +111,10 @@ make instattention-sparf-group-test
 QEMU 已构建后，需要正常停止旧 VM、以新二进制启动；不要在正在运行的 QEMU 中期待新命令生效。
 Guest 不需要更新内核或 CUDA 算子，仅重建已有 Python bridge。此测试只验证 IO，库作为现有 program 注册载体，不执行库函数。
 
-```bash
-source /root/cemu-gpu-env/bin/activate
-cd /root/CEMU/tests/cemu
-mkdir -p /root/cemu-logs
-set -o pipefail
-make instattention-sparf-group-device-test \
-  NVM_TEST_DIR=/mnt/nvme0 FDM_TEST_DIR=/mnt/fdm0 \
-  NVM_DEVICE=/dev/nvme0n1 \
-  PROGRAM=./build/sparf_attention_devptr.so \
-  2>&1 | tee /root/cemu-logs/sparf-group-device.log
-```
+独立 Guest PUT/GET 测试已退休，下文保留当时的测试规模和结果语义。
+现在 Host 使用 `make instattention-sparf-group-test` 检查目录/组页/稀疏读写，
+Guest 使用 `make instattention-sparf-group-attention-device-test` 做包含 Attention 的综合验收；
+后者需要编译并执行算子，资源用量和下面的历史 IO-only 测试不同。
 
 测试分配 2 MiB 私有 NVM 池和约 68 KiB FDM，不加载 OPT。两个 stream 各 512 tokens，验证全部 token-K/V 和所有 channel-K，
 再检查跨页/跨组/重复索引稀疏读取。132 次完整组 PUT 共写 192 页（786432 B），PUT 的旧页读取总量应为 0；

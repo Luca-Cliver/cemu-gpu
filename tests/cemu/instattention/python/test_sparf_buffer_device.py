@@ -15,7 +15,7 @@ from cemu_flexgen.cemu_sparf_slot_scheduler import CemuSparfSlotScheduler
 from flexgen_adapter.sparf_attention import SparfAttentionBackend
 from cemu_flexgen.sparf_device_writeback import SparfDeviceWriteback
 from phase_profiler import PhaseProfiler
-from test_cemu_attention_phases import require_fdmfs
+from device_test_support import require_fdmfs
 
 
 def run_case(nvm, fdm, args, ratio, profiler=None):

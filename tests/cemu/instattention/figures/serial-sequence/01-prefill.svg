@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2240" height="4678" viewBox="0 0 2240 4678">
+<style>text {font-family:"Noto Sans CJK SC",sans-serif;}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#315d86"/></marker><marker id="openarrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#315d86" stroke-width="1.5"/></marker></defs>
+<rect x="0" y="0" width="2240" height="4678" rx="0" fill="#ffffff" stroke="none"/>
+<text x="70" y="76" fill="#20344c" font-size="41" text-anchor="start" font-weight="700"><tspan x="70" dy="0">01  Prefill：KV 生产、提交与后台写回</tspan></text>
+<text x="72" y="124" fill="#60738b" font-size="24" text-anchor="start"><tspan x="72" dy="0">CEMU · native KV / autonomous SparF · 单 microbatch 串行路径</tspan></text>
+<text x="72" y="168" fill="#20344c" font-size="23" text-anchor="start"><tspan x="72" dy="0">T = 执行区间   W = 等待区间   R / D = 模型预算 / deadline；未填写实测值，纵向长度不表示时间比例。</tspan></text>
+<text x="72" y="207" fill="#60738b" font-size="23" text-anchor="start"><tspan x="72" dy="0">G：Guest 调用时间   H：Host 实际时间   V：QEMU 虚拟时间   C：GPU stream 时间</tspan></text>
+<rect x="44" y="706" width="2152" height="3016" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<rect x="61" y="772" width="2118" height="210" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<rect x="61" y="1086" width="2118" height="664" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<rect x="61" y="2108" width="2118" height="1366" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<rect x="78" y="2546" width="2084" height="900" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<path d="M 250.0 313 V 4568" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="83.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="250.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="250.0" dy="0">Guest 模型主线程</tspan></text>
+<path d="M 598.0 313 V 4568" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="431.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="598.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="598.0" dy="0">Guest GPU</tspan></text>
+<path d="M 946.0 313 V 4568" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="779.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="946.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="946.0" dy="0">Guest KV writer（单线程）</tspan></text>
+<path d="M 1294.0 313 V 4568" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1127.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="1294.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1294.0" dy="0">Guest 内核</tspan></text>
+<path d="M 1642.0 313 V 4568" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1475.0" y="243" width="334.0" height="70" rx="8" fill="#183c60" stroke="none"/>
+<text x="1642.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1642.0" dy="0">Host native worker / CQ</tspan></text>
+<path d="M 1990.0 313 V 4568" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1823.0" y="243" width="334.0" height="70" rx="8" fill="#183c60" stroke="none"/>
+<text x="1990.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1990.0" dy="0">Host buffer worker / NAND</tspan></text>
+<text x="424.0" y="364" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">prefill_attention(layer l)：LN/</tspan><tspan x="424.0" dy="34">QKV/causal Attention/Wo</tspan></text>
+<path d="M 250.0 423 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="458" width="578.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="490" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">T_pf_attn [G/C]：本层功能计算，待分段测量</tspan></text>
+<text x="424.0" y="562" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">hidden、K/V Tensor</tspan></text>
+<path d="M 598.0 587 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="598.0" y="646" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="598.0" dy="0">submit_prefill(l, K, V)：线程池任务</tspan></text>
+<path d="M 250.0 671 H 946.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#openarrow)"/>
+<text x="60" y="737" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">并行分支：主线程继续，和 writer 重叠</tspan></text>
+<text x="77" y="803" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="77" dy="0">条件：存在上一层 writer</tspan></text>
+<text x="272.0" y="862" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">wait_prefill(l-1)：W_prev [G</tspan><tspan x="272.0" dy="34">]</tspan></text>
+<path d="M 250.0 922 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="424.0" y="1026" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">run_mlp(l)：T_pf_mlp [G/C]</tspan></text>
+<path d="M 250.0 1051 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="77" y="1117" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="77" dy="0">分支：还有下一层</tspan></text>
+<text x="424.0" y="1176" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">prefill_attention(l+1)</tspan></text>
+<path d="M 250.0 1201 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="598.0" y="1260" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="598.0" dy="0">submit_prefill(l+1)：排在单 writer 队列中</tspan></text>
+<path d="M 250.0 1285 H 946.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#openarrow)"/>
+<text x="272.0" y="1344" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">wait_prefill(l)：W_join [G]</tspan></text>
+<path d="M 250.0 1370 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<path d="M 61 1422 H 2179" stroke="#a9bacd" stroke-dasharray="8 6"/>
+<text x="77" y="1454" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="77" dy="0">否则：最后一层</tspan></text>
+<text x="424.0" y="1512" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">run_output_head()：产生首</tspan><tspan x="424.0" dy="34">个生成 token</tspan></text>
+<path d="M 250.0 1571 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="272.0" y="1630" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">wait_prefill(l)：等待末层 wri</tspan><tspan x="272.0" dy="34">ter</tspan></text>
+<path d="M 250.0 1690 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<path d="M 44 1770 H 2196" stroke="#a9bacd" stroke-dasharray="8 6"/>
+<text x="60" y="1802" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">另一并行分支：writer 执行本层追加</tspan></text>
+<text x="968.0" y="1860" fill="#20344c" font-size="23" text-anchor="start"><tspan x="968.0" dy="0">write_prefill → _kv → cpu().</tspan><tspan x="968.0" dy="34">numpy()：T_export [G]</tspan></text>
+<path d="M 946.0 1920 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="968.0" y="1996" fill="#20344c" font-size="23" text-anchor="start"><tspan x="968.0" dy="0">append_batch → _append_</tspan><tspan x="968.0" dy="34">heads：T_pack [G]</tspan></text>
+<path d="M 946.0 2056 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="77" y="2139" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="77" dy="0">循环：每包，pending 时重试当前包</tspan></text>
+<text x="1120.0" y="2198" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">ioctl(/dev/ng0n1, NVME_IOCT</tspan><tspan x="1120.0" dy="34">L_IO_CMD, opcode 0xD1)</tspan></text>
+<path d="M 946.0 2257 H 1294.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="2316" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">PRP 映射 / SQ → bb_native_s</tspan><tspan x="1468.0" dy="34">ubmit → native_execute</tspan></text>
+<path d="M 1294.0 2375 H 1642.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1320.0" y="2434" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1320.0" dy="0">dma_write_prp → append_</tspan><tspan x="1320.0" dy="34">batch：T_prp / T_tail [H]</tspan></text>
+<path d="M 1642.0 2494 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="94" y="2577" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="94" dy="0">分支：tail 可以接收整包</tspan></text>
+<text x="1816.0" y="2636" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1816.0" dy="0">enqueue_ready / wake：后台</tspan><tspan x="1816.0" dy="34">处理满组</tspan></text>
+<path d="M 1642.0 2695 H 1990.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#openarrow)"/>
+<text x="1320.0" y="2754" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1320.0" dy="0">CQ 按 D_append 完成；不等</tspan><tspan x="1320.0" dy="34">待 NAND 写完</tspan></text>
+<path d="M 1642.0 2814 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="2890" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">CQ success</tspan></text>
+<path d="M 1642.0 2915 H 1294.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="1120.0" y="2974" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">ioctl 返回；推进 Guest accept</tspan><tspan x="1120.0" dy="34">ed</tspan></text>
+<path d="M 1294.0 3033 H 946.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<path d="M 78 3068 H 2162" stroke="#a9bacd" stroke-dasharray="8 6"/>
+<text x="94" y="3100" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="94" dy="0">否则：reader 占用或空间不足</tspan></text>
+<text x="1468.0" y="3158" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">CQ pending；整包不进入 tail</tspan></text>
+<path d="M 1642.0 3183 H 1294.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="1120.0" y="3242" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">status=0xC / result=5</tspan></text>
+<path d="M 1294.0 3267 H 946.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="968.0" y="3326" fill="#20344c" font-size="23" text-anchor="start"><tspan x="968.0" dy="0">time.sleep(100 us 请求值)，</tspan><tspan x="968.0" dy="34">然后重试</tspan></text>
+<path d="M 946.0 3386 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="968.0" y="3518" fill="#20344c" font-size="23" text-anchor="start"><tspan x="968.0" dy="0">_update_mean()：T_mean </tspan><tspan x="968.0" dy="34">[G]</tspan></text>
+<path d="M 946.0 3578 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="598.0" y="3654" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="598.0" dy="0">layer l writer future 完成，满足对应 join</tspan></text>
+<path d="M 946.0 3679 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<rect x="1826.0" y="3742" width="328.0" height="126" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="1842.0" y="3774" fill="#705315" font-size="23" text-anchor="start"><tspan x="1842.0" dy="0">后台可跨越上述主线运行；</tspan><tspan x="1842.0" dy="34">下方展示一个写批次，不表</tspan><tspan x="1842.0" dy="34">示必须此时才开始</tspan></text>
+<text x="1668.0" y="3914" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1668.0" dy="0">pack_batch → bb_native_k</tspan><tspan x="1668.0" dy="34">v_batch(write)：T_pack_wr</tspan><tspan x="1668.0" dy="34">ite [H]</tspan></text>
+<path d="M 1990.0 4008 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1668.0" y="4084" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1668.0" dy="0">mapping / backend 写字节</tspan><tspan x="1668.0" dy="34">，产生 D_write [V]</tspan></text>
+<path d="M 1990.0 4144 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1668.0" y="4220" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1668.0" dy="0">等 clock_ns 到达 D_write：</tspan><tspan x="1668.0" dy="34">W_write_ready [H/V]</tspan></text>
+<path d="M 1990.0 4280 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1668.0" y="4356" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1668.0" dy="0">推进三类 committed，释放 r</tspan><tspan x="1668.0" dy="34">ing 空间</tspan></text>
+<path d="M 1990.0 4416 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="4468" width="1970.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="4500" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">Prefill 末尾 flush 只收敛 Guest 工作并检查 ready，不执行 terminal drain</tspan></text>
+<text x="70" y="4635" fill="#60738b" font-size="21" text-anchor="start"><tspan x="70" dy="0">来源：NATIVE_SERIAL_SEQUENCE.md · 2026-09-29 · 箭头为调用/完成关系；嵌套和重叠时间不可直接相加。</tspan></text>
+</svg>

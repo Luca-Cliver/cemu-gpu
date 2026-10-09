@@ -47,55 +47,27 @@ CemuKvStatus native_kv_attention_open(NativeKvBuffer *buffer,
     return CEMU_KV_OK;
 }
 
-static uint64_t range_bytes(const NativeKvAttention *attention, const NativeKvGatherRange *range)
+typedef struct NativeKvAttentionRead {
+    const NativeKvAttention *attention;
+    const uint32_t *indices;
+    uint32_t kind;
+    uint32_t ranks;
+} NativeKvAttentionRead;
+
+static void attention_range(void *opaque, uint32_t index, NativeKvGatherRange *range)
 {
-    return (uint64_t)range->tokens * attention->lease.geometry.element_bytes *
-        (range->coordinate.kind == CEMU_KV_PAGE_CHANNEL_K ? 1 : attention->header.head_dim);
-}
+    const NativeKvAttentionRead *read = opaque;
+    const struct cemu_sparf_workflow_header *header = &read->attention->header;
+    uint32_t vector = index / read->ranks;
 
-static CemuKvStatus read_ranges(NativeKvAttention *attention,
-    const NativeKvGatherRange *ranges, uint32_t count, uint8_t *output,
-    uint64_t start_ns, CemuSparfStorageResult *result)
-{
-    uint64_t bytes = 0, prefix = 0;
-    NativeKvGatherResult gathered = {0};
-    CemuKvStatus status;
-
-    for (uint32_t index = 0; index < count; index++) {
-        bytes += range_bytes(attention, &ranges[index]);
-    }
-    status = native_kv_buffer_gather(attention->lease.buffer, ranges, count, output,
-                                    bytes, start_ns, &gathered);
-    if (status != CEMU_KV_LIMIT) {
-        result->ready_ns = MAX(result->ready_ns, gathered.ready_ns);
-        result->flash_bytes += gathered.transferred_bytes;
-        result->pages += gathered.flash_pages;
-        result->tail_bytes += gathered.tail_bytes;
-        result->batches++;
-        return status;
-    }
-    if (count > 1) {
-        uint32_t first = count / 2;
-
-        for (uint32_t index = 0; index < first; index++) {
-            prefix += range_bytes(attention, &ranges[index]);
-        }
-        status = read_ranges(attention, ranges, first, output, start_ns, result);
-        return status == CEMU_KV_OK ? read_ranges(attention, ranges + first,
-            count - first, output + prefix, start_ns, result) : status;
-    }
-    if (ranges[0].tokens > 1) {
-        NativeKvGatherRange split[2] = { ranges[0], ranges[0] };
-
-        split[0].tokens /= 2;
-        split[1].tokens -= split[0].tokens;
-        split[1].coordinate.token += split[0].tokens;
-        prefix = range_bytes(attention, &split[0]);
-        status = read_ranges(attention, split, 1, output, start_ns, result);
-        return status == CEMU_KV_OK ? read_ranges(attention, split + 1, 1,
-            output + prefix, start_ns, result) : status;
-    }
-    return status;
+    *range = (NativeKvGatherRange){ .coordinate = {
+        .batch = read->attention->lease.batch_first + vector / header->num_query_heads,
+        .layer = header->layer,
+        .head = (vector % header->num_query_heads) / (header->num_query_heads / header->num_kv_heads),
+        .kind = read->kind,
+        .token = read->kind == CEMU_KV_PAGE_CHANNEL_K ? 0 : read->indices[index],
+        .channel = read->kind == CEMU_KV_PAGE_CHANNEL_K ? read->indices[index] : 0 },
+        .tokens = read->kind == CEMU_KV_PAGE_CHANNEL_K ? header->valid_tokens : 1 };
 }
 
 bool native_kv_attention_read(void *opaque,
@@ -104,9 +76,11 @@ bool native_kv_attention_read(void *opaque,
     CemuSparfStorageResult *result)
 {
     NativeKvAttention *attention = opaque;
-    NativeKvGatherRange ranges[CEMU_NATIVE_GATHER_MAX_RANGES];
+    NativeKvGatherResult gathered = {0};
+    NativeKvAttentionRead read;
+    CemuKvStatus status;
     uint64_t vectors, required, cursor = 0;
-    uint32_t ranks, element, count = 0;
+    uint32_t ranks, element;
 
     if (!result) {
         return false;
@@ -130,32 +104,18 @@ bool native_kv_attention_read(void *opaque,
             return false;
         }
     }
-    for (uint64_t index = 0; index < vectors * ranks; index++) {
-        uint64_t vector = index / ranks;
-        CemuKvCoordinate coordinate = {
-            .batch = attention->lease.batch_first + vector / header->num_query_heads,
-            .layer = header->layer,
-            .head = (vector % header->num_query_heads) / (header->num_query_heads / header->num_kv_heads),
-            .kind = kind,
-            .token = kind == CEMU_KV_PAGE_CHANNEL_K ? 0 : indices[index],
-            .channel = kind == CEMU_KV_PAGE_CHANNEL_K ? indices[index] : 0,
-        };
-
-        ranges[count++] = (NativeKvGatherRange){ coordinate,
-            kind == CEMU_KV_PAGE_CHANNEL_K ? header->valid_tokens : 1 };
-        if (count == G_N_ELEMENTS(ranges) || index + 1 == vectors * ranks) {
-            CemuKvStatus status = read_ranges(attention, ranges, count,
-                (uint8_t *)output + cursor, start_ns, result);
-
-            if (status != CEMU_KV_OK) {
-                result->status = status;
-                return false;
-            }
-            for (uint32_t range = 0; range < count; range++) {
-                cursor += range_bytes(attention, &ranges[range]);
-            }
-            count = 0;
-        }
+    read = (NativeKvAttentionRead){ attention, indices, kind, ranks };
+    cursor = required - (kind == CEMU_KV_PAGE_TOKEN_V ? vectors * header->head_dim * element : 0);
+    status = native_kv_buffer_gather_phase(attention->lease.buffer, attention_range,
+        &read, vectors * ranks, output, cursor, start_ns, &gathered);
+    result->ready_ns = gathered.ready_ns;
+    result->flash_bytes = gathered.transferred_bytes;
+    result->pages = gathered.flash_pages;
+    result->tail_bytes = gathered.tail_bytes;
+    result->batches = gathered.batches;
+    result->status = status;
+    if (status != CEMU_KV_OK) {
+        return false;
     }
     if (kind == CEMU_KV_PAGE_TOKEN_V) {
         uint64_t row = (uint64_t)header->head_dim * element;

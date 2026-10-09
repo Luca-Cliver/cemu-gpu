@@ -132,15 +132,10 @@ make instattention-sparf-group-buffer-test
 15/16、255/256 边界、partial drain、幂等排空、FP32、非法请求、空间不足、IO 失败。
 这证明数据和依赖逻辑，不替代 Guest 驱动集成测试或论文时间校准。
 
-Host 正常关闭旧 VM，重新使用编译后的 QEMU 启动；Guest 挂载后：
-
-```bash
-source /root/cemu-gpu-env/bin/activate
-cd /root/CEMU/tests/cemu
-make instattention-sparf-group-buffer-device-test \
-  NVM_TEST_DIR=/mnt/nvme0 \
-  FDM_TEST_DIR=/mnt/fdm0
-```
+独立 grouped buffer Guest 入口已退休，下文为历史测试规模记录。
+现在 Host 使用 `make instattention-sparf-group-buffer-test` 保留细项回归；
+Guest 使用 `make instattention-sparf-group-attention-device-test` 验证 buffer 与 Attention
+联通。native FTL 使用 `instattention-native-buffer-device-test`，不要混用存储模式。
 
 新 Guest 测试使用独占 2 MiB 池和 2 streams，先 253-token Prefill，再跨 256 边界追加，
 最终共 531 tokens/stream 触发环形复用和部分组 DRAIN。校验最终全部 K/V、全部 channel-K，

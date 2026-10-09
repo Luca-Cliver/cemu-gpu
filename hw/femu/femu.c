@@ -486,8 +486,15 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
         ns->uncorrectable = bitmap_new(num_blks);
         ns->backend = init_nvm_backend(n, ns);
         if (!ns->backend) {
-            error_setg(errp, "Native KV requires a new exclusive backend file; existing paths are refused");
+            error_setg(errp, "Failed to initialize namespace %u backend; native NVM requires a new exclusive file (see preceding error)", ns->id);
             return -1;
+        }
+        if (n->native_kv && backend_cuda_sync_requested()) {
+            if (!ns->backend->cuda_sync) {
+                error_setg(errp, "Native namespace %u: CUDA requested but backend initialization failed; refusing to boot with CUDA disabled", ns->id);
+                return -1;
+            }
+            femu_log("Native namespace %u: CUDA backend initialized\n", ns->id);
         }
     }
 

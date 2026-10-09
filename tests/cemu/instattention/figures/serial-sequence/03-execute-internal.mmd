@@ -1,0 +1,56 @@
+sequenceDiagram
+    participant E as Host autonomous worker
+    participant F as Guest vCPU / QEMU virtual clock
+    participant M as native gather / FDM
+    participant C as CU scheduler
+
+    Note over E,C: engine started；后续仍是同一个父 Execute
+    rect rgb(232,241,252)
+        E->>F: enter_compute_section：T_enter [H]
+        Note over F: vCPU 暂停、V 停止；已提交的物理 GPU 工作不会自动暂停
+        E->>E: Q top-r：T_select [H]
+        E->>M: native_kv_attention_read(channel-K)
+        M->>M: committed 分流 → backend/tail → scatter MR1
+        M-->>E: 数据字节已填好；返回 D_ch [V]
+        E->>F: leave_compute_section：T_leave [H]
+    end
+    E->>E: WAIT_TIME：等 V 到 D_ch，W_ch_ready [H/V]
+    rect rgb(232,241,252)
+        E->>F: enter_compute_section
+        E->>E: approximate / softmax / top-k / alpha：T_approx_func [H]
+        E->>F: leave_compute_section
+    end
+    E->>C: sched_submit_internal(R_approx_eff)
+    Note over E,C: W_approx [H/V]：排队、模拟运行、完成观察
+    C-->>E: completion ring（有效预算为零则跳过提交）
+    rect rgb(232,241,252)
+        E->>F: enter_compute_section
+        E->>M: gather selected-K → MR2：T_k_gather [H]
+        M-->>E: 数据 + D_k [V]
+        E->>F: leave_compute_section
+    end
+    E->>E: WAIT_TIME：等 V 到 D_k，W_k_ready [H/V]
+    rect rgb(232,241,252)
+        E->>F: enter_compute_section
+        E->>M: gather selected-V → MR3：T_v_gather [H]
+        M-->>E: 数据 + D_v [V]
+        E->>E: run_sparf_phase(EXACT_QK) → MR8：T_exact_func [H]
+        E->>F: leave_compute_section
+    end
+    E->>C: sched_submit_internal(R_exact_eff)
+    Note over M,C: V 的目标 deadline 与 exact 的模拟运行可重叠；功能 gather 在 exact 前已经返回
+    C-->>E: exact completion；W_exact [H/V]
+    rect rgb(232,241,252)
+        E->>F: enter_compute_section
+        E->>M: MR4 mean → MR3 额外行；收尾 V 读取
+        E->>F: leave_compute_section
+    end
+    E->>E: WAIT_TIME：只等 D_v 尚未到达的部分，W_v_remaining [H/V]
+    rect rgb(232,241,252)
+        E->>F: enter_compute_section
+        E->>E: run_sparf_phase(PV) → MR9；生成 trace：T_pv_func [H]
+        E->>F: leave_compute_section
+    end
+    E->>C: sched_submit_internal(R_pv_eff)
+    C-->>E: PV completion；W_pv [H/V]
+    E->>E: DONE；释放引用；父请求送 to_poller

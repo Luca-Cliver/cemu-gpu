@@ -10,6 +10,7 @@ import unittest
 
 from native_kv_client import (
     BUFFER_APPEND, BUFFER_REGISTER, BUFFER_STATUS, INFO, READ, VERSION,
+    BUFFER_APPEND_BATCH, BUFFER_READ, APPEND_MAX_BYTES, PAGE_BYTES,
     buffer_row, checked, coordinates, run_buffer_contract, run_contract,
 )
 
@@ -22,7 +23,14 @@ ASQ, ACQ, IOSQ, IOCQ, DBS, EIS, DATA = [0x100000 + index * 0x10000 for index in 
 
 
 class NativeQtest:
-    def __init__(self, directory, config=CONFIG):
+    def __init__(self, directory, config=CONFIG, *, cuda=False):
+        environment = {**os.environ, "CEMU_CUDA_SYNC": "0"}
+        if cuda:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if not visible or visible == "-1" or "," in visible:
+                raise ValueError("CUDA qtest requires one explicit CUDA_VISIBLE_DEVICES GPU")
+            environment.update(CEMU_CUDA_SYNC="1", CEMU_CUDA_DEVICE="0",
+                               CUDA_DEVICE_ORDER="PCI_BUS_ID")
         self.directory = Path(directory)
         self.backend = self.directory / "new-nvm.img"
         self.log = open(self.directory / "qemu.log", "w+")
@@ -34,7 +42,7 @@ class NativeQtest:
             "-device", f"femu,id=native0,addr=04.0,ftl_mode=instattention,config_file={config},"
                        f"nvm_backend_file={self.backend}",
         ], cwd=directory, stdout=self.log, stderr=self.log,
-            env={**os.environ, "CEMU_CUDA_SYNC": "0"})
+            env=environment)
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(5)
         self.stream = None
@@ -160,7 +168,15 @@ class NativeQtest:
 
     def __call__(self, opcode, fields, payload=None, namespace=1):
         self.write(DATA, payload if payload is not None else bytes(4096))
-        self.submit(1, opcode, fields, namespace=namespace)
+        prp2 = 0
+        if payload is not None and len(payload) > 4096:
+            pages = (len(payload) + 4095) // 4096
+            prp2 = DATA + 4096
+            if pages > 2:
+                prp2 = DATA + APPEND_MAX_BYTES
+                self.write(prp2, struct.pack(f"<{pages - 1}Q",
+                    *(DATA + page * 4096 for page in range(1, pages))))
+        self.submit(1, opcode, fields, prp2=prp2, namespace=namespace)
         status, result = self.wait(1)
         return status, result, self.read(DATA, 4096)
 
@@ -185,6 +201,66 @@ class NativeQtest:
 
 @unittest.skipUnless(QEMU.exists(), "build qemu-system-x86_64 first")
 class NativeDeviceTest(unittest.TestCase):
+    def test_batched_append_prp_lists_tail_flash_and_rejections(self):
+        import numpy as np
+        from cemu_flexgen.native_kv_store import NativeKvStore
+        from cemu_flexgen.sparf_group_layout import SparfGroupLayout
+        with tempfile.TemporaryDirectory(prefix="native-kv-batch-") as directory:
+            device = NativeQtest(directory, CONFIG.with_name("native_csd_smoke.json"))
+            store = None
+            try:
+                class Transport:
+                    def __call__(self, *args, **kwargs): return device(*args, **kwargs)
+                    def close(self): pass
+
+                store = NativeKvStore(SparfGroupLayout(128, 8), 1, 1, 16, 600, 1,
+                                      transport_factory=lambda path: Transport()).open()
+                self.assertEqual(store._append_batch_bytes, APPEND_MAX_BYTES)
+                keys = np.arange(531 * 16 * 128, dtype=np.uint16).view(np.float16).reshape(531, 16, 128)
+                values = (np.arange(keys.size, dtype=np.uint16) ^ 0x1357).view(np.float16).reshape(keys.shape)
+
+                def verify(tokens):
+                    for head in (0, 7, 15):
+                        for token in tokens:
+                            for kind, source in ((0, keys), (2, values)):
+                                actual = checked(device, BUFFER_READ,
+                                    coordinates(store.task, head=head, token=token, kind=kind))
+                                self.assertEqual(actual[:256], source[token, head].tobytes())
+                            for channel in (0, 7, 8, 127):
+                                actual = checked(device, BUFFER_READ,
+                                    coordinates(store.task, head=head, token=token, kind=1, channel=channel))
+                                self.assertEqual(actual[:2], keys[token, head, channel:channel + 1].tobytes())
+
+                previous = 0
+                for tokens in (15, 16, 253, 256, 259, 531):
+                    store.append_batch(0, previous, keys[previous:tokens], values[previous:tokens])
+                    verify((0, tokens - 1))
+                    previous = tokens
+                    if tokens == 15:
+                        self.assertEqual(store.statistics()["write_bytes"], 0)
+                for heads, head, generation, count in ((0, 0, 1, 1), (2, 15, 1, 1),
+                                                       (1, 0, 2, 1), (16, 0, 1, 17)):
+                    fields = list(coordinates(store.task, generation, head=head, token=531, valid=count))
+                    fields[4] |= heads << 16
+                    checked(device, BUFFER_APPEND_BATCH, tuple(fields), bytes(1024), rejected=True)
+                for head in range(16):
+                    data = checked(device, BUFFER_STATUS, coordinates(store.task, head=head))
+                    self.assertEqual(struct.unpack_from("<Q", data)[0], 531)
+                store.drain()
+                stats = store.statistics()
+                self.assertEqual(stats["write_bytes"], 16 * 116 * PAGE_BYTES)
+                self.assertEqual(stats["client_appended_head_tokens"], 531 * 16)
+                self.assertEqual(stats["failed"], 0)
+                self.assertEqual(stats["sealed"], 1)
+                verify((14, 15, 16, 252, 255, 256, 258, 512, 530))
+                fields = list(coordinates(store.task, token=531, valid=1))
+                fields[4] |= 1 << 16
+                checked(device, BUFFER_APPEND_BATCH, tuple(fields), bytes(512), rejected=True)
+            finally:
+                if store:
+                    store.close()
+                device.close()
+
     def test_native_buffer(self):
         with tempfile.TemporaryDirectory(prefix="native-kv-buffer-") as directory:
             device = NativeQtest(directory)
@@ -246,6 +322,40 @@ class NativeDeviceTest(unittest.TestCase):
                     self.assertEqual(backend.read_bytes(), sentinel)
                     if path != backend:
                         self.assertFalse(path.exists())
+
+    def test_cuda_init_failure_stops_native_boot(self):
+        with tempfile.TemporaryDirectory(prefix="native-cuda-guard-") as directory:
+            directory = Path(directory)
+            source = directory / "cuda_failure.c"
+            source.write_text("""
+#include <stddef.h>
+static int calls;
+int cudaSetDevice(int device) { return ++calls == FAIL_CALL ? 3 : 0; }
+int cudaMalloc(void **pointer, size_t bytes) { return 2; }
+int cudaFree(void *pointer) { return 0; }
+int cudaMemcpy(void *dest, const void *source, size_t bytes, int kind) { return 0; }
+const char *cudaGetErrorString(int status) { return "injected initialization error"; }
+""")
+            config = ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json"
+            for namespace in (1, 2):
+                with self.subTest(namespace=namespace):
+                    subprocess.run([
+                        "cc", "-shared", "-fPIC", f"-DFAIL_CALL={namespace}", str(source),
+                        "-o", str(directory / "libcudart.so"),
+                    ], check=True)
+                    result = subprocess.run([
+                        str(QEMU), "-machine", "pc", "-accel", "qtest", "-display", "none",
+                        "-nodefaults", "-m", "64M", "-device",
+                        f"femu,ftl_mode=instattention,config_file={config},"
+                        f"nvm_backend_file={directory / f'failure-{namespace}.img'}",
+                    ], cwd=directory, env={**os.environ, "CEMU_CUDA_SYNC": "1",
+                        "CEMU_CUDA_DEVICE": "0", "LD_LIBRARY_PATH": str(directory)},
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+                    output = result.stdout.decode()
+                    self.assertGreater(result.returncode, 0, output)
+                    self.assertIn("status=3 (injected initialization error)", output)
+                    self.assertIn(f"Native namespace {namespace}: CUDA requested", output)
+                    self.assertIn("refusing to boot with CUDA disabled", output)
 
     def test_completion_backpressure(self):
         with tempfile.TemporaryDirectory(prefix="native-kv-cq-") as directory:

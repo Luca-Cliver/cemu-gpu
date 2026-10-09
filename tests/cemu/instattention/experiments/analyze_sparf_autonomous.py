@@ -179,11 +179,46 @@ def validate_request(row):
         "request": row["request"], "layer": row["layer"], "tokens": row["tokens"],
         "host_elapsed_ns": ready[0] - admitted[0],
         "virtual_elapsed_ns": ready[1] - admitted[1],
+        "engine_queue_host_ns": started[0] - admitted[0],
+        "engine_queue_virtual_ns": started[1] - admitted[1],
+        "read_boundaries": {
+            name: {
+                "model_ns": read["deadline_ns"] - stamp(read, "submitted")[1],
+                "host_submit_to_observed_ns": stamp(read, "observed")[0] - stamp(read, "submitted")[0],
+                "host_observed_to_ready_ns": stamp(read, "ready")[0] - stamp(read, "observed")[0],
+                "virtual_deadline_to_ready_ns": stamp(read, "ready")[1] - read["deadline_ns"],
+            } for name, read in reads.items()
+        },
+        "compute_boundaries": {
+            name: {
+                "functional_host_ns": stamp(compute, "functional_end")[0] - stamp(compute, "functional_start")[0],
+                "functional_virtual_ns": stamp(compute, "functional_end")[1] - stamp(compute, "functional_start")[1],
+                "end_to_submit_virtual_ns": compute["submitted_ns"] - stamp(compute, "functional_end")[1],
+                "submit_to_complete_virtual_ns": compute["completed_ns"] - compute["submitted_ns"],
+                "complete_to_observed_virtual_ns": stamp(compute, "observed_done")[1] - compute["completed_ns"],
+            } for name, compute in computes.items()
+        },
         "cu_occupied_ns": sum(right - left for left, right, _, _ in spans),
         "qk_v_target_overlap_ns": qk_v_overlap,
         "zero_budget_phases": sum(not item["scheduled"] for item in computes.values()),
         "read_io": {name: read_diagnostics(read) for name, read in reads.items()},
     }, spans
+
+
+def summarize_boundaries(reports):
+    summary = {
+        "requests": len(reports),
+        **{name: sum(row[name] for row in reports) for name in (
+            "host_elapsed_ns", "virtual_elapsed_ns", "engine_queue_host_ns", "engine_queue_virtual_ns")},
+    }
+    for category in ("read_boundaries", "compute_boundaries"):
+        summary[category] = {}
+        for row in reports:
+            for phase, fields in row[category].items():
+                totals = summary[category].setdefault(phase, {})
+                for name, value in fields.items():
+                    totals[name] = totals.get(name, 0) + value
+    return summary
 
 
 def analyze(records):
@@ -274,6 +309,7 @@ def main():
     parser.add_argument("trace", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--read-summary", type=Path)
+    parser.add_argument("--boundary-summary", type=Path)
     parser.add_argument("--require-read-diagnostics", action="store_true")
     parser.add_argument("--latest-session", action="store_true")
     parser.add_argument("--min-tokens", type=int, default=0)
@@ -294,6 +330,7 @@ def main():
             require(concurrency["cross_request_io_compute_ns"] > 0,
                     "no observed cross-request IO/CU overlap in virtual time")
         summary = summarize_reads(reports)
+        boundaries = summarize_boundaries(reports)
         if args.require_read_diagnostics:
             require(all(not phase["missing_requests"] for phase in summary.values()),
                     "read diagnostics missing; enable CEMU_SPARF_READ_DIAGNOSTICS=1 and rerun")
@@ -303,12 +340,23 @@ def main():
         args.output.write_text(json.dumps(reports, indent=2) + "\n")
     if args.read_summary:
         args.read_summary.write_text(json.dumps(summary, indent=2) + "\n")
+    if args.boundary_summary:
+        args.boundary_summary.write_text(json.dumps(boundaries, indent=2) + "\n")
     total_overlap = sum(row["qk_v_target_overlap_ns"] for row in reports)
     print(f"[sparf-autonomous] PASS: {len(reports)} requests; IO/CU exclusion and QK/V→PV dependencies valid")
     print(f"[sparf-autonomous] target QK/V overlap={total_overlap / 1e6:.6f} ms; "
           f"zero-budget phases={sum(row['zero_budget_phases'] for row in reports)}")
     print("[sparf-autonomous] Host intervals are not target times; PASS does not calibrate the timing model")
     print(f"[sparf-autonomous] concurrency={concurrency}")
+    print(f"[sparf-boundary] parent Host sum={boundaries['host_elapsed_ns'] / 1e9:.6f}s, "
+          f"virtual sum={boundaries['virtual_elapsed_ns'] / 1e9:.6f}s, "
+          f"engine queue virtual sum={boundaries['engine_queue_virtual_ns'] / 1e9:.6f}s")
+    for category in ("read_boundaries", "compute_boundaries"):
+        for phase, values in boundaries[category].items():
+            durations = ', '.join(f"{name}={value / 1e9:.6f}s" for name, value in values.items())
+            print(f"[sparf-boundary] {phase}: {durations}")
+    print("[sparf-boundary] Sums overlap; boundary intervals do not isolate freeze cost, "
+          "GPU kernel time, or Guest ioctl completion latency")
     for phase, values in summary.items():
         if not values["observed_requests"]:
             print(f"[sparf-read] {phase}: diagnostics unavailable (not zero IO)")

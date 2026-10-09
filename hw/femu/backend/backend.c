@@ -7,6 +7,7 @@ typedef int (*cuda_set_decive_fn)(int);
 typedef int (*cuda_malloc_fn)(void **, size_t);
 typedef int (*cuda_free_fn)(void *);
 typedef int (*cuda_memcpy_fn)(void *, const void *, size_t, int);
+typedef const char *(*cuda_error_string_fn)(int);
 
 typedef struct CudaSyncApi
 {
@@ -16,6 +17,7 @@ typedef struct CudaSyncApi
     cuda_malloc_fn malloc;
     cuda_free_fn free;
     cuda_memcpy_fn memcpy;
+    cuda_error_string_fn error_string;
 } CudaSyncApi;
 
 static CudaSyncApi cuda_api = {0};
@@ -358,6 +360,7 @@ static int backend_cuda_init_api(void)
     cuda_api.malloc = (cuda_malloc_fn)cuda_get_symbol("cudaMalloc");
     cuda_api.free = (cuda_free_fn)cuda_get_symbol("cudaFree");
     cuda_api.memcpy = (cuda_memcpy_fn)cuda_get_symbol("cudaMemcpy");
+    cuda_api.error_string = (cuda_error_string_fn)dlsym(cuda_api.module, "cudaGetErrorString");
 
     if (!cuda_api.set_device || !cuda_api.malloc || !cuda_api.free ||
         !cuda_api.memcpy) {
@@ -368,6 +371,14 @@ static int backend_cuda_init_api(void)
     return true;
 }
 
+bool backend_cuda_sync_requested(void)
+{
+    const char *enable = g_getenv("CEMU_CUDA_SYNC");
+
+    return enable && enable[0] && g_ascii_strcasecmp(enable, "0") &&
+           g_ascii_strcasecmp(enable, "false");
+}
+
 int backend_cuda_sync_init(SsdBackend *b)
 {
     const char *enable = g_getenv("CEMU_CUDA_SYNC");
@@ -375,7 +386,7 @@ int backend_cuda_sync_init(SsdBackend *b)
     int device_id = decive_env ? atoi(decive_env) : 0;
     femu_debug("backend_cuda_sync_init: enable %s, device_id %d\n", enable, device_id);
 
-    if(!enable || !enable[0] || !g_ascii_strcasecmp(enable, "0") || !g_ascii_strcasecmp(enable, "false"))
+    if (!backend_cuda_sync_requested())
     {
         return 0;
     }
@@ -385,8 +396,12 @@ int backend_cuda_sync_init(SsdBackend *b)
         return -1;
     }
 
-    if(cuda_api.set_device && cuda_api.set_device(device_id) != 0) {
-        femu_err("Failed to set CUDA device %d.\n", device_id);
+    int status = cuda_api.set_device(device_id);
+    if (status != 0) {
+        const char *description = cuda_api.error_string ? cuda_api.error_string(status) : NULL;
+        femu_err("Failed to set CUDA device %d: status=%d (%s), CUDA_VISIBLE_DEVICES=%s.\n",
+                 device_id, status, description ? description : "unknown",
+                 g_getenv("CUDA_VISIBLE_DEVICES") ? g_getenv("CUDA_VISIBLE_DEVICES") : "unset");
         return -1;
     }
 

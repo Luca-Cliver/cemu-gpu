@@ -1,0 +1,52 @@
+sequenceDiagram
+    participant A as Guest 模型主线程
+    participant G as Guest GPU
+    participant W as Guest KV writer（单线程）
+    participant K as Guest 内核
+    participant N as Host native worker / CQ
+    participant B as Host buffer worker / NAND
+
+    A->>G: prefill_attention(layer l)：LN/QKV/causal Attention/Wo
+    Note over A,G: T_pf_attn [G/C]：本层功能计算，待分段测量
+    G-->>A: hidden、K/V Tensor
+    A-)W: submit_prefill(l, K, V)：线程池任务
+    par 主线程继续，和 writer 重叠
+        opt 存在上一层 writer
+            A->>A: wait_prefill(l-1)：W_prev [G]
+        end
+        A->>G: run_mlp(l)：T_pf_mlp [G/C]
+        alt 还有下一层
+            A->>G: prefill_attention(l+1)
+            A-)W: submit_prefill(l+1)：排在单 writer 队列中
+            A->>A: wait_prefill(l)：W_join [G]
+        else 最后一层
+            A->>G: run_output_head()：产生首个生成 token
+            A->>A: wait_prefill(l)：等待末层 writer
+        end
+    and writer 执行本层追加
+        W->>W: write_prefill → _kv → cpu().numpy()：T_export [G]
+        W->>W: append_batch → _append_heads：T_pack [G]
+        loop 每包，pending 时重试当前包
+            W->>K: ioctl(/dev/ng0n1, NVME_IOCTL_IO_CMD, opcode 0xD1)
+            K->>N: PRP 映射 / SQ → bb_native_submit → native_execute
+            N->>N: dma_write_prp → append_batch：T_prp / T_tail [H]
+            alt tail 可以接收整包
+                N-)B: enqueue_ready / wake：后台处理满组
+                N->>N: CQ 按 D_append 完成；不等待 NAND 写完
+                N-->>K: CQ success
+                K-->>W: ioctl 返回；推进 Guest accepted
+            else reader 占用或空间不足
+                N-->>K: CQ pending；整包不进入 tail
+                K-->>W: status=0xC / result=5
+                W->>W: time.sleep(100 us 请求值)，然后重试
+            end
+        end
+        W->>W: _update_mean()：T_mean [G]
+        W-->>A: layer l writer future 完成，满足对应 join
+    end
+    Note over B: 后台可跨越上述主线运行；下方展示一个写批次，不表示必须此时才开始
+    B->>B: pack_batch → bb_native_kv_batch(write)：T_pack_write [H]
+    B->>B: mapping / backend 写字节，产生 D_write [V]
+    B->>B: 等 clock_ns 到达 D_write：W_write_ready [H/V]
+    B->>B: 推进三类 committed，释放 ring 空间
+    Note over A,B: Prefill 末尾 flush 只收敛 Guest 工作并检查 ready，不执行 terminal drain

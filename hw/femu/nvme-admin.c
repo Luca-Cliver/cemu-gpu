@@ -923,7 +923,7 @@ static uint16_t nvme_cmd_effects(FemuCtrl *n, NvmeCmd *cmd, uint8_t csi,
                 CEMU_NATIVE_KV_REGISTER, CEMU_NATIVE_KV_WRITE, CEMU_NATIVE_KV_READ,
                 CEMU_NATIVE_KV_BUFFER_REGISTER, CEMU_NATIVE_KV_BUFFER_STATUS,
                 CEMU_NATIVE_KV_BUFFER_DRAIN, CEMU_NATIVE_KV_BUFFER_APPEND,
-                CEMU_NATIVE_KV_BUFFER_READ };
+                CEMU_NATIVE_KV_BUFFER_READ, CEMU_NATIVE_KV_BUFFER_APPEND_BATCH };
             for (unsigned int index = 0; index < G_N_ELEMENTS(opcodes); index++)
                 log.iocs[opcodes[index]] = cpu_to_le32(NVME_CMD_EFF_CSUPP);
         } else if (n->num_namespaces == 3 && csi == NVME_CSI_MEMORY) {

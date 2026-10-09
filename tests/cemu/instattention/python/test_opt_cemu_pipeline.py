@@ -16,7 +16,7 @@ import torch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_DIR / "build-guest"))
+sys.path.insert(0, os.environ.get("CEMU_INSTATTENTION_BUILD_DIR", str(PROJECT_DIR / "build-guest")))
 sys.path.insert(0, str(PROJECT_DIR / "python"))
 sys.path.insert(0, str(PROJECT_DIR))
 
@@ -59,6 +59,7 @@ from experiments.softmax_ratio import SoftmaxRatioTable
 from cemu_flexgen.cemu_sparf_slot_scheduler import CemuSparfSlotScheduler
 from cemu_flexgen.sparf_device_writeback import SparfDeviceWriteback
 from cemu_flexgen.native_kv_store import NativeKvStore
+from native_kv_client import PAGE_BYTES as NATIVE_PAGE_BYTES
 from phase_profiler import PhaseProfiler, profile_scope
 from runtime_common import partition_kv_cache_by_batch
 
@@ -1210,7 +1211,17 @@ def main():
         f"decode_steps={args.decode_steps}, attention_slots={args.attention_slots}"
     )
     if args.attention_mode == "sparf":
-        if args.sparf_grouped:
+        if args.sparf_native:
+            streams = args.batch_size * config.num_hidden_layers * config.num_key_value_heads
+            packet_tokens = NATIVE_PAGE_BYTES // (2 * config.head_dim * layout_dtype.itemsize)
+            prefill_commands = streams * ((prompt_length + packet_tokens - 1) // packet_tokens)
+            log(
+                f"[opt-cemu] Native KV: streams={streams}, packet_tokens={packet_tokens}, "
+                f"prefill_append_commands={prefill_commands}, "
+                f"decode_append_commands={streams * args.decode_steps}, excluding retries; "
+                f"top_r={args.sparf_top_r}, compression=1/{args.sparf_compression_ratio}; no KV files"
+            )
+        elif args.sparf_grouped:
             log(
                 f"[opt-cemu] SparF grouped KV pool_bytes={grouped_capacity.pool_bytes if grouped_capacity else 'n/a'}, "
                 f"streams={grouped_capacity.streams if grouped_capacity else 'n/a'}, "

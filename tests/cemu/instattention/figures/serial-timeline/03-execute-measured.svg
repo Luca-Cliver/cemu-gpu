@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="1920" viewBox="0 0 2600 1920">
+<style>text{font-family:"Noto Sans CJK SC",sans-serif;}</style>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#58708c"/></marker></defs>
+<rect x="0" y="0" width="2600" height="1920" rx="0" fill="white" stroke="none"/>
+<text x="65" y="65" font-size="37" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">03  一个 Execute 的实测时间轴：Host 实际时间与设备虚拟时间分开看</tspan></text>
+<text x="65" y="110" font-size="23" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">历史日志 native-batch-device-timeline.jsonl · 2026-09-26 · request=1 / layer=0 / T=1025 / success=true；不是新运行。</tspan></text>
+<rect x="65" y="147" width="810" height="101" rx="9" fill="#dcecff" stroke="none"/>
+<text x="470.0" y="187.49" font-size="26" fill="#172b43" text-anchor="middle"><tspan x="470.0" dy="0">Host：admitted → ready  183.282 ms</tspan><tspan x="470.0" dy="37.699999999999996">实际线程执行、控制开销与等待的包络</tspan></text>
+<rect x="895" y="147" width="810" height="101" rx="9" fill="#eadefa" stroke="none"/>
+<text x="1300.0" y="187.49" font-size="26" fill="#172b43" text-anchor="middle"><tspan x="1300.0" dy="0">虚拟时间：admitted → ready  82.474 ms</tspan><tspan x="1300.0" dy="37.699999999999996">QEMU_CLOCK_VIRTUAL 的推进量</tspan></text>
+<rect x="1725" y="147" width="810" height="101" rx="9" fill="#fff0cc" stroke="none"/>
+<text x="2130.0" y="188.26" font-size="24" fill="#172b43" text-anchor="middle"><tspan x="2130.0" dy="0">不含完整 Guest syscall 前后路径</tspan><tspan x="2130.0" dy="34.8">不能写成 execute_wait_wall 的实测值</tspan></text>
+<text x="65" y="294" font-size="26" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">A  Host 墙钟轴：真实经过时间，横向长度按 ms 比例</tspan></text>
+<path d="M335.0,351 L335.0,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="335.0" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="335.0" dy="0">0</tspan></text>
+<path d="M449.2105263157895,351 L449.2105263157895,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="449.2105263157895" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="449.2105263157895" dy="0">10</tspan></text>
+<path d="M563.421052631579,351 L563.421052631579,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="563.421052631579" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="563.421052631579" dy="0">20</tspan></text>
+<path d="M677.6315789473684,351 L677.6315789473684,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="677.6315789473684" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="677.6315789473684" dy="0">30</tspan></text>
+<path d="M791.8421052631579,351 L791.8421052631579,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="791.8421052631579" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="791.8421052631579" dy="0">40</tspan></text>
+<path d="M906.0526315789474,351 L906.0526315789474,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="906.0526315789474" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="906.0526315789474" dy="0">50</tspan></text>
+<path d="M1020.2631578947369,351 L1020.2631578947369,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1020.2631578947369" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1020.2631578947369" dy="0">60</tspan></text>
+<path d="M1134.4736842105262,351 L1134.4736842105262,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1134.4736842105262" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1134.4736842105262" dy="0">70</tspan></text>
+<path d="M1248.6842105263158,351 L1248.6842105263158,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1248.6842105263158" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1248.6842105263158" dy="0">80</tspan></text>
+<path d="M1362.8947368421052,351 L1362.8947368421052,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1362.8947368421052" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1362.8947368421052" dy="0">90</tspan></text>
+<path d="M1477.1052631578948,351 L1477.1052631578948,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1477.1052631578948" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1477.1052631578948" dy="0">100</tspan></text>
+<path d="M1591.3157894736842,351 L1591.3157894736842,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1591.3157894736842" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1591.3157894736842" dy="0">110</tspan></text>
+<path d="M1705.5263157894738,351 L1705.5263157894738,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1705.5263157894738" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1705.5263157894738" dy="0">120</tspan></text>
+<path d="M1819.7368421052631,351 L1819.7368421052631,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1819.7368421052631" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1819.7368421052631" dy="0">130</tspan></text>
+<path d="M1933.9473684210527,351 L1933.9473684210527,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1933.9473684210527" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1933.9473684210527" dy="0">140</tspan></text>
+<path d="M2048.157894736842,351 L2048.157894736842,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2048.157894736842" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2048.157894736842" dy="0">150</tspan></text>
+<path d="M2162.3684210526317,351 L2162.3684210526317,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2162.3684210526317" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2162.3684210526317" dy="0">160</tspan></text>
+<path d="M2276.578947368421,351 L2276.578947368421,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2276.578947368421" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2276.578947368421" dy="0">170</tspan></text>
+<path d="M2390.7894736842104,351 L2390.7894736842104,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2390.7894736842104" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2390.7894736842104" dy="0">180</tspan></text>
+<path d="M2505.0,351 L2505.0,685" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2505.0" y="339" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2505.0" dy="0">190</tspan></text>
+<path d="M335,351 L2505,351" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="2505" y="716" font-size="20" fill="#5c6e83" text-anchor="end"><tspan x="2505" dy="0">相对 admitted 的 ms</tspan></text>
+<text x="65" y="413" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">channel-K 读</tspan></text>
+<rect x="357.9644704210526" y="383" width="186.36751478947372" height="45" rx="3" fill="#d7f0e5" stroke="none"/>
+<rect x="544.3319852105263" y="383" width="256.9176296842105" height="45" rx="3" fill="#dcecff" stroke="none"/>
+<text x="451.1482278157895" y="413" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="451.1482278157895" dy="0">16.318</tspan></text>
+<text x="672.7908000526315" y="413" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="672.7908000526315" dy="0">22.495</tspan></text>
+<text x="811.2496148947369" y="413" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="811.2496148947369" dy="0">就绪 @40.824</tspan></text>
+<text x="65" y="491" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">selected-K 读</tspan></text>
+<rect x="1245.334347263158" y="461" width="198.13386010526324" height="45" rx="3" fill="#d7f0e5" stroke="none"/>
+<rect x="1443.4682073684212" y="461" width="334.3536342631576" height="45" rx="3" fill="#dcecff" stroke="none"/>
+<text x="1344.4012773157897" y="491" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1344.4012773157897" dy="0">17.348</tspan></text>
+<text x="1610.6450245" y="491" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1610.6450245" dy="0">29.275</tspan></text>
+<text x="1787.8218416315788" y="491" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="1787.8218416315788" dy="0">就绪 @126.330</tspan></text>
+<text x="65" y="569" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">selected-V 读</tspan></text>
+<rect x="1779.2298975263159" y="539" width="304.7384336315788" height="45" rx="3" fill="#d7f0e5" stroke="none"/>
+<rect x="2083.9683311578947" y="539" width="328.2168856842104" height="45" rx="3" fill="#dcecff" stroke="none"/>
+<text x="1931.5991143421052" y="569" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1931.5991143421052" dy="0">26.682</tspan></text>
+<text x="2248.076774" y="569" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="2248.076774" dy="0">28.738</tspan></text>
+<text x="2422.185216842105" y="569" font-size="20" fill="#5c6e83" text-anchor="start"><tspan x="2422.185216842105" dy="0">就绪 @181.873</tspan></text>
+<text x="65" y="658" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">实际功能计算</tspan></text>
+<rect x="802.3184426842105" y="627" width="427.8562046315791" height="45" rx="3" fill="#eadefa" stroke="none"/>
+<rect x="1230.1746473157896" y="627" width="14.04889978947358" height="45" rx="2" fill="#dcecff" stroke="none"/>
+<text x="1016.246545" y="657" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="1016.246545" dy="0">Approx 37.462</tspan></text>
+<rect x="1969.073581" y="627" width="108.14873410526297" height="45" rx="3" fill="#eadefa" stroke="none"/>
+<rect x="2077.222315105263" y="627" width="6.734800578947215" height="45" rx="2" fill="#dcecff" stroke="none"/>
+<text x="2023.1479480526316" y="657" font-size="20" fill="#172b43" text-anchor="middle"><tspan x="2023.1479480526316" dy="0">QK 9.469</tspan></text>
+<rect x="2413.1975446842107" y="627" width="6.622828578947065" height="45" rx="3" fill="#eadefa" stroke="none"/>
+<rect x="2419.8203732631578" y="627" width="8.403747578947787" height="45" rx="2" fill="#dcecff" stroke="none"/>
+<text x="2403.1975446842107" y="657" font-size="20" fill="#172b43" text-anchor="end"><tspan x="2403.1975446842107" dy="0">PV 0.580 →</tspan></text>
+<text x="65" y="752" font-size="23" fill="#172b43" text-anchor="start"><tspan x="65" dy="0">绿色：submitted → observed；蓝色：observed → ready。V 读绿色窗口包含 QK 功能计算及其模型等待，不能再相加。</tspan></text>
+<text x="65" y="791" font-size="22" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">紫色三个功能区间的 V 增量均为 0。日志未细分所有 freeze enter/leave 与 top-r；空白不等于空闲，H−V 也不能直接当总冻结时长。</tspan></text>
+<text x="65" y="845" font-size="26" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">B  设备虚拟时间轴：读目标 deadline 与 CU 模拟运行，横向长度按 ms 比例</tspan></text>
+<path d="M335.0,902 L335.0,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="335.0" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="335.0" dy="0">0</tspan></text>
+<path d="M576.1111111111111,902 L576.1111111111111,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="576.1111111111111" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="576.1111111111111" dy="0">10</tspan></text>
+<path d="M817.2222222222222,902 L817.2222222222222,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="817.2222222222222" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="817.2222222222222" dy="0">20</tspan></text>
+<path d="M1058.3333333333335,902 L1058.3333333333335,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1058.3333333333335" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1058.3333333333335" dy="0">30</tspan></text>
+<path d="M1299.4444444444443,902 L1299.4444444444443,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1299.4444444444443" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1299.4444444444443" dy="0">40</tspan></text>
+<path d="M1540.5555555555557,902 L1540.5555555555557,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1540.5555555555557" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1540.5555555555557" dy="0">50</tspan></text>
+<path d="M1781.6666666666667,902 L1781.6666666666667,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="1781.6666666666667" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="1781.6666666666667" dy="0">60</tspan></text>
+<path d="M2022.7777777777778,902 L2022.7777777777778,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2022.7777777777778" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2022.7777777777778" dy="0">70</tspan></text>
+<path d="M2263.8888888888887,902 L2263.8888888888887,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2263.8888888888887" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2263.8888888888887" dy="0">80</tspan></text>
+<path d="M2505.0,902 L2505.0,1213" stroke="#d6e0eb" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+<text x="2505.0" y="890" font-size="21" fill="#5c6e83" text-anchor="middle"><tspan x="2505.0" dy="0">90</tspan></text>
+<path d="M335,902 L2505,902" stroke="#5c6e83" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="2505" y="1244" font-size="20" fill="#5c6e83" text-anchor="end"><tspan x="2505" dy="0">相对 admitted 的 ms</tspan></text>
+<text x="65" y="964" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">channel-K 读目标</tspan></text>
+<rect x="337.7291607777778" y="934" width="539.4861111111111" height="43" rx="3" fill="#dcecff" stroke="none"/>
+<text x="607.4722163333333" y="963" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="607.4722163333333" dy="0">22.3750 ms</tspan></text>
+<text x="65" y="1033" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">selected-K 读目标</tspan></text>
+<rect x="906.954253888889" y="1003" width="703.7430555555553" height="43" rx="3" fill="#dcecff" stroke="none"/>
+<text x="1258.8257816666667" y="1032" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="1258.8257816666667" dy="0">29.1875 ms</tspan></text>
+<text x="65" y="1102" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">selected-V 读目标</tspan></text>
+<rect x="1610.8206377777776" y="1072" width="703.7430555555559" height="43" rx="3" fill="#dcecff" stroke="none"/>
+<text x="1962.6921655555557" y="1101" font-size="22" fill="#172b43" text-anchor="middle"><tspan x="1962.6921655555557" dy="0">29.1875 ms</tspan></text>
+<text x="65" y="1186" font-size="24" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">CU 模拟计算</tspan></text>
+<rect x="878.5177058888888" y="1156" width="28.204502666666826" height="43" rx="2" fill="#eadefa" stroke="none"/>
+<text x="916.7222085555557" y="1186" font-size="21" fill="#172b43" text-anchor="start"><tspan x="916.7222085555557" dy="0">Approx 1.170</tspan></text>
+<rect x="1611.3612571111112" y="1156" width="13.379110888889045" height="43" rx="2" fill="#eadefa" stroke="none"/>
+<text x="1634.7403680000002" y="1186" font-size="21" fill="#172b43" text-anchor="start"><tspan x="1634.7403680000002" dy="0">QK 0.555</tspan></text>
+<rect x="2315.146965222222" y="1156" width="8.001874999999927" height="43" rx="2" fill="#eadefa" stroke="none"/>
+<text x="2303.146965222222" y="1186" font-size="21" fill="#172b43" text-anchor="end"><tspan x="2303.146965222222" dy="0">PV 0.332</tspan></text>
+<text x="65" y="1273" font-size="23" fill="#172b43" text-anchor="start"><tspan x="65" dy="0">V 读目标区间与 QK 的 CU 区间重叠：QK 完成后只等 V 读剩余时间；随后执行 PV。上、下两条轴不能按 x 坐标互相对齐。</tspan></text>
+<text x="65" y="1330" font-size="27" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="65" dy="0">计算阶段：实际做功能，与模型等待是两个不同区间</tspan></text>
+<text x="80" y="1380" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="80" dy="0">阶段 / 调用</tspan></text>
+<text x="555" y="1380" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="555" dy="0">Host 功能起止（ms）</tspan></text>
+<text x="1090" y="1380" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="1090" dy="0">功能 / 后续观察（H）</tspan></text>
+<text x="1495" y="1380" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="1495" dy="0">有效预算（V）</tspan></text>
+<text x="1965" y="1380" font-size="23" fill="#172b43" text-anchor="start" font-weight="700"><tspan x="1965" dy="0">提交至完成（V）</tspan></text>
+<rect x="65" y="1400" width="2470" height="62" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="80" y="1440" font-size="23" fill="#172b43" text-anchor="start"><tspan x="80" dy="0">Approx / softmax / top-k</tspan></text>
+<text x="555" y="1440" font-size="23" fill="#172b43" text-anchor="start"><tspan x="555" dy="0">40.917 → 78.379</tspan></text>
+<text x="1090" y="1440" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1090" dy="0">37.462 / 1.230 ms</tspan></text>
+<text x="1495" y="1440" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1495" dy="0">1.167768 ms</tspan></text>
+<text x="1965" y="1440" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1965" dy="0">1.169772 ms</tspan></text>
+<rect x="65" y="1466" width="2470" height="62" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="80" y="1506" font-size="23" fill="#172b43" text-anchor="start"><tspan x="80" dy="0">run_sparf_phase(EXACT_QK)</tspan></text>
+<text x="555" y="1506" font-size="23" fill="#172b43" text-anchor="start"><tspan x="555" dy="0">143.076 → 152.545</tspan></text>
+<text x="1090" y="1506" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1090" dy="0">9.469 / 0.590 ms</tspan></text>
+<text x="1495" y="1506" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1495" dy="0">0.553512 ms</tspan></text>
+<text x="1965" y="1506" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1965" dy="0">0.554894 ms</tspan></text>
+<rect x="65" y="1532" width="2470" height="62" rx="9" fill="#f5f8fc" stroke="none"/>
+<text x="80" y="1572" font-size="23" fill="#172b43" text-anchor="start"><tspan x="80" dy="0">run_sparf_phase(PV)</tspan></text>
+<text x="555" y="1572" font-size="23" fill="#172b43" text-anchor="start"><tspan x="555" dy="0">181.962 → 182.542</tspan></text>
+<text x="1090" y="1572" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1090" dy="0">0.580 / 0.736 ms</tspan></text>
+<text x="1495" y="1572" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1495" dy="0">0.331100 ms</tspan></text>
+<text x="1965" y="1572" font-size="23" fill="#172b43" text-anchor="start"><tspan x="1965" dy="0">0.331875 ms</tspan></text>
+<rect x="65" y="1620" width="2470" height="221" rx="9" fill="#fff5df" stroke="none"/>
+<text x="85" y="1658" font-size="23" fill="#172b43" text-anchor="start"><tspan x="85" dy="0">排队：admitted → engine started = 0.074677 ms（H） / 0.075047 ms（V）；上图没有把短排队放大成等宽块。</tspan></text>
+<text x="85" y="1702" font-size="22" fill="#172b43" text-anchor="start"><tspan x="85" dy="0">功能区：enter_compute_section() → 功能调用 → leave_compute_section()；随后 WAIT_TIME 或 sched_submit_internal() 等待。</tspan></text>
+<text x="85" y="1745" font-size="22" fill="#172b43" text-anchor="start"><tspan x="85" dy="0">后续观察 = functional_end → observed_done：包含功能收尾、解冻控制、CU 排队、模拟等待与完成观察；并非纯 sleep。</tspan></text>
+<text x="85" y="1788" font-size="22" fill="#172b43" text-anchor="start"><tspan x="85" dy="0">读模型起点使用 model_cursor；submitted 的 H 与 V 不是严格配对采样。更多端点与精确值见同目录 CSV / 原始请求 JSON。</tspan></text>
+<text x="65" y="1890" font-size="19" fill="#5c6e83" text-anchor="start"><tspan x="65" dy="0">CEMU · native KV / autonomous SparF · 单 microbatch 串行路径 · 图表生成 2026-09-29</tspan></text>
+</svg>

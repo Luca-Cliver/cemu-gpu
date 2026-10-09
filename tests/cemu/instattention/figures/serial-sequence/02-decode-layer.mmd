@@ -1,0 +1,56 @@
+sequenceDiagram
+    participant A as Guest 模型主线程
+    participant G as Guest GPU
+    participant S as Guest slot workers
+    participant K as Guest 内核
+    participant N as Host NVMe / native / FDM
+    participant E as Host SparF engine
+
+    A->>G: prepare_decode_attention()：LN/QKV
+    Note over A,G: T_qkv [G/C]，已有 decode.qkv 指标
+    G-->>A: Q、当前 token K/V
+    A->>A: append_decode → _kv → _append_heads
+    Note over A: T_export + T_pack；当前计时合并在 grouped_append_wall
+    loop 本层全部 APPEND 包成功（含需要的重试）
+        A->>K: ioctl(/dev/ng0n1, NVME_IOCTL_IO_CMD, 0xD1)
+        K->>N: SQ → native_execute → PRP copy → tail
+        Note over A,N: W_append_ioctl [G]：接收、背压或 CQ；模型 D_append 见时间表
+        N-->>K: CQ
+        K-->>A: 返回状态；pending 则 sleep 后重试
+    end
+    A->>A: _update_mean；_decode_args 导出 Q、构造 mean
+    A->>S: run_decode → submit_decode；分配 slot
+    Note over A,S: 主线程等待 future.result()：W_attention [G]
+    S->>S: _prepare_decode：估计 k、R_approx/R_exact/R_pv
+    loop Q 写 MR0、mean 写 MR4
+        S->>K: write_tensor → write_range → pwrite(FDM fd)
+        K->>N: fdmfs direct I/O → ns2 memory_write
+        N->>N: PRP copy 到 FDM；D_fdm = stime + bytes/2 ns
+        N-->>K: CQ
+        K-->>S: pwrite 返回
+    end
+    Note over S,N: T_fdm_write [G]：已有；不包含此前 Q 导出
+    S->>S: pack_workflow()：metadata / MRS / native identity
+    S->>K: execute_autonomous → CemuClient.execute → ioctl(/dev/ng0n3)
+    K->>N: NVMe Execute SQ / metadata PRP
+    N->>E: program_execute → sparf_submit_autonomous
+    Note over S,E: W_execute [G] = decode.execute_wait_wall；含整个父命令等待，不含后续回读
+    E->>E: 获取 lease、engine 排队：W_engine [H/V]
+    E->>E: sparf_autonomous_main()，内部时序见图三
+    E-->>N: workflow 完成；释放 lease；请求进入 to_poller
+    N-->>K: CQ 完成
+    K-->>S: Execute ioctl 返回
+    loop 先读输出 MR9，再读 trace MR10
+        S->>K: _collect_decode → read_range → pread(FDM fd)
+        K->>N: ns2 memory_read
+        N->>N: prepare_host（必要时 CUDA D2H）→ PRP 写 Guest
+        N->>N: D_fdm = stime + bytes/2 ns
+        N-->>K: CQ
+        K-->>S: pread 返回
+    end
+    Note over S,N: T_output_read / T_trace_read [G]：已有两个独立指标
+    S-->>A: 设置 future result、释放 slot；主线程继续
+    A->>G: finish_decode_attention：输出 CPU→GPU
+    A->>G: Wo / 残差 / LN → run_mlp()
+    Note over A,G: T_output_to_gpu、T_wo、T_mlp [G/C]：已有
+    Note over A: 下一层；所有层结束后 LM head 生成下一 token

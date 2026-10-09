@@ -65,9 +65,6 @@ source /root/cemu-gpu-env/bin/activate
 cd /root/CEMU/tests/cemu
 make instattention
 make instattention-sparf-group-capacity-test instattention-sparf-grouped-backend-test
-make instattention-sparf-group-buffer-device-test \
-  NVM_TEST_DIR=/mnt/nvme0 FDM_TEST_DIR=/mnt/fdm0 \
-  SPARF_GROUP_WRITE_BATCH_PAGES=256
 make instattention-sparf-group-attention-device-test \
   NVM_TEST_DIR=/mnt/nvme0 FDM_TEST_DIR=/mnt/fdm0 CSD_TARGET=cuda
 ```

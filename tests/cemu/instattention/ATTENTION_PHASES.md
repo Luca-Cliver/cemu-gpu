@@ -60,12 +60,9 @@ CUDA_VISIBLE_DEVICES=<空闲GPU编号> python3 instattention/python/test_attenti
   --cuda --library build/attention_phases_devptr.so
 ```
 
-Guest 激活环境后，在 `/root/CEMU/tests/cemu`：
-
-```bash
-make instattention-attention-phases-device-test \
-  FDM_TEST_DIR=/mnt/fdm0 CSD_TARGET=cuda DTYPE=float16
-```
+以下为早期 Guest 双 execute 测试的历史设计记录，独立设备测试入口已退休。
+算子数值回归仍使用上面的 `instattention-attention-phases-test`；
+当前设备综合验收见 [测试导航](README.md#测试入口与清理范围)。
 
 `CSD_TARGET=cpu` 可测 CPU，`DTYPE=float32` 可测另一精度。
 算子 `.so` 必须先在宿主机编译，`PROGRAM` 是相对于 QEMU 工作目录的宿主机路径，
@@ -92,13 +89,8 @@ Guest 完成一次请求。`serial` 对照模式在QK完成后才提交V。
 当前工作流要求配置 `internal_bandwidth=0`。非零内部带宽的原FTL路径要等待虚拟时钟，
 而功能算子执行期间虚拟时钟被冻结；CEMU会在提交工作流前拒绝该组合，避免设备侧死锁。
 
-Guest测试命令：
-
-```bash
-make instattention-attention-workflow-device-test \
-  NVM_TEST_DIR=/mnt/nvme0 FDM_TEST_DIR=/mnt/fdm0 \
-  CSD_TARGET=cuda DTYPE=float16 TOKEN_COUNT=257
-```
+下面描述的是已退休的 dense 六 MR Guest 工作流测试，不再提供独立运行入口。
+当前 SparF/native 状态机的依赖检查与它不是同一个设备工作流，不能据此声称旧路径已重新验收。
 
 测试使用同一份NVM K/V分别运行overlap和serial模式。每种模式只提交一次Guest
 execute，检查P、输出、依赖顺序、关键路径公式，并打印K/QK/V/PV实际时间及QK/V重叠。

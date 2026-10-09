@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2240" height="5154" viewBox="0 0 2240 5154">
+<style>text {font-family:"Noto Sans CJK SC",sans-serif;}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#315d86"/></marker><marker id="openarrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10" fill="none" stroke="#315d86" stroke-width="1.5"/></marker></defs>
+<rect x="0" y="0" width="2240" height="5154" rx="0" fill="#ffffff" stroke="none"/>
+<text x="70" y="76" fill="#20344c" font-size="41" text-anchor="start" font-weight="700"><tspan x="70" dy="0">02  单层 Decode：从 QKV 到下一层</tspan></text>
+<text x="72" y="124" fill="#60738b" font-size="24" text-anchor="start"><tspan x="72" dy="0">CEMU · native KV / autonomous SparF · 单 microbatch 串行路径</tspan></text>
+<text x="72" y="168" fill="#20344c" font-size="23" text-anchor="start"><tspan x="72" dy="0">T = 执行区间   W = 等待区间   R / D = 模型预算 / deadline；未填写实测值，纵向长度不表示时间比例。</tspan></text>
+<text x="72" y="207" fill="#60738b" font-size="23" text-anchor="start"><tspan x="72" dy="0">G：Guest 调用时间   H：Host 实际时间   V：QEMU 虚拟时间   C：GPU stream 时间</tspan></text>
+<rect x="44" y="906" width="2152" height="524" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<rect x="44" y="1886" width="2152" height="614" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<rect x="44" y="3762" width="2152" height="682" rx="8" fill="#f6f8fb" stroke="#cad7e5"/>
+<path d="M 250.0 313 V 5044" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="83.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="250.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="250.0" dy="0">Guest 模型主线程</tspan></text>
+<path d="M 598.0 313 V 5044" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="431.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="598.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="598.0" dy="0">Guest GPU</tspan></text>
+<path d="M 946.0 313 V 5044" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="779.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="946.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="946.0" dy="0">Guest slot workers</tspan></text>
+<path d="M 1294.0 313 V 5044" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1127.0" y="243" width="334.0" height="70" rx="8" fill="#2b6b7c" stroke="none"/>
+<text x="1294.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1294.0" dy="0">Guest 内核</tspan></text>
+<path d="M 1642.0 313 V 5044" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1475.0" y="243" width="334.0" height="70" rx="8" fill="#183c60" stroke="none"/>
+<text x="1642.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1642.0" dy="0">Host NVMe / native / FDM</tspan></text>
+<path d="M 1990.0 313 V 5044" stroke="#bdc9d7" stroke-width="1.8" stroke-dasharray="7 8"/>
+<rect x="1823.0" y="243" width="334.0" height="70" rx="8" fill="#183c60" stroke="none"/>
+<text x="1990.0" y="287" fill="white" font-size="23" text-anchor="middle" font-weight="700"><tspan x="1990.0" dy="0">Host SparF engine</tspan></text>
+<text x="424.0" y="364" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">prepare_decode_attention()</tspan><tspan x="424.0" dy="34">：LN/QKV</tspan></text>
+<path d="M 250.0 423 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="458" width="578.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="490" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">T_qkv [G/C]，已有 decode.qkv 指标</tspan></text>
+<text x="424.0" y="562" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">Q、当前 token K/V</tspan></text>
+<path d="M 598.0 587 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="272.0" y="646" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">append_decode → _kv → _</tspan><tspan x="272.0" dy="34">append_heads</tspan></text>
+<path d="M 250.0 706 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="86.0" y="758" width="328.0" height="126" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="102.0" y="790" fill="#705315" font-size="23" text-anchor="start"><tspan x="102.0" dy="0">T_export + T_pack；当前计</tspan><tspan x="102.0" dy="34">时合并在 grouped_append</tspan><tspan x="102.0" dy="34">_wall</tspan></text>
+<text x="60" y="937" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">循环：本层全部 APPEND 包成功（含需要的重试）</tspan></text>
+<text x="772.0" y="996" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="772.0" dy="0">ioctl(/dev/ng0n1, NVME_IOCTL_IO_CMD, 0xD1)</tspan></text>
+<path d="M 250.0 1021 H 1294.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="1080" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">SQ → native_execute → PRP </tspan><tspan x="1468.0" dy="34">copy → tail</tspan></text>
+<path d="M 1294.0 1139 H 1642.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="1174" width="1622.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="1206" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">W_append_ioctl [G]：接收、背压或 CQ；模型 D_append 见时间表</tspan></text>
+<text x="1468.0" y="1278" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">CQ</tspan></text>
+<path d="M 1642.0 1303 H 1294.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="772.0" y="1362" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="772.0" dy="0">返回状态；pending 则 sleep 后重试</tspan></text>
+<path d="M 1294.0 1387 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="272.0" y="1474" fill="#20344c" font-size="23" text-anchor="start"><tspan x="272.0" dy="0">_update_mean；_decode_</tspan><tspan x="272.0" dy="34">args 导出 Q、构造 mean</tspan></text>
+<path d="M 250.0 1534 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="598.0" y="1610" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="598.0" dy="0">run_decode → submit_decode；分配 slot</tspan></text>
+<path d="M 250.0 1635 H 946.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="1670" width="926.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="1702" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">主线程等待 future.result()：W_attention [G]</tspan></text>
+<text x="968.0" y="1774" fill="#20344c" font-size="23" text-anchor="start"><tspan x="968.0" dy="0">_prepare_decode：估计 k、</tspan><tspan x="968.0" dy="34">R_approx/R_exact/R_pv</tspan></text>
+<path d="M 946.0 1834 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="60" y="1917" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">循环：Q 写 MR0、mean 写 MR4</tspan></text>
+<text x="1120.0" y="1976" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">write_tensor → write_range </tspan><tspan x="1120.0" dy="34">→ pwrite(FDM fd)</tspan></text>
+<path d="M 946.0 2035 H 1294.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="2094" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">fdmfs direct I/O → ns2 memo</tspan><tspan x="1468.0" dy="34">ry_write</tspan></text>
+<path d="M 1294.0 2153 H 1642.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1320.0" y="2212" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1320.0" dy="0">PRP copy 到 FDM；D_fdm = </tspan><tspan x="1320.0" dy="34">stime + bytes/2 ns</tspan></text>
+<path d="M 1642.0 2272 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="2348" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">CQ</tspan></text>
+<path d="M 1642.0 2373 H 1294.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="1120.0" y="2432" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">pwrite 返回</tspan></text>
+<path d="M 1294.0 2457 H 946.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<rect x="831.0" y="2520" width="926.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="847.0" y="2552" fill="#705315" font-size="23" text-anchor="start"><tspan x="847.0" dy="0">T_fdm_write [G]：已有；不包含此前 Q 导出</tspan></text>
+<text x="968.0" y="2624" fill="#20344c" font-size="23" text-anchor="start"><tspan x="968.0" dy="0">pack_workflow()：metadat</tspan><tspan x="968.0" dy="34">a / MRS / native identity</tspan></text>
+<path d="M 946.0 2684 h 95 v 25 h -95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1120.0" y="2760" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">execute_autonomous → Cem</tspan><tspan x="1120.0" dy="34">uClient.execute → ioctl(/dev/</tspan><tspan x="1120.0" dy="34">ng0n3)</tspan></text>
+<path d="M 946.0 2853 H 1294.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="2912" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">NVMe Execute SQ / metadata </tspan><tspan x="1468.0" dy="34">PRP</tspan></text>
+<path d="M 1294.0 2971 H 1642.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1816.0" y="3030" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1816.0" dy="0">program_execute → sparf_su</tspan><tspan x="1816.0" dy="34">bmit_autonomous</tspan></text>
+<path d="M 1642.0 3089 H 1990.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="831.0" y="3124" width="1274.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="847.0" y="3156" fill="#705315" font-size="23" text-anchor="start"><tspan x="847.0" dy="0">W_execute [G] = decode.execute_wait_wall；含整个父命令等待，不含后续回读</tspan></text>
+<text x="1668.0" y="3228" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1668.0" dy="0">获取 lease、engine 排队：W</tspan><tspan x="1668.0" dy="34">_engine [H/V]</tspan></text>
+<path d="M 1990.0 3288 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1668.0" y="3364" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1668.0" dy="0">sparf_autonomous_main()</tspan><tspan x="1668.0" dy="34">，内部时序见图三</tspan></text>
+<path d="M 1990.0 3424 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1816.0" y="3500" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1816.0" dy="0">workflow 完成；释放 lease；</tspan><tspan x="1816.0" dy="34">请求进入 to_poller</tspan></text>
+<path d="M 1990.0 3559 H 1642.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="1468.0" y="3618" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">CQ 完成</tspan></text>
+<path d="M 1642.0 3643 H 1294.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="1120.0" y="3702" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">Execute ioctl 返回</tspan></text>
+<path d="M 1294.0 3727 H 946.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="60" y="3793" fill="#20344c" font-size="22" text-anchor="start" font-weight="700"><tspan x="60" dy="0">循环：先读输出 MR9，再读 trace MR10</tspan></text>
+<text x="1120.0" y="3852" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">_collect_decode → read_ran</tspan><tspan x="1120.0" dy="34">ge → pread(FDM fd)</tspan></text>
+<path d="M 946.0 3911 H 1294.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="3970" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">ns2 memory_read</tspan></text>
+<path d="M 1294.0 3995 H 1642.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1320.0" y="4054" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1320.0" dy="0">prepare_host（必要时 CUD</tspan><tspan x="1320.0" dy="34">A D2H）→ PRP 写 Guest</tspan></text>
+<path d="M 1642.0 4114 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1320.0" y="4190" fill="#20344c" font-size="23" text-anchor="start"><tspan x="1320.0" dy="0">D_fdm = stime + bytes/2 ns</tspan></text>
+<path d="M 1642.0 4216 h -95 v 25 h 95" fill="none" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="1468.0" y="4292" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1468.0" dy="0">CQ</tspan></text>
+<path d="M 1642.0 4317 H 1294.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="1120.0" y="4376" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="1120.0" dy="0">pread 返回</tspan></text>
+<path d="M 1294.0 4401 H 946.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<rect x="831.0" y="4464" width="926.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="847.0" y="4496" fill="#705315" font-size="23" text-anchor="start"><tspan x="847.0" dy="0">T_output_read / T_trace_read [G]：已有两个独立指标</tspan></text>
+<text x="598.0" y="4568" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="598.0" dy="0">设置 future result、释放 slot；主线程继续</tspan></text>
+<path d="M 946.0 4593 H 250.0" stroke="#315d86" stroke-width="2.3" stroke-dasharray="9 6" marker-end="url(#arrow)"/>
+<text x="424.0" y="4652" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">finish_decode_attention：输</tspan><tspan x="424.0" dy="34">出 CPU→GPU</tspan></text>
+<path d="M 250.0 4711 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<text x="424.0" y="4770" fill="#20344c" font-size="23" text-anchor="middle"><tspan x="424.0" dy="0">Wo / 残差 / LN → run_mlp()</tspan></text>
+<path d="M 250.0 4795 H 598.0" stroke="#315d86" stroke-width="2.3" marker-end="url(#arrow)"/>
+<rect x="135.0" y="4830" width="578.0" height="58" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="151.0" y="4862" fill="#705315" font-size="23" text-anchor="start"><tspan x="151.0" dy="0">T_output_to_gpu、T_wo、T_mlp [G/C]：已有</tspan></text>
+<rect x="86.0" y="4910" width="328.0" height="92" rx="8" fill="#fff8df" stroke="#e5d8a4"/>
+<text x="102.0" y="4942" fill="#705315" font-size="23" text-anchor="start"><tspan x="102.0" dy="0">下一层；所有层结束后 LM h</tspan><tspan x="102.0" dy="34">ead 生成下一 token</tspan></text>
+<text x="70" y="5111" fill="#60738b" font-size="21" text-anchor="start"><tspan x="70" dy="0">来源：NATIVE_SERIAL_SEQUENCE.md · 2026-09-29 · 箭头为调用/完成关系；嵌套和重叠时间不可直接相加。</tspan></text>
+</svg>

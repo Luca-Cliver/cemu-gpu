@@ -962,3 +962,444 @@ Host Python 3.10扩展重跑通过；未覆盖Guest扩展文件。
    native buffer预算64MiB，不能直接照搬旧grouped大实验的容量假设。
 4. 多microbatch/GPU真实异步、论文配置、目标runtime和时间精度需分别验收。
    CPU qtest功能通过不代表这些指标已对齐；不以A100耗时替代FPGA目标时间。
+
+## 20. 准备真实 Guest OPT-125M 验收（2026-09-23）
+
+增加专用`run-native-opt-test.sh`、Guest入口`native-opt-guest-test.sh`及
+`native_opt125m_smoke.json`，不改变旧NVM-only测试脚本或旧grouped实验启动方式。
+新启动使用KVM/Linux Guest、已绑定的VFIO GPU、系统盘overlay和独立native后端；
+`init=/bin/bash`跳过旧自动mkfs/fio，Guest只挂载FDM而不挂载native NVM。
+初测Guest GPU跑真实OPT-125M，CSD用CPU SparF，batch=1、prompt=32、Decode=4。
+不设置目标计算runtime/Softmax ratio，先验收链路而非时延。
+
+源码和模型只读共享；Guest扩展在`/root/native-opt-client`构建，算子在Host构建。
+Guest日志通过专用9p共享持久保存；Host QEMU从`tests/cemu`启动，使算子相对路径可解析。
+Guest脚本检查启动标记，拒绝在Host或旧模式Guest中运行。
+
+已完成的预检查：shell语法、JSON、CPU算子构建、Guest脚本Host误用拒绝；新配置在隔离
+QEMU里按真实OPT-125M几何执行144个stream各36 token的APPEND/DRAIN成功，
+native内存10904856字节、NVM写入7077888字节，sealed=1、failed=0。
+这只证明容量和存储入口可用，**尚未执行真实Guest测试**；当前工具环境没有`/dev/kvm`，
+需用户在物理Host启动并反馈结果。命令统一见README的Native Guest OPT-125M节。
+
+Guest首次构建报告`pybind11::headers`引用不存在的`/include`，发生在CMake生成阶段、
+尚未注册模型KV会话。构建现改为查找真实pybind11头文件，通过Python3的CMake接口构建
+带SOABI后缀的扩展；不修改Guest系统包、不创建假的`/include`链接。
+同时让OPT入口接受`CEMU_INSTATTENTION_BUILD_DIR`，Guest脚本指向私有构建目录，避免
+新扩展建好后仍优先加载共享目录里的旧扩展。Host以真实头文件完成编译和导入，
+18项native客户端/OPT集成测试通过；Guest需原地重跑脚本确认，无须重启控制器。
+
+## 21. Guest 功能结果与恢复正常登录（2026-09-23）
+
+用户提供的真实Guest日志确认OPT-125M、batch=1、prompt=32、Decode=4流程完成：
+48次逻辑Attention、accepted_stream0/token-K/channel-K/token-V均36、DRAIN完成及functional PASS。
+Guest计时Prefill=0.477142s、Decode=0.292188s、final_flush=0.052919s；这些只是此次功能运行记录，
+计算runtime为0，不能用于FPGA时间精度结论。统计行有串口交错，完整状态以保存的日志/CSV为准。
+
+下一步支持OPT-13B同规模功能测试，而非跳到时间校准。启动器增加型号选择：13B使用64GiB
+Guest RAM、512MiB native buffer预算；512MiB NVM、65536页映射上限和64MiB FDM仍足够
+此次36-token小负载，不能外推到论文的大batch。两slot FDM预估475136字节，目标KV页数35200。
+
+新增normal启动选项复用用户指定的测试OS overlay，恢复systemd、账号密码登录和本机SSH；
+rescue选项保留。normal要求显式提供`CEMU_NATIVE_OS_IMAGE`，避免误把未准备的基础系统盘
+直接启动。每次仍创建新的native NVM后端，未声称支持旧KV的重启恢复。
+
+`cemu-mount.sh`增加仅匹配native启动标记的分支，挂载共享和FDM后返回，绕过NVM mkfs/fio和
+1GiB FDM占位分配；原模式逻辑不变。用户需在当前Guest复制更新后的脚本到`/root`，正常关机
+后再启动normal模式；共享仓库的修改不会自动替换Guest系统盘里的旧副本。
+脚本语法、native挂载分支的隔离命令mock验证通过；未在工具环境启动KVM或运行13B模型。
+
+13B几何的隔离qtest预检查完成：1600个stream各36 token，native内存223186136字节，
+NVM写入144179200字节，accepted/token-K/channel-K/token-V均36，sealed=1、failed=0。
+首次预检查DRAIN等待超时；在测试transport每次命令前显式推进qtest虚拟时钟1ms后通过。
+此推进仅用于无Guest的qtest驱动，不修改设备时间模型或freezing机制；预检查不等同于
+真实13B权重、Guest GPU和Attention全流程通过，仍需在正常登录Guest中验证。
+
+## 22. 13B Guest验收与B4/P1024/D16入口（2026-09-23）
+
+真实Guest后续日志确认13B小负载通过：batch=1、prompt=32、Decode=4，160次逻辑Attention，
+输出[57,6,17,27,90]；native最终accepted/token-K/channel-K/token-V均36，sealed=1、failed=0。
+Guest Prefill=0.819505s、Decode=1.973599s、drain=1.820223s、含drain的e2e=4.613514s，
+权重加载320.192614s单独列出。此时计算runtime为0，是functional结果，不是FPGA性能校准。
+期间Guest系统盘满及旧挂载脚本占满64MiB FDM已由用户清缓存、更新脚本并重新启动解决。
+
+新增启动/Guest脚本profile `b4-p1024-d16`，按之前常用B4/微批4/P1024/D16负载准备观测运行：
+复用既有96GiB NVM、2GiB FDM、8通道/6LUN、2CU/2线程/2引擎配置；保持native FTL，
+native buffer预算1GiB、目录上限2097152页、批写256页。仍用CSD CPU，不把它称为与旧CUDA
+后端的单变量FTL对照。保持functional入口，传入已有runtime配置及必需的Softmax ratio。
+ratio在设备注册前验证18个目标shape与anchor，缺失直接失败；运行快照保留配置和ratio。
+不修改freezing、FTL实现或计算时间公式。启动profile变化需先关闭旧Guest、启动新native会话。
+
+容量预估1344000页/5505024000字节NVM数据、891289600字节环形KV本体、32628736字节
+Attention FDM；设备容量足够本次负载，不外推大batch。脚本语法、diff检查、ratio dry-run及
+31项native客户端/OPT SparF集成/Softmax ratio测试通过；该大负载尚未在真实Guest执行。
+
+## 23. 性能回退诊断与恢复CUDA入口（2026-09-23）
+
+用户提供native CPU B4/P1024/D16记录：Guest Prefill=81.479804s（APPEND累计80.898236s），
+Decode=196.301630s（execute等待累计187.349998s），drain=4.772960s，e2e=282.555232s。
+640次工作流模型累计46.763593s，近似/QK/PV计算分别0.776037/0.425384/0.269369s；
+入口要求ratio覆盖全部shape，不是退回164us线性放大。附带profile不构成数值准确性证明。
+
+审查确认以下差异/边界：
+
+- 新启动器曾固定`CEMU_CUDA_SYNC=0`，Guest固定CPU程序；现改为显式CPU/CUDA选择，
+  CUDA必须指定单个Host GPU、同步开启、Guest从内核启动参数选同一后端，记录启动设置。
+- 新启动器原为4 vCPU，旧`run-csd.sh`为8；现支持`CEMU_NATIVE_VCPUS`并记录值，默认仍4，
+  首轮CUDA/上一轮CPU对照保持4，之后若对照旧grouped双方统一8，不悄悄混合变量。
+- `NativeKvStore.append_batch`逐head串行，每4KiB容纳8个FP16 K/V token；Prefill基础命令
+  819200次，Decode基础命令102400次。新增计数可区分成功命令、尝试、背压重试和head-token
+  数；未改变协议或提交顺序，避免与本次后端对照混合。
+- `instattention_attention.c:read_ranges`拆分仍传相同start_ns，`bb_native_kv_batch`也对
+  各页传共同起点并取max deadline；FTL按每个LUN可用时间建模，不能直接把C循环说成
+  每页模拟时延完全串加。`native_kv_buffer_gather`的scratch和锁按小批复用、页去重仅在
+  当次gather内，跨批重复读和Host串行查找/复制仍可能有额外开销，尚未量化。
+- native存储回调当前同步完成backend取数与gather；目标deadline由原autonomous状态机
+  等待，不应把Host物理取数时长和目标Flash时间直接相加。现有聚合profile不足以解释
+  187s execute等待与46.76s模型累计的差值，更不能全部归因于CPU。
+
+新增可选`CEMU_NATIVE_TIMELINE=1`接入现有autonomous Host/virtual阶段trace；默认关闭，
+不开启native尚未完整填充的LUN诊断。离线分析器增加boundary摘要，展示engine排队、
+读观察及deadline晚到、计算功能段/调度提交/完成观察区间，即使没有LUN数据也能分析。
+不增加Guest逐命令计时/日志，不修改设备、内核、freezing、runtime公式和FTL策略。
+
+验证：50项针对性Python测试、101项native回归（含隔离真实QEMU与小OPT集成）通过；
+CUDA算子目标已是最新，脚本语法/参数拒绝检查通过。没有运行Host GPU计算或真实13B CUDA
+Guest；CUDA速度改善、APPEND优化及最终论文行为/性能一致性均不在此次验证结论中。
+
+## 24. Native CUDA初始化失败的提前拒绝（2026-09-23）
+
+用户首次CUDA运行的QEMU启动日志明确两次`Failed to set CUDA device 0`；独立CUDA探针
+先失败、后恢复成功。之后另一轮13B仍返回Execute status 6，但尚未取得该轮启动日志，
+不能断言重复错误一定同源，也不能将一次探针成功视为新QEMU的初始化成功。
+
+审查确认DRAM/file backend忽略`backend_cuda_sync_init`返回值，导致初始化失败后仍能
+启动Guest、加载权重和完成Prefill，而CUDA镜像准备阶段才返回错误。此次在native namespace
+初始化处增加严格检查：明确要求CUDA但后端未启用则通过Error拒绝启动，使用既有native
+清理路径释放资源。legacy启动行为不变；CUDA初始化错误增加数字状态、错误字符串及可见
+设备配置，autonomous镜像失败增加program/MRS/range信息。freezing、FTL和时间公式不变。
+
+新增故障注入qtest，用假libcudart分别模拟NVM和FDM初始化失败，无需真实GPU即可验证
+QEMU非零退出及具体错误信息。此修改解决迟报/模糊报错，不代表Host CUDA环境根因已修复。
+
+验证：QEMU编译通过；9项native qtest/小OPT CSD集成测试通过（包括上述两种故障注入），
+不访问真实GPU。首次回归受沙箱socket权限限制，在允许本地测试socket后通过；未运行13B。
+
+后续用户提供`opt-13b.h06gLE/qemu.log`开头，确认该轮旧进程同样两次CUDA初始化失败。
+随后在Host GPU1上运行两个独立QEMU初始化探针：小native配置、正式OPT13B设备配置均
+打印namespace 1/2 CUDA initialized并正常退出。正式配置探针保留96GiB文件NVM、2GiB
+FDM和native预算，但仅64MiB Guest RAM、qtest加速，不接VFIO、不加载模型。
+因此只证明该时刻新QEMU的后端初始化可成功，尚未定位完整64GiB/KVM/VFIO启动为何失败，
+不将探针成功等同真实算子/13B验证通过。日志位于`/tmp/cemu-cuda-qemu-probe.jXqAB3/qemu.log`
+及`/tmp/cemu-cuda-profile-probe.nNFuOK/qemu.log`。
+
+## 25. 隔离CUDA功能验证与完整启动排查（2026-09-24）
+
+只读检查时无QEMU进程，Host GPU1空闲，加载驱动仍575.57.08。新增两组初始化探针使用
+相同正式设备配置，q35/qtest下64MiB和64GiB虚拟RAM均正常初始化NVM/FDM CUDA；未接
+VFIO、未预分配RAM或执行Guest，不能代表64GiB锁页场景。KVM探针在打开/dev/kvm时被
+权限拒绝，尚未执行CUDA，不把该错误计作CUDA失败。
+
+复用`test_native_csd_pipeline.py`增加`CEMU_NATIVE_QTEST_CUDA=1`可选入口；NativeQtest
+默认保持CPU，显式CUDA模式要求单张可见GPU并传入同步配置，LOAD使用CUDA_DEVPTR目标。
+真实GPU1运行两项测试通过：Native token/channel KV读写→FDM/MRS→autonomous SparF
+CUDA QK/PV数值对照及复位；小型合成OPT Prefill/Decode与纯PyTorch对照。用时约10秒，
+没有真实13B权重、Guest或VFIO。第一次第二项因探针覆盖LD_LIBRARY_PATH导致Host Python
+缺CUPTI未执行，恢复进程局部CUPTI路径后两项均通过，未修改系统库。
+
+功能日志`/tmp/cemu-native-cuda-qtest-0924.log`；初始化日志目录
+`/tmp/cemu-cuda-0924.S3JLSQ`。这些结果缩小排查范围，不宣称已定位完整启动失败根因。
+
+用户随后提供三个root启动日志：tc8NHn为空，不能判断成功或失败；qMrkeH和8bEzey均在
+namespace 1初始化返回CUDA status=3，并被新增检查提前拒绝启动。说明提前拒绝生效，
+但CUDA根因仍未解决。新增`femu-scripts/probe-native-cuda.sh`供同一root环境依次测试
+qtest/64MiB、KVM/64MiB、KVM/64GiB：不接VFIO、OS镜像或模型，不预分配RAM，使用
+独立临时NVM文件，每组限时30秒（强制终止宽限5秒），同时检查退出码和两个namespace
+成功标记。要求显式指定单张Host GPU；语法和缺失GPU参数拒绝检查通过。
+这三组用于缩小启动环境差异，全部通过也不能直接证明VFIO就是根因，仍需完整启动对照。
+
+## 26. Native与旧grouped路径回退审查（2026-09-24）
+
+本次仅检查和隔离复现，不改生产FTL、协议、freezing、runtime或调度策略。
+依据用户提供的native CUDA B4/GB4/P1024/D16日志：640次Attention，Guest Decode
+173.641890s、Execute累计165.325648s；trace父请求Host累计164.365550s、QEMU
+virtual累计46.725469s、阶段目标累计46.764468s。父请求虚拟跨度不是应用端到端时间，
+Guest perf_counter也不能直接替代QEMU virtual；这些数字不证明与论文精度一致。
+
+### 26.1 已复现：APPEND粒度和提交顺序改变
+
+对生产Python append_batch分别接计数transport，不运行VM、GPU或模型；一层的数据为
+FP16、160个head-stream、head_dim=128，旧grouped使用默认1MiB IO buffer。
+
+| 阶段 | native命令数 | 旧grouped命令数 | native/旧grouped payload字节 |
+|---|---:|---:|---:|
+| 一层1024-token Prefill | 20480 | 128 | 83886080 / 83886080 |
+| 一层一次Decode | 160 | 1 | 655360 / 81920 |
+
+按40层/16步展开：native成功命令921600，旧grouped逻辑APPEND命令5760，比例160。
+旧路径每次APPEND还有FDM写入、Execute、状态读取，因此不能把逻辑命令比例称为总系统
+调用比例或时延加速比。日志另有134034次背压重试，总尝试1055634。
+
+native_kv_store.py:append_batch先遍历stream，再连续提交同一head的8-token小包；
+sparf_group_device.py:append_batch先遍历16-token tile，再一次提交多个stream。
+这不仅增加命令数：它改变设备获得各head数据的顺序。native缓冲每stream的V环只有两个
+token group，生产者在一个head上推进时容易等其写回，其他head的数据还未到设备。
+后台worker每批又等待目标deadline才发布/取下一批，无法把未提交的其他head合入。
+日志5,505,024,000写字节/411497批次，平均3.266页/批；256是上限，不是实际批量。
+不能简单等待攒满256页修复，这可能与逐head生产者形成更严重的背压。
+
+### 26.2 已复现：分块边界丢失整阶段页去重，改变NAND目标时间
+
+旧sparf_start_grouped_read为整个阶段收集页内span，compute.c:sparf_start_read用整阶段
+SparfPageCache去重。native_kv_attention_read每256个range调用read_ranges，gather内部
+容量不足还会递归拆分；native_kv_buffer_gather每次创建新candidate，因此只在单个小批次
+去重。同页元素分布到两个小批次时，会再次调用bb_native_kv_batch并再次推进NAND资源。
+该问题不仅增加Host复制，还能增加模拟Flash请求和deadline。
+
+隔离复现复用现有NativeAttentionTest编译的真实production native buffer/attention/
+mapping/io/FTL代码；临时文件后端、受控虚拟时钟、2通道×2LUN、页读400ns、32页scratch。
+先写入并drain 531 token，读取一个batch两个KV/query head，K索引集合相同，只改变顺序。
+没有OPT checkpoint、GPU或真实Guest；所有返回张量均逐元素完全一致。
+
+| 每head选择数 | 顺序 | 唯一页数 | 实际native页数 | 目标区间ns |
+|---|---|---:|---:|---:|
+| 128 | 连续/交错 | 16 | 16 / 16 | 1600 / 1600 |
+| 129 | 连续 | 18 | 19 | 2000 |
+| 129 | 交错 | 18 | 20 | 2400 |
+| 256 | 连续/交错 | 32 | 32 / 32 | 3200 / 3200 |
+| 257 | 连续 | 34 | 35 | 3600 |
+| 257 | 交错 | 34 | 37 | 4000 |
+
+129案例的实际页数低于32页scratch，重复来自256-range切分而不是scratch容量不足；
+正式1025-token、compression=8恰好top_k=129，但不能将小案例比例直接外推640请求。
+没有跑旧grouped完整FTL的时延对照；旧路径整阶段去重结论来自其生产代码。
+应在有界内存下先规划唯一页，再分批读取并scatter所有消费者，保留原输出顺序、数据依赖
+和真实资源竞争；不能为了去重无界扩大DRAM预算或取消NAND调度。
+
+### 26.3 确定的行为差异与不能归罪于新FTL的部分
+
+- 物理放置确有变化：旧fifo/kv_group使用原write pointer（后者仅按kind分流）；native
+  mapping以group_index%channels确定channel，按task/batch/layer/kind/channel共用活跃块。
+  FP16 channel-K的窗口为256 token，所以1024个已发布token只有group 0..3，使用8通道
+  中的0..3；新token仍在tail时不增加Flash channel。它会影响并行度，但这是现有设计选择，
+  尚不能断言不符合论文；需要与论文地址布局独立核对，不能强行改成最均匀以追求速度。
+- native gather持buffer锁完成两轮range遍历、线性页查找、实际backend读取和scatter；
+  旧grouped在构建span后释放buffer锁，再经原FTL请求执行读取。新路径增加锁覆盖范围，
+  Host读取区间59.37/21.67/19.90s尚不能拆成锁、查表、后端读取各自成本。
+- read_ranges递归给各批传同一个start_ns，bb_native_kv_batch取页deadline最大值，
+  不是在C循环里简单累加所有页时延。不能把既有NAND资源排队误报成这种实现错误。
+- 近似评分/Softmax/qsort的Host CPU循环位于共用sparf_workflow.h，旧grouped也走这里。
+  approx Host15.324s/virtual0证明冻结边界工作，但它不是native新增的CPU回退。
+- 本次max_active_requests=1、跨请求重叠0与GB4/B4仅一个microbatch相符；单层后续
+  依赖没有凭空变独立。QK/V目标重叠359.988ms确实存在，不能说全部异步都失效。
+- native APPEND的pcie_lat=1是公共poller建模的标志，不是1ns目标延迟；未改相关代码。
+
+### 26.4 本次验证与修复顺序
+
+隔离诊断脚本/结果：/tmp/cemu-native-regression-audit.py及同名.log（8组实际C读路径），
+/tmp/cemu-native-append-audit.py及同名.log（2组生产Python封包对照）。后者仅mock传输，
+不能用于性能计时；前者受控NAND参数不同于正式配置，不能当论文校准。均不使用Host GPU、
+不启动完整VM、不修改用户后端或权重。生产编译出现既有unused enable警告，未顺手修改。
+
+先修整阶段页计划/去重的准确性回归，再设计保留背压和发布语义的多stream APPEND，验证
+提交顺序和后台NAND并行；同时明确Host/Guest/QEMU virtual端到端口径。暂不调小runtime、
+不更改freezing、不以Host加速作为模拟准确性证明。完整日志缺少选中索引、每页PPA及LUN
+服务/竞争计数，尚不能量化上述各项对本次46.73s或173.64s的完整贡献。
+
+## 27. Native Attention 整阶段页去重修复（2026-09-24）
+
+本轮仅修复26.2已经复现的读路径问题，暂不同时修改APPEND ABI/提交顺序，便于单独回归。
+没有修改NAND读写参数、物理页放置、Softmax/runtime模型、freezing或Guest命令接口。
+
+### 27.1 实现和不变量
+
+- `instattention_attention.c`不再每256个range调用一次独立gather、容量不足再递归拆分；
+  改为通过range生成器向`native_kv_buffer_gather_phase`提供完整channel-K/token-K/token-V阶段。
+- `instattention_buffer.c`先验证所有range的坐标、accepted前缀和输出大小，再规划页内片段。
+  Flash片段按完整逻辑页身份去重：当前buffer固定task/generation，页编号包含batch/layer/
+  head/kind/group/channel-group。重复选中和GQA共享KV head不会造成重复Flash读取。
+- 页按首次出现顺序提交，未对物理地址重新排序；每批至多原来的`batch_pages`，继续复用
+  原来的页数据scratch，不建立跨Attention缓存。所有消费者scatter回原输出位置，保留
+  top-k/channel索引顺序；V的额外mean占位行仍置零，后续算子语义不变。
+- 页计划只保存元数据，申请前检查`常驻buffer内存 + 临时计划 <= 注册budget`，不足返回
+  `CEMU_KV_LIMIT`，不退回重复读取/重复NAND计时。纯tail读取不分配页计划。
+  STATUS中的memory_bytes仍是常驻内存，不是本次临时计划峰值。
+- 沿用buffer锁和Attention lease保证两轮规划之间committed/tail不变化。没有在本轮缩小
+  锁范围，因此Host锁争用尚未优化。失败路径释放临时计划和锁，不把失败上报为成功；
+  后端中途失败时已有I/O和目标时钟推进不回滚，也不消费部分输出。
+- 每个唯一Flash页仍实际调用原native mapping/backend/NAND模型，批次传同一start_ns、
+  完成时间取实际资源调度deadline最大值；只移除重复请求，不免除有效Flash访问。
+  trace的batches现在表示真正提交的Flash批数，纯tail阶段为0。
+
+### 27.2 验证
+
+沿用26.2相同临时文件、2通道×2LUN、400ns页读、32页scratch复现：
+
+| 每head选择数 | 连续/交错实际页数（修复后） | Flash批数 | 目标区间ns（两种顺序） |
+|---|---:|---:|---:|
+| 128 | 16 / 16 | 1 | 1600 / 1600 |
+| 129 | 18 / 18 | 1 | 2000 / 2000 |
+| 256 | 32 / 32 | 1 | 3200 / 3200 |
+| 257 | 34 / 34 | 2 | 3600 / 3600 |
+
+所有输出逐元素一致；这只是可控回归，不代表OPT-13B整轮加速比例或论文精度校准。
+
+回归补入原有`test_instattention_native_attention.py`，没有新建独立小测试文件：
+覆盖128/129、256/257边界、乱序/逆序、GQA复用、token-K/V、channel-K多页、V占位行、
+临时内存预算拒绝、非法末尾索引、实际backend读失败及随后恢复。保留原有FP16/FP32、
+tail/Flash混读、部分组、停止与lease错误清理测试。QEMU重新编译成功。
+
+执行现有`instattention-native-regression-test`检查协议、buffer、Attention、QEMU qtest、
+小型合成OPT Prefill/Decode及旧grouped路径。qtest需要本地Unix socket，受限环境首次
+返回EPERM，放行临时测试socket后最终105项全部通过（27.268s）。结果保存在
+`/tmp/cemu-native-read-fix-regression.log`。未使用GPU/完整OPT-13B，不启动或修改现有Guest。
+
+下一步仍是有界多stream APPEND及其原子准入/背压验证；当前逐head小包产生的大量命令、
+Prefill等待没有在本轮修复。正式A/B需重启到新QEMU，保持相同checkpoint、batch、prompt、
+Decode、ratio和设备配置，再对比实际Flash字节/页数与目标时间，不能只比较Guest wall。
+
+## 28. 原 run-csd 入口支持 native 与初始化顺序对照（2026-09-24）
+
+用户新一轮完整启动`opt-13b.EYjIjt`仍在CUDA初始化失败；同一QEMU二进制在root下
+qtest-64M/kvm-64M/kvm-64G探针全部成功。原`build/x86_64-softmmu/qemu-system-x86_64`
+是`build/qemu-system-x86_64`的符号链接，两套原启动命令均先VFIO、后FEMU，不能认为
+换回原脚本自动解决CUDA。native的明确失败检查保留，不允许偷偷回退CPU继续跑。
+
+`femu-scripts/run-csd.sh`及当前`build/run-csd.sh`增加可选参数，未重新编译QEMU：
+
+- 默认`CEMU_FTL_MODE=femu`，保留原8vCPU、原系统盘、原VFIO优先顺序。
+- `CEMU_FTL_MODE=instattention`要求单CSD、文件后端目录、明确提供已更新native-aware
+  cemu-mount.sh的`CEMU_OS_IMAGE`。每次在后端目录下新建`native.XXXXXX`，不复用旧NVM。
+- 保存设备配置、launch-settings、qemu.log，提供logsrc共享与native Guest启动标记；
+  因此仍可在正常登录Guest后执行`native-opt-guest-test.sh`。模型/源码共享沿用原脚本。
+- 可设置`CEMU_GUEST_CPUS`、`CEMU_GUEST_MEMORY`、native buffer/page预算。B4测试应
+  保持4vCPU/64G、1GiB buffer/2097152页以及同一个runtime/ratio，不混入容量变化。
+- `CEMU_DEVICE_INIT_ORDER=femu-first`仅用于验证先初始化FEMU/CUDA、后接入VFIO的
+  启动差异；默认`vfio-first`不变。尚未证明VFIO是故障原因，也未证明该选项修复故障。
+- 开启pipefail，防止QEMU失败被tee的成功退出码掩盖；未修改任何设备运行时计时行为。
+
+宿主机示例（已有Guest必须先关闭；使用独立且已更新挂载脚本的系统盘）：
+
+```bash
+cd /home/lihan/cemu/CEMU/build
+sudo env \
+  CEMU_FTL_MODE=instattention CEMU_DEVICE_INIT_ORDER=femu-first \
+  CEMU_CSD_COUNT=1 CEMU_GUEST_MEMORY=64G CEMU_GUEST_CPUS=4 \
+  CEMU_OS_IMAGE=/data/lihan/cemu-native-opt/standalone.PnutcI/guest.qcow2 \
+  CEMU_CONFIG_FILE=/home/lihan/cemu/CEMU/femu-scripts/cemu_config_opt13b_sparf_engines2.json \
+  CEMU_NVM_BACKEND_DIR=/data/lihan/cemu-native-opt \
+  CUDA_VISIBLE_DEVICES=1 CEMU_CUDA_SYNC=1 CEMU_CUDA_DEVICE=0 \
+  CEMU_CUDA_LIBRARY_PATH=/home/lihan/cemu/nvidia-575-libs \
+  CEMU_NATIVE_PROFILE=b4-p1024-d16 CEMU_NATIVE_TIMELINE=1 \
+  CEMU_COMPUTE_LOG=progress CEMU_COMPUTE_LOG_INTERVAL=1000 \
+  ./run-csd.sh
+```
+
+在Guest执行原来的`bash /root/cemu-mount.sh`和
+`bash /root/CEMU/femu-scripts/native-opt-guest-test.sh OPT-13B b4-p1024-d16 /root/opt13b-b4-p1024-d16.json`。
+不能格式化native NVM，启动必须确认两个namespace的CUDA初始化成功。
+
+验证：两个脚本bash -n及临时mock-launch检查通过，覆盖旧默认、native参数、两种设备
+顺序、每次新建会话、QEMU退出码37透传、非法参数拒绝；检查脚本为
+`/tmp/cemu-run-csd-launch-check.py`。没有访问真实GPU/VFIO/Guest系统盘，完整启动待用户验证。
+
+## 29. Native多head批量APPEND（2026-09-24）
+
+用户新日志`native-startup-current.log`中读取去重后的B4/GB4/P1024/D16功能PASS，
+Decode97.114607s、Prefill82.529486s，其中Prefill grouped_append81.970163s；
+成功APPEND仍921600次、背压重试132453次。此次只处理这个小包提交路径，未改启动脚本、
+freezing、算子runtime、读取去重或FTL放置规则。不能用Guest wall变化倒推论文硬件时间。
+
+### 29.1 有界扩展ABI，保留旧接口
+
+- 保留ABI版本1和旧0xcd/4KiB单headAPPEND。新增0xd1（Host到设备）批量APPEND，
+  INFO响应偏移104的u64给出最大传输字节数：最多128KiB，受控制器MDTS约束。
+- CDW10低16位版本、高16位token_count；CDW11/12仍task/generation；CDW13低/高16位
+  batch/layer；CDW14低16位first_head、高16位head_count；CDW15为first_token。
+  新命令CDW14不再复用kind/channel，接收的始终是K和V。
+- payload为连续的K[head_count,token_count,head_dim]，随后同形状V，不按4KiB补齐；
+  数据类型来自BUFFER_REGISTER。实际长度=2*heads*tokens*head_dim*element_bytes。
+  超过上限、空计数、错误identity和MDTS超限拒绝；坐标/prefix/ring容量随后统一校验。
+- 单namespace worker复用有界128KiB wire暂存区（原为4KiB），不是扩大KV ring；PRP列表
+  经原有DMA路径复制，req.stat.data_size按实际传输长度登记，未假装这些字节不走PCIe。
+- 新客户端查询能力后自动使用批量路径，旧设备INFO保留区为0则走旧路径；
+  NativeKvStore构造参数append_batch_bytes=0可在代码级强制旧路径，默认None自动协商。
+
+### 29.2 原子接收与后台写回
+
+`native_kv_buffer_append_batch`在同一buffer锁内检查所有head的accepted prefix、
+Attention读lease以及K/V环形空间。任何一个head不满足则整包拒绝/PENDING，既不推进
+任何accepted也不入队；客户端仅对PENDING原包重试。全部通过才拷贝、统一推进各head，
+调用原enqueue_ready，最后唤醒后台worker。旧单head接口也复用这套检查。
+
+成功ACK依然仅表示进入设备tail，不等待NAND完成；原token/channel组页、后台FIFO、
+写后目标deadline到期才推进committed、terminal drain以及读tail/Flash规则不变。
+多命令组成的应用层append若中途永久失败，客户端仍标记会话失败，不能把已接收前缀
+当成已回滚，也不能重新提交整段造成覆盖。
+
+### 29.3 上层打包与命令数
+
+以token tile为外层轮转所有stream，每包不跨batch/layer；tile不超过一个token group，
+head数受传输上限限制。OPT-13B FP16下tile=16，每包最多16heads；末包可更小。
+不再先把单个head的整段prompt写完，避免其他head迟迟没有数据供后台合批。
+
+对B4/GB4/P1024/D16，Prefill每层64个tile * 4个batch * ceil(40/16)=768命令，
+40层共30720；Decode每层每步4包，共4*40*16=2560；总33280（旧921600）。
+有效head-token仍6656000，终态Flash完整页字节仍5505024000；背压重试和后台write_batches
+取决于运行时，不能预先承诺比例。该接口是CEMU实现选择，不声称是论文原始NVMe ABI。
+
+### 29.4 验证范围
+
+扩展已有测试文件，不新增零散测试：客户端覆盖兼容旧设备、可变长度、跨microbatch/layer
+坐标、payload重排、整包重试/部分应用提交失败和B4完整命令数；核心C测试覆盖后一个head
+prefix错误/空间不足时前一个head不得被部分接收，以及Attention lease拒绝。
+真实QEMU qtest覆盖128KiB PRP列表、多head的15/16、255/256、531token边界、tail/Flash
+两份K及V逐字节读取、非法命令、末尾drain与Flash字节计数；现有native小型合成OPT
+Prefill/Decode测试自动通过能力协商走新路径。CPU qtest不等同完整OPT-13B CUDA性能测试。
+
+QEMU重新编译通过；现有`instattention-native-regression-test`最终111项全部通过
+（39.276s），日志`/tmp/cemu-native-append-regression.log`。仅使用临时CPU qtest设备，
+未访问GPU/VFIO或改动运行中的Guest。初次测试受本地socket沙箱限制，允许隔离socket后
+重新运行；测试自身的设备配置选择与缺少常量导入已修正。完整OPT-13B CUDA性能仍待
+用户重启新QEMU后按同配置验证，不能报告尚未测量的Prefill/Decode加速。
+
+## 30. Native tail 内部 KV head 命名整理
+
+`instattention_buffer.c` 中原来的 stream 表示 `(batch, layer, kv_head)` 对应的
+独立 KV 状态，不是 CUDA stream 或执行线程。为避免混淆，内部类型改为
+`NativeKvHeadState`，状态数组改为 `head_states`，坐标转换函数改为
+`kv_head_index` / `kv_head_coordinate`，展平后的索引使用 `head_index`。
+索引仍为 `(batch * layers + layer) * heads + head`；局部 `head` 仍表示层内的
+KV head 编号，两者不要混用。
+
+这次仅调整内部标识符；共享布局的 `streams` / `pages_per_stream` 字段、
+命令 ABI、统计字段、tail 容量与寻址公式、背压、写回顺序和 freezing 均不变。
+
+## 31. 2026-10-09 保存版本前回归
+
+本次保存 native 批量 APPEND、tail/读取路径修正、CUDA 初始化失败诊断、Guest 启动与
+构建支持、串行数据流说明，以及两轮旧测试入口清理。不以删除旧测试或 functional PASS
+代替论文行为、GPU 正确性和时间模型校准。
+
+- QEMU：`make -C build -j4` 通过。
+- Host 客户端：在 `/tmp/cemu-release-client` 重新编译通过。Host Python 未安装独立
+  pybind11 包，默认配置找不到头文件；显式将 `CEMU_PYBIND11_INCLUDE_DIR` 指向当前
+  PyTorch 的 `include` 后通过，没有安装系统包或修改全局环境。
+- `instattention-native-regression-test`：111 项通过，35.352 秒。包含真实 QEMU qtest
+  的 NVMe/PRP、native KV、FDM/MRS、SparF 及小型合成 OPT Prefill/Decode 全链路。
+  首次运行有 8 项因沙箱禁止 Unix socket 报错；允许隔离 socket 后完整重跑通过。
+- 其余 30 个 unittest 模块：215 项通过，2.434 秒。覆盖公共 Prefill/Decode/microbatch
+  调度、checkpoint loader、dense phases、KV 布局、grouped IO、SparF、ratio 和时间线分析。
+  模块清单及逐项结果保存在 `cpu-regression.log`，与上面的 111 项不重复。
+- 独立 `test_sparf_operator.py` CPU 数值检查通过；5 个相关启动/挂载脚本 `bash -n`
+  通过。已有临时 mock-launch 检查验证默认/native 参数、新会话、退出码和非法参数，
+  不实际启动 KVM/VFIO Guest。
+
+本机日志目录：`/home/lihan/cemu/cemu-logs/release-20261009-095719/`。
+重点日志为 `build-qemu.log`、`build-client-retry.log`、
+`native-regression-unsandboxed.log`、`cpu-regression.log`、`sparf-operator.log`、
+`launch-mock.log`。日志不随源码提交；已有 unused-function/unused-variable 编译警告仍在。
+
+这轮没有使用真实 GPU、OPT-13B checkpoint 或现有实验系统盘，没有跑 Guest FDMFS 驱动
+和 CUDA 全流程，也没有重新测量论文规模性能。下一轮仍需在专用 native Guest 中验证
+OPT-125M/OPT-13B 的实际 GPU 路径，再做同配置性能对照；上述 326 项不能替代这一步。

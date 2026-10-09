@@ -18,7 +18,7 @@ PYTHON_EXECUTABLE := $(shell command -v $(PYTHON))
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
 
-.PHONY: all kernel instattention instattention-test instattention-client-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-decode-test instattention-flexgen-decode-gpu-test instattention-flexgen-cemu-gpu-test instattention-flexgen-attention-async-test instattention-attention-slot-scheduler-test instattention-attention-slot-device-test instattention-attention-slot-device-gpu-test instattention-hf-checkpoint-test instattention-tinyllama-checkpoint-test instattention-opt-checkpoint-test instattention-opt-runtime-test instattention-opt-reference-test instattention-opt-cemu-gpu-test instattention-opt-cemu-functional instattention-opt-cemu-benchmark instattention-figure14-config-test instattention-figure14-functional instattention-figure14-sparf-functional instattention-tinyllama-prefill-test instattention-tinyllama-reference-test instattention-tinyllama-decode-reference-test instattention-tinyllama-cemu-gpu-test instattention-tinyllama-cemu-trace-test instattention-tinyllama-cemu-benchmark instattention-pipeline-trace-test instattention-attention-test instattention-attention-gpu-test instattention-table1-test instattention-table1-cemu-test
+.PHONY: all kernel instattention instattention-test instattention-device-test instattention-gpu-test instattention-layout-test instattention-kv-store-test instattention-kv-staging-test instattention-prefill-test instattention-flexgen-prefill-test instattention-flexgen-prefill-gpu-test instattention-flexgen-decode-test instattention-flexgen-decode-gpu-test instattention-flexgen-attention-async-test instattention-attention-slot-scheduler-test instattention-attention-slot-device-test instattention-attention-slot-device-gpu-test instattention-hf-checkpoint-test instattention-opt-checkpoint-test instattention-opt-runtime-test instattention-opt-reference-test instattention-opt-cemu-gpu-test instattention-opt-cemu-functional instattention-opt-cemu-benchmark instattention-figure14-config-test instattention-figure14-functional instattention-figure14-sparf-functional instattention-tinyllama-reference-test instattention-tinyllama-decode-reference-test instattention-tinyllama-cemu-gpu-test instattention-tinyllama-cemu-trace-test instattention-tinyllama-cemu-benchmark instattention-pipeline-trace-test instattention-table1-test instattention-table1-cemu-test
 
 all: $(BUILD_DIR) $(TARGETS) instattention
 
@@ -28,9 +28,6 @@ kernel:
 instattention:
 	cmake -S $(INSTATTENTION_DIR) -B $(INSTATTENTION_BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython3_EXECUTABLE="$(PYTHON_EXECUTABLE)"
 	cmake --build $(INSTATTENTION_BUILD_DIR) --parallel
-
-instattention-client-test: instattention
-	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py
 
 instattention-device-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
@@ -78,29 +75,11 @@ instattention-native-device-test:
 instattention-native-buffer-device-test:
 	$(PYTHON) $(INSTATTENTION_DIR)/python/native_kv_client.py --device "$(or $(NVM_DEVICE),/dev/ng0n1)" --buffer-test
 
-.PHONY: instattention-attention-phases-test instattention-attention-phases-device-test instattention-attention-workflow-device-test instattention-sparf-test instattention-sparf-kv-test instattention-sparf-device-test
+.PHONY: instattention-attention-phases-test instattention-sparf-test instattention-sparf-kv-test instattention-sparf-device-test
 
 instattention-attention-phases-test:
 	$(MAKE) -C kernel ../build/attention_phases.so
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_attention_phases.py
-
-instattention-attention-phases-device-test: instattention
-	$(PYTHON) $(INSTATTENTION_DIR)/python/test_cemu_attention_phases.py \
-		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
-		--dtype "$(if $(DTYPE),$(DTYPE),float16)" \
-		$(if $(filter cuda,$(CSD_TARGET)),--cuda) \
-		$(if $(PROGRAM),--program "$(PROGRAM)")
-
-instattention-attention-workflow-device-test: instattention
-	$(PYTHON) $(INSTATTENTION_DIR)/python/test_cemu_attention_workflow.py \
-		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
-		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
-		--dtype "$(if $(DTYPE),$(DTYPE),float16)" \
-		--tokens "$(if $(TOKEN_COUNT),$(TOKEN_COUNT),257)" \
-		--qk-runtime-ns "$(if $(QK_RUNTIME_NS),$(QK_RUNTIME_NS),200000)" \
-		--pv-runtime-ns "$(if $(PV_RUNTIME_NS),$(PV_RUNTIME_NS),100000)" \
-		$(if $(filter cuda,$(CSD_TARGET)),--cuda) \
-		$(if $(PROGRAM),--program "$(PROGRAM)")
 
 instattention-sparf-test:
 	$(MAKE) -C kernel ../build/sparf_attention.so
@@ -118,11 +97,11 @@ instattention-sparf-group-layout-test:
 instattention-sparf-group-capacity-test:
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_capacity.py
 
-.PHONY: instattention-sparf-group-test instattention-sparf-group-device-test
+.PHONY: instattention-sparf-group-test
 instattention-sparf-group-test: instattention-sparf-group-layout-test instattention-sparf-group-capacity-test
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_device.py
 
-.PHONY: instattention-sparf-group-buffer-test instattention-sparf-group-buffer-device-test instattention-sparf-grouped-backend-test
+.PHONY: instattention-sparf-group-buffer-test instattention-sparf-grouped-backend-test
 .PHONY: instattention-sparf-group-attention-test instattention-sparf-group-attention-device-test
 instattention-sparf-group-attention-test:
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_attention.py
@@ -140,21 +119,6 @@ instattention-sparf-group-buffer-test: instattention-sparf-group-test
 
 instattention-sparf-grouped-backend-test:
 	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_grouped_backend.py
-
-instattention-sparf-group-buffer-device-test: instattention
-	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_buffer_device.py \
-		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
-		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
-		--nvm-device "$(if $(NVM_DEVICE),$(NVM_DEVICE),/dev/nvme0n1)" \
-		--write-batch-pages "$(if $(SPARF_GROUP_WRITE_BATCH_PAGES),$(SPARF_GROUP_WRITE_BATCH_PAGES),256)" \
-		--program "$(if $(PROGRAM),$(PROGRAM),./build/sparf_attention_devptr.so)"
-
-instattention-sparf-group-device-test: instattention
-	$(PYTHON) $(INSTATTENTION_DIR)/python/test_sparf_group_io_device.py \
-		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
-		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
-		--nvm-device "$(if $(NVM_DEVICE),$(NVM_DEVICE),/dev/nvme0n1)" \
-		--program "$(if $(PROGRAM),$(PROGRAM),./build/sparf_attention.so)"
 
 .PHONY: instattention-sparf-stages-test instattention-sparf-stages-device-test
 instattention-sparf-stages-test:
@@ -299,12 +263,6 @@ instattention-attention-slot-device-gpu-test: instattention
 instattention-hf-checkpoint-test:
 	python3 $(INSTATTENTION_DIR)/python/test_hf_checkpoint.py
 
-instattention-tinyllama-checkpoint-test:
-	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_checkpoint.py \
-		--model-dir "$(MODEL_DIR)" \
-		$(if $(CUDA),--cuda) \
-		$(if $(ALL_LAYERS),--all-layers)
-
 instattention-opt-checkpoint-test:
 	python3 $(INSTATTENTION_DIR)/python/test_opt_checkpoint_loader.py
 	python3 $(INSTATTENTION_DIR)/python/test_opt_checkpoint.py \
@@ -405,13 +363,6 @@ instattention-figure14-functional: instattention
 instattention-figure14-sparf-functional: EXPERIMENT_CONFIG=$(INSTATTENTION_DIR)/experiments/configs/opt13b_sparf_1csd.json
 instattention-figure14-sparf-functional: instattention-figure14-functional
 
-instattention-tinyllama-prefill-test:
-	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_prefill.py \
-		--model-dir "$(MODEL_DIR)" \
-		--batch-size "$(if $(BATCH_SIZE),$(BATCH_SIZE),1)" \
-		--prompt-length "$(if $(PROMPT_LENGTH),$(PROMPT_LENGTH),8)" \
-		$(if $(CUDA),--cuda)
-
 instattention-tinyllama-reference-test:
 	python3 $(INSTATTENTION_DIR)/python/test_tinyllama_reference.py \
 		--model-dir "$(MODEL_DIR)" \
@@ -471,33 +422,14 @@ instattention-tinyllama-cemu-benchmark: instattention
 		--iterations "$(if $(ITERATIONS),$(ITERATIONS),5)" \
 		--benchmark-output "$(if $(BENCHMARK_OUTPUT),$(BENCHMARK_OUTPUT),$(INSTATTENTION_DIR)/results/tinyllama-cemu-benchmark.csv)"
 
-instattention-flexgen-cemu-gpu-test: instattention
-	python3 $(INSTATTENTION_DIR)/python/test_flexgen_cemu_pipeline.py \
-		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \
-		--fdm-dir "$(if $(FDM_TEST_DIR),$(FDM_TEST_DIR),/mnt/fdm0)" \
-		--decode-steps "$(if $(DECODE_STEPS),$(DECODE_STEPS),4)" \
-		--num-layers "$(if $(NUM_LAYERS),$(NUM_LAYERS),2)" \
-		--hidden-size "$(if $(HIDDEN_SIZE),$(HIDDEN_SIZE),16)" \
-		--num-attention-heads "$(if $(QUERY_HEADS),$(QUERY_HEADS),4)" \
-		--num-key-value-heads "$(if $(KV_HEADS),$(KV_HEADS),2)" \
-		--staging-tokens "$(if $(STAGING_TOKENS),$(STAGING_TOKENS),0)"
-
-instattention-attention-test: instattention
-	python3 $(INSTATTENTION_DIR)/python/test_attention.py --nvm-dir "$(NVM_TEST_DIR)" --fdm-dir "$(FDM_TEST_DIR)"
-
-instattention-attention-gpu-test: instattention
-	python3 $(INSTATTENTION_DIR)/python/test_attention.py --cuda --nvm-dir "$(NVM_TEST_DIR)" --fdm-dir "$(FDM_TEST_DIR)"
-
 instattention-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_kv_layout.py
 	CEMU_KV_TEST_DIR="$(NVM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_store.py
 	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_kv_staging.py
 	CEMU_NVM_TEST_DIR="$(NVM_TEST_DIR)" CEMU_FDM_TEST_DIR="$(FDM_TEST_DIR)" python3 $(INSTATTENTION_DIR)/python/test_prefill.py
-	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
 
 instattention-gpu-test: instattention
-	python3 $(INSTATTENTION_DIR)/python/test_python_bridge.py --cuda
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py --cuda
 
 $(BUILD_DIR):

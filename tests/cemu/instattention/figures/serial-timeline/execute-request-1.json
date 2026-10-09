@@ -1,0 +1,202 @@
+{
+  "schema": "sparf-autonomous-v1",
+  "event": "complete",
+  "pid": 3063245,
+  "session": 906725105082679,
+  "request": 1,
+  "controller": 0,
+  "program": 1,
+  "layer": 0,
+  "tokens": 1025,
+  "host_clock": "host_monotonic_ns",
+  "virtual_clock": "qemu_virtual_ns",
+  "admitted": {
+    "host_ns": 906725105091492,
+    "virtual_ns": 367402626011
+  },
+  "engines": 2,
+  "compute_units": 2,
+  "engine": 0,
+  "success": true,
+  "started": {
+    "host_ns": 906725105166169,
+    "virtual_ns": 367402701058
+  },
+  "ready": {
+    "host_ns": 906725288373726,
+    "virtual_ns": 367485100140
+  },
+  "reads": [
+    {
+      "name": "channel_k",
+      "deadline_ns": 367425114202,
+      "submitted": {
+        "host_ns": 906725107102206,
+        "virtual_ns": 367402739202
+      },
+      "observed": {
+        "host_ns": 906725123420099,
+        "virtual_ns": 367402767292
+      },
+      "ready": {
+        "host_ns": 906725145915191,
+        "virtual_ns": 367425115865
+      }
+    },
+    {
+      "name": "token_k",
+      "deadline_ns": 367455535116,
+      "submitted": {
+        "host_ns": 906725184798186,
+        "virtual_ns": 367426347616
+      },
+      "observed": {
+        "host_ns": 906725202146312,
+        "virtual_ns": 367426363639
+      },
+      "ready": {
+        "host_ns": 906725231421515,
+        "virtual_ns": 367455538338
+      }
+    },
+    {
+      "name": "token_v",
+      "deadline_ns": 367484727731,
+      "submitted": {
+        "host_ns": 906725231544801,
+        "virtual_ns": 367455540231
+      },
+      "observed": {
+        "host_ns": 906725258226968,
+        "virtual_ns": 367456128883
+      },
+      "ready": {
+        "host_ns": 906725286964852,
+        "virtual_ns": 367484738354
+      }
+    }
+  ],
+  "computes": [
+    {
+      "name": "approx",
+      "scheduled": true,
+      "truncated": false,
+      "effective_ns": 1167768,
+      "submitted_ns": 367425168220,
+      "completed_ns": 367426337992,
+      "functional_start": {
+        "host_ns": 906725146008775,
+        "virtual_ns": 367425117387
+      },
+      "functional_end": {
+        "host_ns": 906725183470839,
+        "virtual_ns": 367425117387
+      },
+      "observed_done": {
+        "host_ns": 906725184700927,
+        "virtual_ns": 367426346204
+      },
+      "cu_spans": [
+        {
+          "cu": 0,
+          "start_ns": 367425170173,
+          "end_ns": 367425370219
+        },
+        {
+          "cu": 0,
+          "start_ns": 367425370219,
+          "end_ns": 367425570265
+        },
+        {
+          "cu": 0,
+          "start_ns": 367425570265,
+          "end_ns": 367425770320
+        },
+        {
+          "cu": 0,
+          "start_ns": 367425770320,
+          "end_ns": 367425970376
+        },
+        {
+          "cu": 0,
+          "start_ns": 367425970376,
+          "end_ns": 367426170442
+        },
+        {
+          "cu": 0,
+          "start_ns": 367426170442,
+          "end_ns": 367426337992
+        }
+      ]
+    },
+    {
+      "name": "qk",
+      "scheduled": true,
+      "truncated": false,
+      "effective_ns": 553512,
+      "submitted_ns": 367455562653,
+      "completed_ns": 367456117547,
+      "functional_start": {
+        "host_ns": 906725248167059,
+        "virtual_ns": 367455540231
+      },
+      "functional_end": {
+        "host_ns": 906725257636303,
+        "virtual_ns": 367455540231
+      },
+      "observed_done": {
+        "host_ns": 906725258225986,
+        "virtual_ns": 367456128052
+      },
+      "cu_spans": [
+        {
+          "cu": 0,
+          "start_ns": 367455563965,
+          "end_ns": 367455764021
+        },
+        {
+          "cu": 0,
+          "start_ns": 367455764021,
+          "end_ns": 367455964077
+        },
+        {
+          "cu": 0,
+          "start_ns": 367455964077,
+          "end_ns": 367456117547
+        }
+      ]
+    },
+    {
+      "name": "pv",
+      "scheduled": true,
+      "truncated": false,
+      "effective_ns": 331100,
+      "submitted_ns": 367484751922,
+      "completed_ns": 367485083797,
+      "functional_start": {
+        "host_ns": 906725287053489,
+        "virtual_ns": 367484739525
+      },
+      "functional_end": {
+        "host_ns": 906725287633368,
+        "virtual_ns": 367484739525
+      },
+      "observed_done": {
+        "host_ns": 906725288369180,
+        "virtual_ns": 367485095764
+      },
+      "cu_spans": [
+        {
+          "cu": 0,
+          "start_ns": 367484752643,
+          "end_ns": 367484952699
+        },
+        {
+          "cu": 0,
+          "start_ns": 367484952699,
+          "end_ns": 367485083797
+        }
+      ]
+    }
+  ]
+}

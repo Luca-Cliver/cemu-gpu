@@ -13,8 +13,8 @@ typedef struct NativeAttentionFixture {
     gint stopped;
 } NativeAttentionFixture;
 
-void *native_attention_fixture_create(uint32_t batches, uint32_t layers,
-                                      uint32_t heads, uint32_t element)
+void *native_attention_fixture_create_budget(uint32_t batches, uint32_t layers,
+    uint32_t heads, uint32_t element, uint64_t budget)
 {
     NativeAttentionFixture *fixture = g_new0(NativeAttentionFixture, 1);
     CemuKvGeometry geometry;
@@ -26,9 +26,19 @@ void *native_attention_fixture_create(uint32_t batches, uint32_t layers,
     geometry = (CemuKvGeometry){ .batches = batches, .layers = layers, .heads = heads,
         .head_dim = 128, .max_tokens = 600, .channels_per_page = 8,
         .element_bytes = element, .page_bytes = 4096 };
-    assert(native_kv_buffer_create(&fixture->storage.ns, &fixture->storage.identity,
-        &geometry, 16 * MiB, 32, &fixture->buffer) == CEMU_KV_OK);
+    if (native_kv_buffer_create(&fixture->storage.ns, &fixture->storage.identity,
+        &geometry, budget, 32, &fixture->buffer) != CEMU_KV_OK) {
+        fixture_close(&fixture->storage);
+        g_free(fixture);
+        return NULL;
+    }
     return fixture;
+}
+
+void *native_attention_fixture_create(uint32_t batches, uint32_t layers,
+                                      uint32_t heads, uint32_t element)
+{
+    return native_attention_fixture_create_budget(batches, layers, heads, element, 16 * MiB);
 }
 
 void native_attention_fixture_free(void *opaque)
@@ -61,6 +71,25 @@ int native_attention_fixture_open(void *opaque,
     memset(fixture->reads, 0, sizeof(fixture->reads));
     memset(fixture->starts, 0, sizeof(fixture->starts));
     return native_kv_attention_open(fixture->buffer, &identity, batch_first, header, &fixture->attention);
+}
+
+int native_attention_fixture_append_batch(void *opaque, uint32_t head,
+    uint32_t heads, uint32_t token, uint32_t count, void *key, void *value, size_t bytes)
+{
+    NativeAttentionFixture *fixture = opaque;
+    CemuKvCoordinate coordinate = { .head = head, .token = token };
+
+    return native_kv_buffer_append_batch(fixture->buffer, &coordinate, heads, count, key, value, bytes);
+}
+
+uint64_t native_attention_fixture_accepted(void *opaque, uint32_t head, uint32_t field)
+{
+    NativeAttentionFixture *fixture = opaque;
+    CemuKvCoordinate coordinate = { .head = head };
+    NativeKvBufferStats stats;
+
+    assert(native_kv_buffer_stats(fixture->buffer, &coordinate, &stats) == CEMU_KV_OK);
+    return field == 0 ? stats.accepted : stats.committed[2];
 }
 
 void native_attention_fixture_close(void *opaque)
@@ -106,13 +135,18 @@ bool native_attention_fixture_read(void *opaque,
     uint32_t kind, void *output, size_t bytes, uint64_t start_ns, CemuSparfStorageResult *result)
 {
     NativeAttentionFixture *fixture = opaque;
+    void *space = fixture->storage.backend.logical_space;
 
     if (fixture->fail_kind == kind + 1) {
         *result = (CemuSparfStorageResult){ .ready_ns = start_ns, .status = CEMU_KV_IO_FAILED };
         return false;
     }
+    if (fixture->fail_kind == -1) {
+        fixture->storage.backend.logical_space = NULL;
+    }
     bool success = native_kv_attention_read(&fixture->attention, header, indices,
         kind, output, bytes, start_ns, result);
+    fixture->storage.backend.logical_space = space;
     fixture->reads[kind] = *result;
     fixture->starts[kind] = start_ns;
     return success;
