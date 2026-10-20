@@ -53,6 +53,7 @@ class NativeKVTransportTest(unittest.TestCase):
         import ctypes
         from native_kv_client import Passthrough
         transport = LinuxTransport.__new__(LinuxTransport)
+        transport.backend = "ioctl"
         transport.descriptor = 42
         transport.libc = Mock()
         payload = bytes(range(256)) * 512
@@ -101,6 +102,176 @@ class NativeStoreTest(unittest.TestCase):
         self.store = NativeKvStore(SparfGroupLayout(128, 8), 4, 2, 2, 300, 2,
                                    transport_factory=lambda path: self.transport).open()
         self.addCleanup(self.store.close)
+
+    def async_transport(self, outcome=None):
+        self.store._append_batch_bytes = 8192
+        self.store._append_queue_depth = 3
+        self.transport.backend = "uring"
+        active_heads = set()
+        accepted = {}
+        events = []
+        requests = []
+
+        def submit(fields, payload):
+            count, heads = fields[0] >> 16, fields[4] >> 16
+            first_head = fields[4] & 65535
+            identities = [(fields[3], head) for head in range(first_head, first_head + heads)]
+            for identity in identities:
+                self.assertNotIn(identity, active_heads)
+                self.assertEqual(accepted.get(identity, 0), fields[5])
+            active_heads.update(identities)
+            events.append(("submit", fields, payload))
+
+            def complete():
+                active_heads.difference_update(identities)
+                events.append(("complete", fields, payload))
+                status, result = outcome(fields) if outcome else (0, 0)
+                if not status:
+                    for identity in identities:
+                        accepted[identity] = fields[5] + count
+                return status, result, b""
+
+            request = SimpleNamespace(result=Mock(side_effect=complete))
+            requests.append(request)
+            return request
+
+        self.transport.submit_append.side_effect = submit
+        self.transport.wait_any.side_effect = lambda active: len(active) - 1
+        return events, requests, active_heads, accepted
+
+    def test_async_prefill_window_order_payload_and_refill(self):
+        events, requests, active_heads, accepted = self.async_transport()
+        keys = self.array_module.arange(33 * 8 * 128, dtype="float32").reshape(33, 8, 128).astype("float16")
+        self.store.append_batch(8, 0, keys, -keys)
+        self.assertEqual([event[0] for event in events[:4]], ["submit"] * 3 + ["complete"])
+        self.assertEqual(events[4][0], "submit")
+        self.assertFalse(active_heads)
+        self.assertEqual(list(accepted.values()), [33] * 8)
+        self.assertEqual(self.store._append_peak_inflight, 3)
+        self.assertEqual(self.store._append_commands, 24)
+        self.assertEqual(self.store._appended_head_tokens, 33 * 8)
+        for request in requests:
+            request.result.assert_called_once()
+        for event, fields, packet in events:
+            if event != "submit":
+                continue
+            batch, layer, head = fields[3] & 65535, fields[3] >> 16, fields[4] & 65535
+            first, count, heads = fields[5], fields[0] >> 16, fields[4] >> 16
+            column = layer * 4 + (batch - 2) * 2 + head
+            expected = b"".join(array[first:first + count, column:column + heads]
+                                .transpose(1, 0, 2).tobytes() for array in (keys, -keys))
+            self.assertEqual(packet, expected)
+            self.assertLessEqual(len(packet), 8192)
+        self.assertEqual(self.store.statistics()["client_append_peak_inflight"], 3)
+
+    def test_async_backpressure_retries_only_unaccepted_packet(self):
+        attempts = {}
+
+        def outcome(fields):
+            attempts[fields] = attempts.get(fields, 0) + 1
+            return (0xC, 5) if fields[5] == 0 and attempts[fields] == 1 else (0, 0)
+
+        _, requests, active_heads, accepted = self.async_transport(outcome)
+        keys = self.array_module.ones((33, 8, 128), dtype="float16")
+        with patch("cemu_flexgen.native_kv_store.time.sleep"):
+            self.store.append_batch(8, 0, keys, keys)
+        self.assertEqual(self.store._append_retries, 8)
+        self.assertEqual(self.store._append_commands, 24)
+        self.assertEqual(self.store._append_attempts, 32)
+        self.assertEqual(list(accepted.values()), [33] * 8)
+        self.assertFalse(active_heads)
+        for request in requests:
+            request.result.assert_called_once()
+
+    def test_async_multihead_payload_and_second_append(self):
+        events, _, active_heads, accepted = self.async_transport()
+        self.store._append_batch_bytes = 16384
+        keys = self.array_module.arange(33 * 8 * 128, dtype="float32").reshape(33, 8, 128).astype("float16")
+        self.store.append_batch(8, 0, keys, -keys)
+        self.store.append_batch(8, 33, keys[:2], -keys[:2])
+        self.assertFalse(active_heads)
+        self.assertEqual(list(accepted.values()), [35] * 8)
+        self.assertEqual(self.store._append_commands, 16)
+        self.assertEqual(self.store._appended_head_tokens, 35 * 8)
+        for event, fields, packet in events:
+            if event != "submit":
+                continue
+            self.assertEqual(fields[4] >> 16, 2)
+            batch, layer = fields[3] & 65535, fields[3] >> 16
+            column = layer * 4 + (batch - 2) * 2
+            first, count = fields[5], fields[0] >> 16
+            start = first if first < 33 else first - 33
+            expected = b"".join(array[start:start + count, column:column + 2]
+                                .transpose(1, 0, 2).tobytes() for array in (keys, -keys))
+            self.assertEqual(packet, expected)
+            self.assertLessEqual(len(packet), 16384)
+
+    def test_async_window_validation(self):
+        from cemu_flexgen.native_kv_store import NativeKvStore
+        for depth in (0, 65, True, 1.5):
+            with self.subTest(depth=depth), self.assertRaisesRegex(ValueError, "queue depth"):
+                NativeKvStore(self.store.layout, 4, 2, 2, 600, 2, append_queue_depth=depth)
+
+    def test_async_error_drains_requests_and_poisons_store(self):
+        _, requests, active_heads, _ = self.async_transport(lambda fields: (2, 7))
+        keys = self.array_module.ones((33, 8, 128), dtype="float16")
+        with self.assertRaisesRegex(RuntimeError, "status=0x2"):
+            self.store.append_batch(8, 0, keys, keys)
+        self.assertEqual(len(requests), 3)
+        self.assertFalse(active_heads)
+        for request in requests:
+            request.result.assert_called_once()
+        with self.assertRaisesRegex(RuntimeError, "closed or failed"):
+            self.store.append_batch(8, 0, keys, keys)
+
+    def test_async_submit_failure_drains_earlier_requests(self):
+        _, requests, active_heads, _ = self.async_transport()
+        submit = self.transport.submit_append.side_effect
+
+        def fail_second(fields, payload):
+            if requests:
+                raise OSError("submission failed")
+            return submit(fields, payload)
+
+        self.transport.submit_append.side_effect = fail_second
+        keys = self.array_module.ones((33, 8, 128), dtype="float16")
+        with self.assertRaisesRegex(OSError, "submission failed"):
+            self.store.append_batch(8, 0, keys, keys)
+        self.assertFalse(active_heads)
+        requests[0].result.assert_called_once()
+
+    def test_async_backpressure_timeout_drains(self):
+        _, requests, active_heads, _ = self.async_transport(lambda fields: (0xC, 5))
+        keys = self.array_module.ones((33, 8, 128), dtype="float16")
+        with patch("cemu_flexgen.native_kv_store.time.monotonic", side_effect=[0, 0, 0, 121]):
+            with self.assertRaisesRegex(TimeoutError, "backpressure"):
+                self.store.append_batch(8, 0, keys, keys)
+        self.assertFalse(active_heads)
+        for request in requests:
+            request.result.assert_called_once()
+
+    def test_decode_and_depth_one_keep_synchronous_submission(self):
+        for tokens, depth, backend in ((1, 3, "uring"), (33, 1, "uring"), (33, 3, "ioctl")):
+            with self.subTest(tokens=tokens, depth=depth, backend=backend):
+                self.store._accepted.clear()
+                self.store._append_batch_bytes = 8192
+                self.store._append_queue_depth = depth
+                self.transport.backend = backend
+                keys = self.array_module.ones((tokens, 8, 128), dtype="float16")
+                self.store.append_batch(8, 0, keys, keys)
+                self.transport.submit_append.assert_not_called()
+
+    def test_async_completion_exception_drains(self):
+        def outcome(fields):
+            raise OSError("CQE failed")
+
+        _, requests, active_heads, _ = self.async_transport(outcome)
+        keys = self.array_module.ones((33, 8, 128), dtype="float16")
+        with self.assertRaisesRegex(OSError, "CQE failed"):
+            self.store.append_batch(8, 0, keys, keys)
+        self.assertFalse(active_heads)
+        for request in requests:
+            request.result.assert_called_once()
 
     def test_microbatch_coordinates_and_payload_tiles(self):
         from native_kv_client import coordinates

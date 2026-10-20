@@ -15,7 +15,7 @@ CemuKvStatus native_kv_attention_open(NativeKvBuffer *buffer,
 bool native_kv_attention_read(void *opaque,
     const struct cemu_sparf_workflow_header *header, const uint32_t *indices,
     uint32_t kind, void *output, size_t bytes, uint64_t start_ns,
-    CemuSparfStorageResult *result);
+    CemuSparfStorageResult *result, FemuReadObservation *observation);
 void native_kv_attention_close(NativeKvAttention *attention);
 
 #endif

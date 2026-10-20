@@ -4,6 +4,8 @@
 #include "instattention_mapping.h"
 
 typedef struct CemuKvIoOps {
+    /* Synchronous: consume the buffer before returning. With write=true the
+     * source is borrowed read-only; do not modify it or retain its pointer. */
     int (*transfer)(void *opaque, void *buffer, uint64_t offset,
                     size_t bytes, bool write);
     bool (*schedule)(void *opaque, const CemuKvPhysicalPage *page, bool write,

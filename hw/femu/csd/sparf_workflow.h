@@ -62,7 +62,7 @@ static bool sparf_start_bound_read(ComputeJob *job, SparfAutonomous *state,
         return false;
     }
     bool success = state->storage_read(state->storage_opaque, header, indices, kind,
-        job->args.mr_addr[destination_range], bytes, start, &result);
+        job->args.mr_addr[destination_range], bytes, start, &result, observation);
     backend_cuda_mark_host_dirty(job->mr_backend[destination_range], job->args.mr_addr[destination_range], bytes);
     if (!success || result.ready_ns < start) {
         return false;

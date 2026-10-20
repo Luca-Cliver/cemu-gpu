@@ -66,7 +66,7 @@ sequenceDiagram
             K->>N: PRP 映射 / SQ → bb_native_submit → native_execute
             N->>N: dma_write_prp → append_batch：T_prp / T_tail [H]
             alt tail 可以接收整包
-                N-)B: enqueue_ready / wake：后台处理满组
+                N-)B: enqueue_page / wake：页满入队，后台等待满块
                 N->>N: CQ 按 D_append 完成；不等待 NAND 写完
                 N-->>K: CQ success
                 K-->>W: ioctl 返回；推进 Guest accepted
@@ -80,10 +80,10 @@ sequenceDiagram
         W-->>A: layer l writer future 完成，满足对应 join
     end
     Note over B: 后台可跨越上述主线运行；下方展示一个写批次，不表示必须此时才开始
-    B->>B: pack_batch → bb_native_kv_batch(write)：T_pack_write [H]
+    B->>B: 等待满块 → bb_native_kv_batch(write)：T_write [H]（布局已在 APPEND 内生成）
     B->>B: mapping / backend 写字节，产生 D_write [V]
     B->>B: 等 clock_ns 到达 D_write：W_write_ready [H/V]
-    B->>B: 推进三类 committed，释放 ring 空间
+    B->>B: 推进三类 committed，释放 DRAM 页槽
     Note over A,B: Prefill 末尾 flush 只收敛 Guest 工作并检查 ready，不执行 terminal drain
 ```
 

@@ -20,6 +20,7 @@ typedef struct CemuKvLayout {
     CemuKvGeometry geometry;
     uint32_t token_group_tokens;
     uint32_t channel_group_tokens;
+    /* Independent page groups per head token span; legacy ABI field name. */
     uint32_t channel_group_pages;
     uint64_t streams;
     uint64_t pages_per_stream;
@@ -48,8 +49,8 @@ typedef struct CemuKvPageKey {
     uint32_t layer;
     uint32_t head;
     uint32_t kind;
-    uint64_t group;
-    uint32_t channel_group;
+    uint64_t group; /* Token-span index. */
+    uint32_t channel_group; /* Together with group identifies ONE channel-K page. */
 } CemuKvPageKey;
 
 typedef struct CemuKvLocation {

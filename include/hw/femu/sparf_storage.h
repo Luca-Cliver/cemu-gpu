@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "sparf_workflow_abi.h"
+#include "read_observation.h"
 
 typedef struct CemuSparfStorageResult {
     uint64_t ready_ns;
@@ -19,6 +20,6 @@ typedef struct CemuSparfStorageResult {
 typedef bool (*CemuSparfStorageRead)(void *opaque,
     const struct cemu_sparf_workflow_header *header, const uint32_t *indices,
     uint32_t kind, void *output, size_t bytes, uint64_t start_ns,
-    CemuSparfStorageResult *result);
+    CemuSparfStorageResult *result, FemuReadObservation *observation);
 
 #endif

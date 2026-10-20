@@ -5,15 +5,28 @@
 typedef struct NativeKvHeadState {
     uint64_t accepted;
     uint64_t committed[3];
-    uint8_t queued;
     uint32_t readers;
 } NativeKvHeadState;
 
-typedef struct NativeKvPending {
-    uint32_t head_index;
-    uint32_t kind;
-    uint32_t count;
-} NativeKvPending;
+/* Each entry is exactly one NAND page, including a channel-indexed group. */
+typedef struct NativeKvStagedPage {
+    uint64_t key;
+    CemuKvCoordinate coordinate;
+    uint32_t valid_tokens;
+    uint32_t next;
+    uint32_t hash_next;
+    bool ready; /* Full or terminally sealed; queued/inflight pages are immutable. */
+} NativeKvStagedPage;
+
+typedef struct NativeKvBlockQueue {
+    uint32_t first, last, count;
+} NativeKvBlockQueue;
+
+typedef struct NativeKvWriteback {
+    NvmeRequest completion;
+    uint32_t first, count, next;
+    bool active;
+} NativeKvWriteback;
 
 struct NativeKvBuffer {
     NvmeNamespace *ns;
@@ -23,23 +36,25 @@ struct NativeKvBuffer {
     GCond wake;
     GThread *worker;
     NativeKvHeadState *head_states;
-    uint32_t *queue;
-    uint32_t queue_head;
-    uint32_t queue_tail;
-    uint32_t queue_count;
-    uint32_t key_capacity;
-    uint32_t value_capacity;
+    uint32_t append_max_tokens;
     uint32_t row_bytes;
     uint32_t batch_pages;
     uint64_t memory_budget;
-    uint8_t *tails;
-    uint8_t *scratch;
+    uint8_t *staged_data;
+    NativeKvStagedPage *staged;
+    NativeKvBlockQueue *blocks;
+    uint32_t *page_hash;
+    uint32_t *inflight;
+    NativeKvWriteback *writebacks;
+    uint32_t writeback_capacity, free_writeback;
+    uint32_t pool_pages, free_page, free_pages, hash_size;
+    uint32_t domains, nand_channels, block_pages;
     uint8_t *read_page;
     uint8_t *gather_data;
     CemuKvDevicePage *gather_pages;
     CemuKvPageKey *gather_keys;
     CemuKvDevicePage *pages;
-    NativeKvPending *pending;
+
     NativeKvBufferStats stats;
     bool draining;
     bool stop;
@@ -50,19 +65,6 @@ static uint32_t group_capacity(const NativeKvBuffer *buffer, uint32_t kind)
 {
     return kind == CEMU_KV_PAGE_CHANNEL_K ? buffer->layout.channel_group_tokens :
                                            buffer->layout.token_group_tokens;
-}
-
-static uint8_t *tail_row(NativeKvBuffer *buffer, uint32_t head_index, uint32_t kind,
-                         uint64_t token)
-{
-    uint64_t base = (uint64_t)head_index * (buffer->key_capacity + buffer->value_capacity);
-    uint32_t capacity = buffer->key_capacity;
-
-    if (kind == CEMU_KV_PAGE_TOKEN_V) {
-        base += buffer->key_capacity;
-        capacity = buffer->value_capacity;
-    }
-    return buffer->tails + (base + token % capacity) * buffer->row_bytes;
 }
 
 static bool kv_head_index(const NativeKvBuffer *buffer, const CemuKvCoordinate *coordinate,
@@ -87,69 +89,237 @@ static CemuKvCoordinate kv_head_coordinate(const NativeKvBuffer *buffer, uint32_
         .batch = head_index / geometry->heads / geometry->layers };
 }
 
-static void enqueue_ready(NativeKvBuffer *buffer, uint32_t head_index)
+static uint64_t gather_page_key(const NativeKvBuffer *buffer,
+    uint32_t head_index, const CemuKvLocation *location);
+
+static uint32_t page_hash_slot(const NativeKvBuffer *buffer, uint64_t key)
 {
-    NativeKvHeadState *head_state = &buffer->head_states[head_index];
-
-    for (uint32_t kind = 0; kind < 3; kind++) {
-        uint64_t available = head_state->accepted - head_state->committed[kind];
-
-        if (!(head_state->queued & (1U << kind)) && available &&
-            (available >= group_capacity(buffer, kind) || buffer->draining)) {
-            buffer->queue[buffer->queue_tail] = head_index * 3 + kind;
-            buffer->queue_tail = (buffer->queue_tail + 1) % (buffer->layout.streams * 3);
-            buffer->queue_count++;
-            head_state->queued |= 1U << kind;
-        }
-    }
+    uint64_t hash = key * UINT64_C(0x9e3779b97f4a7c15);
+    return (hash ^ (hash >> 32)) & (buffer->hash_size - 1);
 }
 
-static uint32_t pack_batch(NativeKvBuffer *buffer, uint32_t *groups)
+static uint32_t staged_page(NativeKvBuffer *buffer, uint64_t key)
+{
+    for (uint32_t p = buffer->page_hash[page_hash_slot(buffer, key)]; p;
+         p = buffer->staged[p].hash_next) {
+        if (buffer->staged[p].key == key) {
+            return p;
+        }
+    }
+    return 0;
+}
+
+/* NULL means NAND. Partial/full pages stay readable in DRAM through their deadline.
+ * A committed prefix alone cannot classify a page: different NAND channels may
+ * flush out of logical token order. Caller holds buffer->lock. */
+static uint8_t *dram_element(NativeKvBuffer *buffer, uint32_t head_index,
+                            const CemuKvCoordinate *coordinate)
+{
+    CemuKvLocation location;
+    uint32_t page;
+
+    if (!cemu_kv_resolve(&buffer->layout, &buffer->identity, coordinate, &location)) {
+        g_assert_not_reached();
+    }
+    page = staged_page(buffer, gather_page_key(buffer, head_index, &location));
+    return page ? buffer->staged_data + (uint64_t)(page - 1) *
+                  buffer->layout.geometry.page_bytes + location.byte_offset : NULL;
+}
+
+/* Same allocation domain as cemu_kv_map_reserve(): heads share a block, but
+ * batch/layer/layout/NAND-channel do not. Embedding channel is NOT NAND channel. */
+static uint32_t block_domain(const NativeKvBuffer *buffer,
+                             const CemuKvCoordinate *coordinate)
+{
+    return (((coordinate->batch * buffer->layout.geometry.layers + coordinate->layer) * 3 +
+             coordinate->kind) * buffer->nand_channels) +
+           (coordinate->token / group_capacity(buffer, coordinate->kind)) % buffer->nand_channels;
+}
+
+/* Publish only a complete page (or a sealed partial page during drain).
+ * The data remains in the same slot until the block's target deadline. */
+static void enqueue_page(NativeKvBuffer *buffer, uint32_t index)
+{
+    NativeKvStagedPage *entry = &buffer->staged[index];
+    NativeKvBlockQueue *block = &buffer->blocks[block_domain(buffer, &entry->coordinate)];
+
+    g_assert(!entry->ready);
+    entry->ready = true;
+    entry->next = 0;
+    if (block->last) {
+        buffer->staged[block->last].next = index;
+    } else {
+        block->first = index;
+    }
+    block->last = index;
+    block->count++;
+}
+
+static uint32_t allocate_page(NativeKvBuffer *buffer, const CemuKvCoordinate *coordinate,
+                              uint64_t key)
+{
+    uint32_t index = buffer->free_page;
+    uint32_t slot = page_hash_slot(buffer, key);
+    NativeKvStagedPage *entry;
+
+    /* APPEND reserves enough slots for the WHOLE command before any mutation. */
+    g_assert(index && buffer->free_pages);
+    entry = &buffer->staged[index];
+    buffer->free_page = entry->next;
+    buffer->free_pages--;
+    *entry = (NativeKvStagedPage){ .coordinate = *coordinate, .key = key,
+                                  .hash_next = buffer->page_hash[slot] };
+    buffer->page_hash[slot] = index;
+    memset(buffer->staged_data + (uint64_t)(index - 1) * buffer->layout.geometry.page_bytes,
+           0, buffer->layout.geometry.page_bytes);
+    buffer->stats.staged_pages++;
+    return index;
+}
+
+/* Visit all page fragments touched by one head/layout. The first pass counts
+ * new slots only; the second pass writes directly into final-layout pages.
+ * No allocation or validation may fail between these passes under the lock. */
+static uint64_t append_layout(NativeKvBuffer *buffer, uint32_t head_index,
+    uint32_t kind, uint64_t token, uint32_t count, const uint8_t *input)
 {
     const CemuKvGeometry *geometry = &buffer->layout.geometry;
-    uint32_t total = 0;
+    uint32_t capacity = group_capacity(buffer, kind);
+    uint32_t stripes = kind == CEMU_KV_PAGE_CHANNEL_K ? buffer->layout.channel_group_pages : 1;
+    uint64_t needed = 0;
 
-    *groups = 0;
-    while (buffer->queue_count) {
-        uint32_t task = buffer->queue[buffer->queue_head];
-        uint32_t head_index = task / 3, kind = task % 3;
-        NativeKvHeadState *head_state = &buffer->head_states[head_index];
-        uint32_t capacity = group_capacity(buffer, kind);
-        uint32_t count = MIN(head_state->accepted - head_state->committed[kind], capacity);
-        uint32_t pages = kind == CEMU_KV_PAGE_CHANNEL_K ? buffer->layout.channel_group_pages : 1;
+    while (count) {
+        uint32_t offset = token % capacity;
+        uint32_t take = MIN(count, capacity - offset);
+        CemuKvCoordinate coordinate = kv_head_coordinate(buffer, head_index);
 
-        if (pages > buffer->batch_pages - total) {
-            break;
-        }
-        buffer->pending[(*groups)++] = (NativeKvPending){ head_index, kind, count };
-        for (uint32_t page = 0; page < pages; page++) {
-            uint8_t *destination = buffer->scratch + (uint64_t)total * geometry->page_bytes;
-            CemuKvCoordinate coordinate = kv_head_coordinate(buffer, head_index);
+        coordinate.kind = kind;
+        coordinate.token = token - offset;
+        for (uint32_t stripe = 0; stripe < stripes; stripe++) {
+            CemuKvLocation location;
+            uint64_t key;
+            uint32_t index;
+            NativeKvStagedPage *entry;
+            uint8_t *destination;
 
-            coordinate.kind = kind;
-            coordinate.token = head_state->committed[kind];
-            coordinate.channel = page * geometry->channels_per_page;
-            memset(destination, 0, geometry->page_bytes);
-            for (uint32_t token = 0; token < count; token++) {
-                uint8_t *source = tail_row(buffer, head_index, kind, coordinate.token + token);
-
-                if (kind != CEMU_KV_PAGE_CHANNEL_K) {
-                    memcpy(destination + (uint64_t)token * buffer->row_bytes, source, buffer->row_bytes);
-                } else {
-                    for (uint32_t channel = 0; channel < geometry->channels_per_page; channel++) {
-                        memcpy(destination + ((uint64_t)channel * capacity + token) * geometry->element_bytes,
-                            source + (coordinate.channel + channel) * geometry->element_bytes,
+            coordinate.channel = stripe * geometry->channels_per_page;
+            if (!cemu_kv_resolve(&buffer->layout, &buffer->identity, &coordinate, &location)) {
+                g_assert_not_reached();
+            }
+            key = gather_page_key(buffer, head_index, &location);
+            index = staged_page(buffer, key);
+            if (!input) {
+                needed += !index;
+                continue;
+            }
+            if (!index) {
+                index = allocate_page(buffer, &coordinate, key);
+            }
+            entry = &buffer->staged[index];
+            g_assert(!entry->ready && entry->valid_tokens == offset);
+            destination = buffer->staged_data + (uint64_t)(index - 1) * geometry->page_bytes;
+            if (kind != CEMU_KV_PAGE_CHANNEL_K) {
+                memcpy(destination + (uint64_t)offset * buffer->row_bytes, input,
+                       (size_t)take * buffer->row_bytes);
+            } else {
+                for (uint32_t channel = 0; channel < geometry->channels_per_page; channel++) {
+                    for (uint32_t t = 0; t < take; t++) {
+                        memcpy(destination + ((uint64_t)channel * capacity + offset + t) * geometry->element_bytes,
+                            input + (uint64_t)t * buffer->row_bytes +
+                                    (coordinate.channel + channel) * geometry->element_bytes,
                             geometry->element_bytes);
                     }
                 }
             }
-            buffer->pages[total++] = (CemuKvDevicePage){ .coordinate = coordinate,
-                .valid_tokens = count, .buffer = destination, .bytes = geometry->page_bytes };
+            entry->valid_tokens += take;
+            if (entry->valid_tokens == capacity) {
+                enqueue_page(buffer, index);
+            }
         }
-        buffer->queue_head = (buffer->queue_head + 1) % (buffer->layout.streams * 3);
-        buffer->queue_count--;
+        token += take;
+        count -= take;
+        if (input) {
+            input += (size_t)take * buffer->row_bytes;
+        }
     }
-    return total;
+    return needed;
+}
+
+static void advance_committed(NativeKvBuffer *buffer, const CemuKvCoordinate *written)
+{
+    uint32_t head_index;
+    uint32_t kind = written->kind, capacity = group_capacity(buffer, kind);
+    uint32_t stripes = kind == CEMU_KV_PAGE_CHANNEL_K ? buffer->layout.channel_group_pages : 1;
+    NativeKvHeadState *head;
+    CemuKvCoordinate coordinate = *written;
+
+    if (!kv_head_index(buffer, written, &head_index)) {
+        g_assert_not_reached();
+    }
+    head = &buffer->head_states[head_index];
+    while (head->committed[kind] < head->accepted) {
+        coordinate.token = head->committed[kind];
+        for (uint32_t stripe = 0; stripe < stripes; stripe++) {
+            coordinate.channel = stripe * buffer->layout.geometry.channels_per_page;
+            if (dram_element(buffer, head_index, &coordinate)) {
+                return;
+            }
+        }
+        head->committed[kind] += MIN((uint64_t)capacity,
+                                    head->accepted - head->committed[kind]);
+    }
+}
+
+static void complete_writeback(NvmeRequest *request, bool cancelled)
+{
+    NativeKvWriteback *writeback = container_of(request, NativeKvWriteback, completion);
+    NativeKvBuffer *buffer = request->internal_owner;
+    uint32_t page;
+
+    g_mutex_lock(&buffer->lock);
+    g_assert(writeback->active && buffer->stats.inflight_blocks);
+    if (cancelled) {
+        buffer->stats.failed = true;
+    }
+    if (!buffer->stop && !buffer->stats.failed) {
+        for (page = writeback->first; page; page = buffer->staged[page].next) {
+            NativeKvStagedPage *entry = &buffer->staged[page];
+            uint32_t *link = &buffer->page_hash[page_hash_slot(buffer, entry->key)];
+            while (*link != page) {
+                link = &buffer->staged[*link].hash_next;
+            }
+            *link = entry->hash_next;
+        }
+        page = writeback->first;
+        while (page) {
+            uint32_t next = buffer->staged[page].next;
+            advance_committed(buffer, &buffer->staged[page].coordinate);
+            buffer->staged[page].next = buffer->free_page;
+            buffer->free_page = page;
+            buffer->free_pages++;
+            page = next;
+        }
+        buffer->stats.staged_pages -= writeback->count;
+        if (writeback->count == buffer->block_pages) {
+            buffer->stats.write_blocks++;
+        } else {
+            buffer->stats.partial_blocks++;
+        }
+    }
+    writeback->active = false;
+    writeback->next = buffer->free_writeback;
+    buffer->free_writeback = writeback - buffer->writebacks;
+    buffer->stats.inflight_blocks--;
+    if (buffer->stats.pending_ready_ns == request->stat.expire_time) {
+        buffer->stats.pending_ready_ns = 0;
+        for (uint32_t index = 1; index <= buffer->writeback_capacity; index++) {
+            if (buffer->writebacks[index].active) {
+                buffer->stats.pending_ready_ns = MAX(buffer->stats.pending_ready_ns,
+                    buffer->writebacks[index].completion.stat.expire_time);
+            }
+        }
+    }
+    g_cond_broadcast(&buffer->wake);
+    g_mutex_unlock(&buffer->lock);
 }
 
 static void *buffer_worker(void *opaque)
@@ -158,44 +328,101 @@ static void *buffer_worker(void *opaque)
 
     g_mutex_lock(&buffer->lock);
     while (!buffer->stop) {
-        uint32_t groups, count;
-        CemuKvDeviceBatchResult result = {0};
-        CemuKvStatus status;
+        NativeKvBlockQueue *block = NULL;
+        NativeKvWriteback *writeback;
+        uint64_t deadline = 0, start_ns;
+        uint32_t count;
 
-        if (buffer->stats.failed || !buffer->queue_count) {
-            if (buffer->draining && !buffer->stats.failed) {
-                buffer->stats.sealed = true;
-            }
+        if (buffer->stats.failed) {
             g_cond_wait(&buffer->wake, &buffer->lock);
             continue;
         }
-        count = pack_batch(buffer, &groups);
-        g_mutex_unlock(&buffer->lock);
-        status = bb_native_kv_batch(buffer->ns, &buffer->identity, buffer->pages,
-                                    count, true, clock_ns(), &result);
-        g_mutex_lock(&buffer->lock);
-        buffer->stats.write_bytes += result.transferred_bytes;
-        buffer->stats.write_batches++;
-        buffer->stats.pending_ready_ns = result.ready_ns;
-        if (status != CEMU_KV_OK || result.completed_pages != count) {
-            buffer->stats.failed = true;
+        for (uint32_t domain = 0; domain < buffer->domains; domain++) {
+            if (buffer->blocks[domain].count >= buffer->block_pages) {
+                block = &buffer->blocks[domain];
+                break;
+            }
+        }
+        /* Terminal drain is the only partial-block/partial-page exception. */
+        if (!block && buffer->draining) {
+            for (uint32_t domain = 0; domain < buffer->domains; domain++) {
+                if (buffer->blocks[domain].count) {
+                    block = &buffer->blocks[domain];
+                    break;
+                }
+            }
+        }
+        if (!block) {
+            buffer->stats.sealed = buffer->draining && !buffer->stats.inflight_blocks;
+            g_cond_wait(&buffer->wake, &buffer->lock);
             continue;
         }
-        while (!buffer->stop && (uint64_t)clock_ns() < result.ready_ns) {
-            g_cond_wait_until(&buffer->wake, &buffer->lock, g_get_monotonic_time() + 10);
+        if (!buffer->free_writeback) {
+            g_cond_wait(&buffer->wake, &buffer->lock);
+            continue;
         }
-        if (buffer->stop) {
-            break;
+        writeback = &buffer->writebacks[buffer->free_writeback];
+        buffer->free_writeback = writeback->next;
+        *writeback = (NativeKvWriteback){ .first = block->first };
+        count = MIN(block->count, buffer->block_pages);
+        writeback->count = count;
+        writeback->active = true;
+        writeback->completion.internal_owner = buffer;
+        writeback->completion.internal_complete = complete_writeback;
+        buffer->stats.inflight_blocks++;
+        buffer->stats.peak_inflight_blocks = MAX(buffer->stats.peak_inflight_blocks,
+                                                buffer->stats.inflight_blocks);
+        for (uint32_t i = 0; i < count; i++) {
+            buffer->inflight[i] = block->first;
+            block->first = buffer->staged[block->first].next;
         }
-        for (uint32_t index = 0; index < groups; index++) {
-            NativeKvPending *pending = &buffer->pending[index];
-            NativeKvHeadState *head_state = &buffer->head_states[pending->head_index];
+        buffer->staged[buffer->inflight[count - 1]].next = 0;
+        block->count -= count;
+        if (!block->count) {
+            block->last = 0;
+        }
+        start_ns = clock_ns();
+        for (uint32_t first = 0; first < count; first += buffer->batch_pages) {
+            CemuKvDeviceBatchResult result = {0};
+            CemuKvStatus status;
+            uint32_t chunk = MIN(buffer->batch_pages, count - first);
 
-            head_state->committed[pending->kind] += pending->count;
-            head_state->queued &= ~(1U << pending->kind);
-            enqueue_ready(buffer, pending->head_index);
+            for (uint32_t i = 0; i < chunk; i++) {
+                uint32_t index = buffer->inflight[first + i];
+                NativeKvStagedPage *entry = &buffer->staged[index];
+                buffer->pages[i] = (CemuKvDevicePage){ .coordinate = entry->coordinate,
+                    .valid_tokens = entry->valid_tokens,
+                    .buffer = buffer->staged_data + (uint64_t)(index - 1) * buffer->layout.geometry.page_bytes,
+                    .bytes = buffer->layout.geometry.page_bytes };
+            }
+            g_mutex_unlock(&buffer->lock);
+            status = bb_native_kv_batch(buffer->ns, &buffer->identity, buffer->pages,
+                                        chunk, true, start_ns, &result);
+            g_mutex_lock(&buffer->lock);
+            buffer->stats.write_bytes += result.transferred_bytes;
+            buffer->stats.write_batches++;
+            deadline = MAX(deadline, result.ready_ns);
+            writeback->completion.stat.expire_time = deadline;
+            buffer->stats.pending_ready_ns = MAX(buffer->stats.pending_ready_ns, deadline);
+            if (status != CEMU_KV_OK || result.completed_pages != chunk) {
+                buffer->stats.failed = true;
+                break;
+            }
+            if (buffer->stop) {
+                break;
+            }
         }
-        buffer->stats.pending_ready_ns = 0;
+        if (buffer->stats.failed || buffer->stop) {
+            g_mutex_unlock(&buffer->lock);
+            complete_writeback(&writeback->completion, true);
+            g_mutex_lock(&buffer->lock);
+            continue;
+        }
+        g_mutex_unlock(&buffer->lock);
+        if (!nvme_submit_internal_completion(buffer->ns->ctrl, &writeback->completion)) {
+            complete_writeback(&writeback->completion, true);
+        }
+        g_mutex_lock(&buffer->lock);
     }
     g_mutex_unlock(&buffer->lock);
     return NULL;
@@ -208,24 +435,62 @@ CemuKvStatus native_kv_buffer_create(NvmeNamespace *ns,
     NativeKvBuffer *buffer;
     CemuKvLayout layout;
     CemuKvStatus status;
-    uint64_t tails, required, bytes_per_head;
+    uint64_t required, pool_pages = 0, domains, partial_pages, command_pages;
+    uint32_t append_max_tokens;
+    uint32_t nand_channels, block_pages, writeback_capacity, hash_size = 1;
     GError *error = NULL;
 
     if (!ns || !identity || !result || !cemu_kv_layout_init(&layout, geometry) ||
-        layout.streams > 65536 || batch_pages < layout.channel_group_pages ||
+        layout.streams > 65536 || !batch_pages ||
+        ns->csi != NVME_CSI_NVM || !ns->private || !nvm_ns(ns)->params ||
         batch_pages > CEMU_NATIVE_INTERNAL_MAX_PAGES) {
         return CEMU_KV_INVALID;
     }
-    bytes_per_head = 2ULL * (layout.channel_group_tokens + layout.token_group_tokens) *
-                 geometry->head_dim * geometry->element_bytes;
-    if (!cemu_kv_multiply(layout.streams, bytes_per_head, &tails)) {
+    if (nvm_ns(ns)->params->nchs <= 0 || nvm_ns(ns)->params->pgs_per_blk <= 0) {
+        return CEMU_KV_INVALID;
+    }
+    nand_channels = nvm_ns(ns)->params->nchs;
+    block_pages = nvm_ns(ns)->params->pgs_per_blk;
+    domains = (uint64_t)geometry->batches * geometry->layers * 3 * nand_channels;
+    if (!nand_channels || !block_pages || domains > UINT32_MAX) {
+        return CEMU_KV_INVALID;
+    }
+    /* Bound idle occupancy by domain residuals + per-head partial pages.
+     * Keep room for the largest atomic APPEND, so capacity backpressure always
+     * has a full/inflight block that can make progress. */
+    append_max_tokens = 2 * layout.token_group_tokens;
+    for (uint32_t kind = 0; kind < 3; kind++) {
+        uint32_t capacity = kind == CEMU_KV_PAGE_CHANNEL_K ?
+                            layout.channel_group_tokens : layout.token_group_tokens;
+        uint32_t stripes = kind == CEMU_KV_PAGE_CHANNEL_K ? layout.channel_group_pages : 1;
+        uint64_t spans = DIV_ROUND_UP(geometry->max_tokens, capacity);
+        for (uint32_t channel = 0; channel < nand_channels; channel++) {
+            uint64_t pages = (spans / nand_channels + (channel < spans % nand_channels)) *
+                             geometry->heads * stripes;
+            pool_pages += MIN(pages, (uint64_t)block_pages - 1);
+        }
+    }
+    partial_pages = layout.streams * (2ULL + layout.channel_group_pages);
+    command_pages = (uint64_t)geometry->heads *
+        (4ULL + DIV_ROUND_UP(append_max_tokens, layout.channel_group_tokens) *
+         (uint64_t)layout.channel_group_pages);
+    pool_pages = pool_pages * geometry->batches * geometry->layers + partial_pages + command_pages;
+    pool_pages = MIN(pool_pages, layout.total_pages);
+    if (!pool_pages || pool_pages > UINT32_MAX / 4) {
         return CEMU_KV_LIMIT;
     }
-    required = sizeof(*buffer) + layout.streams * (sizeof(NativeKvHeadState) + 3 * sizeof(uint32_t)) +
-        (uint64_t)batch_pages * (geometry->page_bytes + sizeof(CemuKvDevicePage) + sizeof(NativeKvPending)) +
+    while (hash_size < pool_pages * 2) {
+        hash_size *= 2;
+    }
+    writeback_capacity = MIN(pool_pages, pool_pages / block_pages + domains + 1);
+    required = sizeof(*buffer) + layout.streams * sizeof(NativeKvHeadState) +
+        (uint64_t)batch_pages * sizeof(CemuKvDevicePage) +
         (uint64_t)batch_pages * (geometry->page_bytes + sizeof(CemuKvDevicePage) + sizeof(CemuKvPageKey)) +
-        geometry->page_bytes;
-    if (required > budget || tails > budget - required || tails > SIZE_MAX - required) {
+        geometry->page_bytes + domains * sizeof(NativeKvBlockQueue) +
+        (pool_pages + 1) * sizeof(NativeKvStagedPage) + pool_pages * geometry->page_bytes +
+        (uint64_t)hash_size * sizeof(uint32_t) + (uint64_t)block_pages * sizeof(uint32_t) +
+        ((uint64_t)writeback_capacity + 1) * sizeof(NativeKvWriteback);
+    if (required > budget || required > SIZE_MAX) {
         return CEMU_KV_LIMIT;
     }
     buffer = g_try_new0(NativeKvBuffer, 1);
@@ -239,26 +504,43 @@ CemuKvStatus native_kv_buffer_create(NvmeNamespace *ns,
     buffer->layout = layout;
     buffer->batch_pages = batch_pages;
     buffer->memory_budget = budget;
-    buffer->key_capacity = 2 * layout.channel_group_tokens;
-    buffer->value_capacity = 2 * layout.token_group_tokens;
+    buffer->pool_pages = pool_pages;
+    buffer->hash_size = hash_size;
+    buffer->domains = domains;
+    buffer->nand_channels = nand_channels;
+    buffer->block_pages = block_pages;
+    buffer->append_max_tokens = append_max_tokens;
     buffer->row_bytes = geometry->head_dim * geometry->element_bytes;
-    buffer->stats.memory_bytes = tails + required;
+    buffer->stats.memory_bytes = required;
     buffer->head_states = g_try_new0(NativeKvHeadState, layout.streams);
-    buffer->queue = g_try_new(uint32_t, layout.streams * 3);
-    buffer->tails = g_try_malloc0(tails);
-    buffer->scratch = g_try_malloc((uint64_t)batch_pages * geometry->page_bytes);
+    buffer->staged_data = g_try_malloc(pool_pages * geometry->page_bytes);
+    buffer->staged = g_try_new0(NativeKvStagedPage, pool_pages + 1);
+    buffer->blocks = g_try_new0(NativeKvBlockQueue, domains);
+    buffer->page_hash = g_try_new0(uint32_t, hash_size);
+    buffer->inflight = g_try_new(uint32_t, block_pages);
+    buffer->writeback_capacity = writeback_capacity;
+    buffer->writebacks = g_try_new0(NativeKvWriteback, (size_t)writeback_capacity + 1);
     buffer->read_page = g_try_malloc(geometry->page_bytes);
     buffer->gather_data = g_try_malloc((uint64_t)batch_pages * geometry->page_bytes);
     buffer->gather_pages = g_try_new(CemuKvDevicePage, batch_pages);
     buffer->gather_keys = g_try_new(CemuKvPageKey, batch_pages);
     buffer->pages = g_try_new(CemuKvDevicePage, batch_pages);
-    buffer->pending = g_try_new(NativeKvPending, batch_pages);
-    if (!buffer->head_states || !buffer->queue || !buffer->tails || !buffer->scratch ||
-        !buffer->read_page || !buffer->pages || !buffer->pending ||
+    if (!buffer->head_states || !buffer->staged_data || !buffer->staged || !buffer->blocks ||
+        !buffer->page_hash || !buffer->inflight || !buffer->writebacks ||
+        !buffer->read_page || !buffer->pages ||
         !buffer->gather_data || !buffer->gather_pages || !buffer->gather_keys) {
         native_kv_buffer_free(buffer);
         return CEMU_KV_NO_MEMORY;
     }
+    for (uint32_t i = 1; i <= pool_pages; i++) {
+        buffer->staged[i].next = i < pool_pages ? i + 1 : 0;
+    }
+    buffer->free_page = 1;
+    buffer->free_pages = pool_pages;
+    for (uint32_t index = 1; index <= writeback_capacity; index++) {
+        buffer->writebacks[index].next = index < writeback_capacity ? index + 1 : 0;
+    }
+    buffer->free_writeback = 1;
     g_mutex_lock(&buffer->lock);
     buffer->worker = g_thread_try_new("native-kv-flush", buffer_worker, buffer, &error);
     status = buffer->worker ? bb_native_kv_register(ns, identity, geometry) : CEMU_KV_NO_MEMORY;
@@ -301,12 +583,13 @@ CemuKvStatus native_kv_buffer_append_batch(NativeKvBuffer *buffer,
     const void *key, const void *value, size_t bytes)
 {
     uint32_t head_index;
+    uint64_t needed = 0;
     CemuKvStatus status = CEMU_KV_INVALID;
 
     if (!buffer || !coordinate || !key || !value || !count || !heads || coordinate->kind || coordinate->channel ||
         !kv_head_index(buffer, coordinate, &head_index) || count > buffer->layout.geometry.max_tokens - coordinate->token ||
         heads > buffer->layout.geometry.heads - coordinate->head ||
-        (uint64_t)heads * count * buffer->row_bytes != bytes || count > buffer->value_capacity) {
+        (uint64_t)heads * count * buffer->row_bytes != bytes || count > buffer->append_max_tokens) {
         return CEMU_KV_INVALID;
     }
     g_mutex_lock(&buffer->lock);
@@ -324,27 +607,27 @@ CemuKvStatus native_kv_buffer_append_batch(NativeKvBuffer *buffer,
     }
     for (uint32_t head = 0; head < heads; head++) {
         NativeKvHeadState *head_state = &buffer->head_states[head_index + head];
-        uint64_t oldest = MIN(head_state->committed[0], head_state->committed[1]);
-
-        if (head_state->readers || count > buffer->key_capacity - (head_state->accepted - oldest) ||
-            count > buffer->value_capacity - (head_state->accepted - head_state->committed[2])) {
+        if (head_state->readers) {
             status = CEMU_KV_PENDING;
             goto done;
         }
+        for (uint32_t kind = 0; kind < 3; kind++) {
+            needed += append_layout(buffer, head_index + head, kind,
+                                    coordinate->token, count, NULL);
+        }
+    }
+    if (needed > buffer->free_pages) {
+        status = CEMU_KV_PENDING;
+        goto done;
     }
     for (uint32_t head = 0; head < heads; head++) {
-        NativeKvHeadState *head_state = &buffer->head_states[head_index + head];
-
-        for (uint32_t token = 0; token < count; token++) {
-            uint64_t offset = ((uint64_t)head * count + token) * buffer->row_bytes;
-
-            memcpy(tail_row(buffer, head_index + head, CEMU_KV_PAGE_TOKEN_K, head_state->accepted + token),
-                   (const uint8_t *)key + offset, buffer->row_bytes);
-            memcpy(tail_row(buffer, head_index + head, CEMU_KV_PAGE_TOKEN_V, head_state->accepted + token),
-                   (const uint8_t *)value + offset, buffer->row_bytes);
+        size_t offset = (size_t)head * count * buffer->row_bytes;
+        for (uint32_t kind = 0; kind < 3; kind++) {
+            const uint8_t *input = kind == CEMU_KV_PAGE_TOKEN_V ? value : key;
+            append_layout(buffer, head_index + head, kind, coordinate->token,
+                          count, input + offset);
         }
-        head_state->accepted += count;
-        enqueue_ready(buffer, head_index + head);
+        buffer->head_states[head_index + head].accepted += count;
     }
     g_cond_signal(&buffer->wake);
     status = CEMU_KV_OK;
@@ -359,6 +642,7 @@ CemuKvStatus native_kv_buffer_read(NativeKvBuffer *buffer,
 {
     uint32_t head_index;
     NativeKvHeadState *head_state;
+    uint8_t *source;
     CemuKvStatus status = CEMU_KV_INVALID;
     CemuKvIoResult candidate = { .start_ns = start_ns, .ready_ns = start_ns };
 
@@ -374,9 +658,8 @@ CemuKvStatus native_kv_buffer_read(NativeKvBuffer *buffer,
         status = CEMU_KV_IO_FAILED;
     } else if (coordinate->token >= head_state->accepted) {
         status = CEMU_KV_NOT_FOUND;
-    } else if (coordinate->token >= head_state->committed[coordinate->kind]) {
-        memcpy(output, tail_row(buffer, head_index, coordinate->kind, coordinate->token) +
-            (uint64_t)coordinate->channel * buffer->layout.geometry.element_bytes, bytes);
+    } else if ((source = dram_element(buffer, head_index, coordinate))) {
+        memcpy(output, source, bytes);
         status = CEMU_KV_OK;
     } else {
         status = bb_native_kv_transfer(buffer->ns, &buffer->identity, coordinate, 0,
@@ -412,7 +695,6 @@ static CemuKvStatus gather_ranges(NativeKvBuffer *buffer,
         CemuKvCoordinate coordinate = ranges[range].coordinate;
         uint32_t head_index = ((uint64_t)coordinate.batch * geometry->layers + coordinate.layer) *
                           geometry->heads + coordinate.head;
-        uint64_t committed = buffer->head_states[head_index].committed[coordinate.kind];
         uint32_t unit = coordinate.kind == CEMU_KV_PAGE_CHANNEL_K ?
                         geometry->element_bytes : buffer->row_bytes;
         uint32_t remaining = ranges[range].tokens;
@@ -421,12 +703,11 @@ static CemuKvStatus gather_ranges(NativeKvBuffer *buffer,
             CemuKvLocation location;
             uint32_t capacity = group_capacity(buffer, coordinate.kind);
             uint32_t tokens = MIN(remaining, capacity - coordinate.token % capacity);
-            bool flash = coordinate.token < committed;
+            uint8_t *dram = dram_element(buffer, head_index, &coordinate);
 
-            if (flash) {
+            if (!dram) {
                 uint32_t page;
 
-                tokens = MIN(tokens, committed - coordinate.token);
                 if (!cemu_kv_resolve(&buffer->layout, &buffer->identity, &coordinate, &location)) {
                     return CEMU_KV_INVALID;
                 }
@@ -448,11 +729,7 @@ static CemuKvStatus gather_ranges(NativeKvBuffer *buffer,
                            location.byte_offset, (size_t)tokens * unit);
                 }
             } else if (output) {
-                for (uint32_t token = 0; token < tokens; token++) {
-                    memcpy(output + (size_t)token * unit,
-                        tail_row(buffer, head_index, coordinate.kind, coordinate.token + token) +
-                        (size_t)coordinate.channel * geometry->element_bytes, unit);
-                }
+                memcpy(output, dram, (size_t)tokens * unit);
             } else {
                 result->tail_bytes += (uint64_t)tokens * unit;
             }
@@ -561,9 +838,57 @@ static uint64_t gather_page_key(const NativeKvBuffer *buffer,
     return base + location->page_index;
 }
 
+static void gather_full_scan(NativeKvBuffer *buffer,
+    const NativeKvBufferLease *lease, uint32_t kind, FemuReadObservation *observation)
+{
+    uint32_t capacity = group_capacity(buffer, kind);
+    uint32_t pages_per_group = kind == CEMU_KV_PAGE_CHANNEL_K ?
+                               buffer->layout.channel_group_pages : 1;
+
+    observation->full_scan_valid = true;
+    observation->page_bytes = buffer->layout.geometry.page_bytes;
+    for (uint32_t batch = lease->batch_first; batch < lease->batch_first + lease->batches; batch++) {
+        for (uint32_t head = 0; head < buffer->layout.geometry.heads; head++) {
+            uint64_t index = ((uint64_t)batch * buffer->layout.geometry.layers +
+                              lease->layer) * buffer->layout.geometry.heads + head;
+            CemuKvCoordinate coordinate = kv_head_coordinate(buffer, index);
+            uint32_t row_bytes = buffer->row_bytes / pages_per_group;
+
+            coordinate.kind = kind;
+            for (coordinate.token = 0; coordinate.token < lease->tokens; coordinate.token += capacity) {
+                uint64_t bytes = MIN((uint64_t)capacity, lease->tokens - coordinate.token) * row_bytes;
+                for (uint32_t stripe = 0; stripe < pages_per_group; stripe++) {
+                    coordinate.channel = stripe * buffer->layout.geometry.channels_per_page;
+                    if (dram_element(buffer, index, &coordinate)) {
+                        observation->full_scan_tail_bytes += bytes;
+                    } else {
+                        observation->full_scan_pages++;
+                        observation->full_scan_logical_bytes += bytes;
+                    }
+                }
+            }
+        }
+    }
+    observation->full_scan_flash_bytes = observation->full_scan_pages * observation->page_bytes;
+}
+
+static uint64_t gather_unique_bytes(const NativeKvReadFragment *fragments,
+                                    uint32_t first, uint32_t page_bytes)
+{
+    uint64_t coverage[65536 / 64];
+    uint64_t bytes = 0;
+
+    memset(coverage, 0, page_bytes / 8);
+    for (uint32_t index = first; index != UINT32_MAX; index = fragments[index].next) {
+        bytes += femu_observe_unique_bytes(coverage, fragments[index].offset, fragments[index].bytes);
+    }
+    return bytes;
+}
+
 CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
     NativeKvGatherSource source, void *opaque, uint32_t count, void *output,
-    size_t bytes, uint64_t start_ns, NativeKvGatherResult *result)
+    size_t bytes, uint64_t start_ns, NativeKvGatherResult *result,
+    const NativeKvBufferLease *lease, uint32_t kind, FemuReadObservation *observation)
 {
     NativeKvGatherResult candidate = { .ready_ns = start_ns };
     NativeKvReadFragment *fragments = NULL;
@@ -573,7 +898,8 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
     CemuKvStatus status = CEMU_KV_INVALID;
 
     if (!buffer || !source || !count || !output || !result || start_ns > INT64_MAX ||
-        !bytes || bytes > 64ULL * 1024 * 1024) {
+        !bytes || bytes > 64ULL * 1024 * 1024 ||
+        (observation && (!lease || lease->buffer != buffer || kind > CEMU_KV_PAGE_TOKEN_V))) {
         return CEMU_KV_INVALID;
     }
     *result = candidate;
@@ -585,7 +911,7 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
     for (uint32_t index = 0; index < count; index++) {
         NativeKvGatherRange range;
         uint32_t head_index, capacity, unit;
-        uint64_t end, committed;
+        uint64_t end;
 
         source(opaque, index, &range);
         if (!range.tokens || !kv_head_index(buffer, &range.coordinate, &head_index) ||
@@ -604,14 +930,20 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
             goto done;
         }
         required += (uint64_t)range.tokens * unit;
-        committed = buffer->head_states[head_index].committed[range.coordinate.kind];
-        if (range.coordinate.token < committed) {
-            capacity = group_capacity(buffer, range.coordinate.kind);
-            pieces += (MIN(end, committed) - 1) / capacity - range.coordinate.token / capacity + 1;
+        capacity = group_capacity(buffer, range.coordinate.kind);
+        while (range.coordinate.token < end) {
+            pieces += !dram_element(buffer, head_index, &range.coordinate);
+            range.coordinate.token += MIN(end - range.coordinate.token,
+                                          capacity - range.coordinate.token % capacity);
         }
     }
     if (required != bytes) {
         goto done;
+    }
+    if (observation) {
+        gather_full_scan(buffer, lease, kind, observation);
+        observation->logical_spans = count;
+        observation->aligned_bytes_before_dedup = pieces * buffer->layout.geometry.page_bytes;
     }
     if (pieces > UINT32_MAX / 2) {
         status = CEMU_KV_LIMIT;
@@ -636,27 +968,25 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
     for (uint32_t index = 0; index < count; index++) {
         NativeKvGatherRange range;
         uint32_t head_index, unit, remaining;
-        uint64_t committed;
 
         source(opaque, index, &range);
         head_index = ((uint64_t)range.coordinate.batch * buffer->layout.geometry.layers +
                   range.coordinate.layer) * buffer->layout.geometry.heads + range.coordinate.head;
-        committed = buffer->head_states[head_index].committed[range.coordinate.kind];
         unit = range.coordinate.kind == CEMU_KV_PAGE_CHANNEL_K ?
                buffer->layout.geometry.element_bytes : buffer->row_bytes;
         remaining = range.tokens;
         while (remaining) {
             CemuKvCoordinate *coordinate = &range.coordinate;
-            uint32_t tokens = remaining;
+            uint32_t capacity = group_capacity(buffer, coordinate->kind);
+            uint32_t tokens = MIN(remaining, capacity - coordinate->token % capacity);
 
-            if (coordinate->token < committed) {
+            uint8_t *dram = dram_element(buffer, head_index, coordinate);
+
+            if (!dram) {
                 CemuKvLocation location;
-                uint32_t capacity = group_capacity(buffer, coordinate->kind);
                 uint64_t key, hash;
                 uint32_t slot;
 
-                tokens = MIN(tokens, capacity - coordinate->token % capacity);
-                tokens = MIN(tokens, committed - coordinate->token);
                 if (!cemu_kv_resolve(&buffer->layout, &buffer->identity, coordinate, &location)) {
                     goto done;
                 }
@@ -687,12 +1017,11 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
                 }
                 used++;
             } else {
-                for (uint32_t token = 0; token < tokens; token++) {
-                    memcpy((uint8_t *)output + cursor + (uint64_t)token * unit,
-                        tail_row(buffer, head_index, coordinate->kind, coordinate->token + token) +
-                        (uint64_t)coordinate->channel * buffer->layout.geometry.element_bytes, unit);
-                }
+                memcpy((uint8_t *)output + cursor, dram, (size_t)tokens * unit);
                 candidate.tail_bytes += (uint64_t)tokens * unit;
+                if (observation) {
+                    observation->tail_copies++;
+                }
             }
             cursor += (uint64_t)tokens * unit;
             coordinate->token += tokens;
@@ -711,8 +1040,8 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
             pages++;
             page = fragments[page].next_page;
         }
-        status = bb_native_kv_batch(buffer->ns, &buffer->identity, buffer->gather_pages,
-                                   pages, false, start_ns, &batch);
+        status = bb_native_kv_batch_observed(buffer->ns, &buffer->identity, buffer->gather_pages,
+                                           pages, false, start_ns, &batch, observation);
         candidate.ready_ns = MAX(candidate.ready_ns, batch.ready_ns);
         candidate.transferred_bytes += batch.transferred_bytes;
         candidate.flash_pages += batch.completed_pages;
@@ -722,6 +1051,10 @@ CemuKvStatus native_kv_buffer_gather_phase(NativeKvBuffer *buffer,
             goto done;
         }
         for (uint32_t slot = 0; slot < pages; slot++) {
+            if (observation) {
+                observation->unique_flash_bytes += gather_unique_bytes(fragments,
+                    first_page, buffer->layout.geometry.page_bytes);
+            }
             for (uint32_t fragment = first_page; fragment != UINT32_MAX;
                  fragment = fragments[fragment].next) {
                 NativeKvReadFragment *span = &fragments[fragment];
@@ -752,7 +1085,14 @@ CemuKvStatus native_kv_buffer_stats(NativeKvBuffer *buffer,
     }
     g_mutex_lock(&buffer->lock);
     *stats = buffer->stats;
+    for (uint32_t domain = 0; domain < buffer->domains; domain++) {
+        stats->ready_blocks += buffer->blocks[domain].count / buffer->block_pages;
+    }
     stats->accepted = buffer->head_states[head_index].accepted;
+    /* Keep the STATUS ABI: all three layouts are now filled at acceptance. */
+    for (uint32_t kind = 0; kind < 3; kind++) {
+        stats->packed[kind] = stats->accepted;
+    }
     memcpy(stats->committed, buffer->head_states[head_index].committed, sizeof(stats->committed));
     g_mutex_unlock(&buffer->lock);
     return CEMU_KV_OK;
@@ -770,9 +1110,34 @@ CemuKvStatus native_kv_buffer_drain(NativeKvBuffer *buffer)
         g_mutex_unlock(&buffer->lock);
         return CEMU_KV_PENDING;
     }
-    buffer->draining = true;
-    for (uint32_t head_index = 0; head_index < buffer->layout.streams; head_index++) {
-        enqueue_ready(buffer, head_index);
+    if (!buffer->draining && !buffer->stats.failed) {
+        buffer->draining = true;
+        /* Seal only the current partial page(s) of each layout. Full pages are
+         * already queued or inflight; unused bytes were zeroed on allocation. */
+        for (uint32_t head_index = 0; head_index < buffer->layout.streams; head_index++) {
+            uint64_t accepted = buffer->head_states[head_index].accepted;
+            CemuKvCoordinate coordinate = kv_head_coordinate(buffer, head_index);
+            for (uint32_t kind = 0; kind < 3; kind++) {
+                uint32_t capacity = group_capacity(buffer, kind);
+                uint32_t stripes = kind == CEMU_KV_PAGE_CHANNEL_K ? buffer->layout.channel_group_pages : 1;
+                if (!(accepted % capacity)) {
+                    continue;
+                }
+                coordinate.kind = kind;
+                coordinate.token = accepted - accepted % capacity;
+                for (uint32_t stripe = 0; stripe < stripes; stripe++) {
+                    CemuKvLocation location;
+                    uint32_t page;
+                    coordinate.channel = stripe * buffer->layout.geometry.channels_per_page;
+                    if (!cemu_kv_resolve(&buffer->layout, &buffer->identity, &coordinate, &location)) {
+                        g_assert_not_reached();
+                    }
+                    page = staged_page(buffer, gather_page_key(buffer, head_index, &location));
+                    g_assert(page && buffer->staged[page].valid_tokens == accepted % capacity);
+                    enqueue_page(buffer, page);
+                }
+            }
+        }
     }
     g_cond_signal(&buffer->wake);
     status = buffer->stats.failed ? CEMU_KV_IO_FAILED :
@@ -871,6 +1236,7 @@ void native_kv_buffer_stop(NativeKvBuffer *buffer)
         g_thread_join(buffer->worker);
         buffer->worker = NULL;
     }
+    nvme_cancel_internal_completions(buffer->ns->ctrl, buffer);
     g_mutex_lock(&buffer->lock);
     while (buffer->leases) {
         g_cond_wait(&buffer->wake, &buffer->lock);
@@ -887,14 +1253,16 @@ void native_kv_buffer_free(NativeKvBuffer *buffer)
     g_mutex_clear(&buffer->lock);
     g_cond_clear(&buffer->wake);
     g_free(buffer->head_states);
-    g_free(buffer->queue);
-    g_free(buffer->tails);
-    g_free(buffer->scratch);
+    g_free(buffer->staged_data);
+    g_free(buffer->staged);
+    g_free(buffer->blocks);
+    g_free(buffer->page_hash);
+    g_free(buffer->inflight);
+    g_free(buffer->writebacks);
     g_free(buffer->read_page);
     g_free(buffer->gather_data);
     g_free(buffer->gather_pages);
     g_free(buffer->gather_keys);
     g_free(buffer->pages);
-    g_free(buffer->pending);
     g_free(buffer);
 }

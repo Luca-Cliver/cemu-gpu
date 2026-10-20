@@ -9,7 +9,7 @@ import time
 import unittest
 
 from native_kv_client import (
-    BUFFER_APPEND, BUFFER_REGISTER, BUFFER_STATUS, INFO, READ, VERSION,
+    BUFFER_APPEND, BUFFER_REGISTER, BUFFER_STATUS, BUFFER_DRAIN, INFO, READ, VERSION,
     BUFFER_APPEND_BATCH, BUFFER_READ, APPEND_MAX_BYTES, PAGE_BYTES,
     buffer_row, checked, coordinates, run_buffer_contract, run_contract,
 )
@@ -201,6 +201,70 @@ class NativeQtest:
 
 @unittest.skipUnless(QEMU.exists(), "build qemu-system-x86_64 first")
 class NativeDeviceTest(unittest.TestCase):
+    def test_internal_writeback_completions_and_reset(self):
+        with tempfile.TemporaryDirectory(prefix="native-writeback-events-") as directory:
+            config = json.loads(CONFIG.read_text())
+            config["namespaces"][0]["parameters"]["pg_wr_lat"] = 1000000000
+            path = Path(directory) / "slow-writes.json"
+            path.write_text(json.dumps(config))
+            device = NativeQtest(directory, path)
+            try:
+                geometry = struct.pack("<8IQI", 1, 1, 16, 128, 64, 8, 2,
+                                       PAGE_BYTES, 8 * 1024 * 1024, 1)
+                checked(device, BUFFER_REGISTER, coordinates(1), geometry.ljust(PAGE_BYTES, b"\0"))
+
+                def append(first):
+                    fields = list(coordinates(1, token=first, valid=16))
+                    fields[4] |= 16 << 16
+                    keys = b"".join(buffer_row(head, token)
+                                    for head in range(16) for token in range(first, first + 16))
+                    values = b"".join(buffer_row(head, token, True)
+                                      for head in range(16) for token in range(first, first + 16))
+                    checked(device, BUFFER_APPEND_BATCH, tuple(fields), keys + values)
+
+                def statistics():
+                    return struct.unpack_from("<20Q", checked(device, BUFFER_STATUS, coordinates(1)))
+
+                def wait_for(predicate):
+                    for attempt in range(1000):
+                        current = statistics()
+                        if predicate(current):
+                            return current
+                        time.sleep(0.001)
+                    self.fail("internal completion did not reach expected state")
+
+                append(0)
+                append(16)
+                before = wait_for(lambda current: current[7] == 64 and current[18] == 4)
+                self.assertEqual(before[1:4], (0, 0, 0))
+                self.assertEqual(before[15], 0)
+                self.assertEqual(before[19], 4)
+                self.assertIsNone(device.completion(1))
+                time.sleep(0.02)
+                self.assertEqual(statistics()[15], 0)
+                device.command("clock_step 17000000000")
+                time.sleep(0.02)
+                self.assertIsNone(device.completion(1), "internal writeback must not post a Guest CQE")
+                completed = wait_for(lambda current: current[15] == 4)
+                self.assertEqual(completed[18], 0)
+                self.assertEqual(completed[1:4], (32, 0, 32))
+                for head in (0, 15):
+                    actual = checked(device, BUFFER_READ, coordinates(1, head=head, token=16))
+                    self.assertEqual(actual[:256], buffer_row(head, 16))
+                append(32)
+                append(48)
+                wait_for(lambda current: current[7] == 128 and current[18] == 4)
+                device.initialize()
+                stopped = statistics()
+                self.assertEqual(stopped[10], 1)
+                self.assertEqual(stopped[18], 0)
+                self.assertEqual(stopped[15], 4)
+                self.assertEqual(stopped[1:4], (32, 0, 32))
+                self.assertIsNone(device.completion(1))
+                checked(device, INFO, (VERSION, 0, 0, 0, 0, 0))
+            finally:
+                device.close()
+
     def test_batched_append_prp_lists_tail_flash_and_rejections(self):
         import numpy as np
         from cemu_flexgen.native_kv_store import NativeKvStore
@@ -249,6 +313,13 @@ class NativeDeviceTest(unittest.TestCase):
                 store.drain()
                 stats = store.statistics()
                 self.assertEqual(stats["write_bytes"], 16 * 116 * PAGE_BYTES)
+                self.assertEqual([stats[name] for name in (
+                    "packed_token_k", "packed_channel_k", "packed_token_v")], [531] * 3)
+                self.assertEqual(stats["staged_pages"], 0)
+                self.assertEqual(stats["ready_blocks"], 0)
+                self.assertGreater(stats["write_blocks"], 0)
+                info = checked(device, INFO, (VERSION, 0, 0, 0, 0, 0))
+                self.assertEqual(struct.unpack_from("<2Q", info, 112), (16, 2))
                 self.assertEqual(stats["client_appended_head_tokens"], 531 * 16)
                 self.assertEqual(stats["failed"], 0)
                 self.assertEqual(stats["sealed"], 1)
@@ -283,6 +354,9 @@ class NativeDeviceTest(unittest.TestCase):
                     payload = b"".join(buffer_row(0, token) for token in range(first, first + 8))
                     payload += b"".join(buffer_row(0, token, True) for token in range(first, first + 8))
                     checked(device, BUFFER_APPEND, coordinates(1, token=first, valid=8), payload)
+                # A short stream needs terminal drain to issue a partial block.
+                status, core, _ = device(BUFFER_DRAIN, coordinates(1))
+                self.assertEqual(core, 5)
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
                     stats = struct.unpack_from("<11Q", checked(device, BUFFER_STATUS, coordinates(1)))

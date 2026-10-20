@@ -7,6 +7,11 @@ if [[ $EUID != 0 ]] || ! grep -qw cemu_native_opt_smoke=1 /proc/cmdline; then
 fi
 model=${1:-}
 csd_target=cpu
+requested_clocksource=${CEMU_GUEST_CLOCKSOURCE:-hpet}
+case "$requested_clocksource" in
+    hpet|kvm-clock) ;;
+    *) echo 'CEMU_GUEST_CLOCKSOURCE must be hpet or kvm-clock (diagnostic only).' >&2; exit 1 ;;
+esac
 read -r -a parameters < /proc/cmdline
 for parameter in "${parameters[@]}"; do
     case "$parameter" in
@@ -48,13 +53,32 @@ case "$profile" in
         prompt_length=1024
         decode_steps=16
         write_batch_pages=256
-        buffer_budget=1073741824
+        # Raw rings plus bounded page staging for block-level native writeback.
+        buffer_budget=6442450944
         runtime_args=(--runtime-config instattention/experiments/configs/opt13b_sparf_1csd.json
                       --softmax-ratio-file "$ratio")
         ;;
     *) echo 'Profile must be smoke or b4-p1024-d16.' >&2; exit 1 ;;
 esac
 mountpoint -q /sys || mount -t sysfs sysfs /sys
+clock_directory=/sys/devices/system/clocksource/clocksource0
+previous_clocksource=$(cat "$clock_directory/current_clocksource")
+if ! grep -qw -- "$requested_clocksource" "$clock_directory/available_clocksource"; then
+    printf 'Guest clocksource %s unavailable; refusing to run with different timing semantics. Available: %s\n' \
+        "$requested_clocksource" "$(cat "$clock_directory/available_clocksource")" >&2
+    exit 1
+fi
+if [[ "$previous_clocksource" != "$requested_clocksource" ]]; then
+    printf '%s\n' "$requested_clocksource" > "$clock_directory/current_clocksource"
+fi
+actual_clocksource=$(cat "$clock_directory/current_clocksource")
+if [[ "$actual_clocksource" != "$requested_clocksource" ]]; then
+    printf 'Guest clocksource switch failed: requested=%s, actual=%s\n' \
+        "$requested_clocksource" "$actual_clocksource" >&2
+    exit 1
+fi
+printf 'Guest clocksource: %s -> %s (kept after test until changed or reboot).\n' \
+    "$previous_clocksource" "$actual_clocksource"
 mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
 mount -o remount,rw /
 mkdir -p /root/models /root/cemu-logs /mnt/fdm0
@@ -95,6 +119,16 @@ if [[ "$profile" != smoke ]]; then
 fi
 printf 'Guest log: %s.log\n' "$output"
 printf 'CSD target from boot parameters: %s; program: %s\n' "$csd_target" "$program"
+{
+printf '[opt-clock] requested=%s, before=%s, current=%s; application clocks use the Guest clocksource, not CUDA event time\n' \
+    "$requested_clocksource" "$previous_clocksource" "$actual_clocksource"
+if [[ "$actual_clocksource" == kvm-clock ]]; then
+    echo '[opt-clock] WARNING: diagnostic kvm-clock run; Guest wall can include frozen functional execution.'
+fi
+test "$(cat "$clock_directory/current_clocksource")" = "$requested_clocksource" || {
+    echo '[opt-clock] Clocksource changed during setup; refusing inference.' >&2
+    exit 1
+}
 PYTHONPATH="/root/native-opt-client${PYTHONPATH:+:$PYTHONPATH}" \
     CEMU_INSTATTENTION_BUILD_DIR=/root/native-opt-client \
     python3 instattention/python/test_opt_cemu_pipeline.py \
@@ -108,5 +142,11 @@ PYTHONPATH="/root/native-opt-client${PYTHONPATH:+:$PYTHONPATH}" \
     --attention-slots 2 --sparf-top-r 16 --sparf-compression-ratio 8 \
     --sparf-group-channels-per-page 8 --sparf-group-write-batch-pages "$write_batch_pages" \
     "${runtime_args[@]}" \
-    --profile-output "$output-profile.csv" \
-    2>&1 | tee "$output.log"
+    --profile-output "$output-profile.csv"
+final_clocksource=$(cat "$clock_directory/current_clocksource")
+printf '[opt-clock] final=%s\n' "$final_clocksource"
+test "$final_clocksource" = "$requested_clocksource" || {
+    echo '[opt-clock] Clocksource changed during inference; discard timing results.' >&2
+    exit 1
+}
+} 2>&1 | tee "$output.log"

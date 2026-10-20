@@ -73,7 +73,7 @@ static void attention_range(void *opaque, uint32_t index, NativeKvGatherRange *r
 bool native_kv_attention_read(void *opaque,
     const struct cemu_sparf_workflow_header *header, const uint32_t *indices,
     uint32_t kind, void *output, size_t bytes, uint64_t start_ns,
-    CemuSparfStorageResult *result)
+    CemuSparfStorageResult *result, FemuReadObservation *observation)
 {
     NativeKvAttention *attention = opaque;
     NativeKvGatherResult gathered = {0};
@@ -107,7 +107,8 @@ bool native_kv_attention_read(void *opaque,
     read = (NativeKvAttentionRead){ attention, indices, kind, ranks };
     cursor = required - (kind == CEMU_KV_PAGE_TOKEN_V ? vectors * header->head_dim * element : 0);
     status = native_kv_buffer_gather_phase(attention->lease.buffer, attention_range,
-        &read, vectors * ranks, output, cursor, start_ns, &gathered);
+        &read, vectors * ranks, output, cursor, start_ns, &gathered,
+        &attention->lease, kind, observation);
     result->ready_ns = gathered.ready_ns;
     result->flash_bytes = gathered.transferred_bytes;
     result->pages = gathered.flash_pages;

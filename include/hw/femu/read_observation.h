@@ -3,6 +3,7 @@
 #ifndef FEMU_READ_OBSERVATION_H
 #define FEMU_READ_OBSERVATION_H
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef struct FemuReadObservation {
     uint64_t logical_bytes, submitted_bytes, ranges;
@@ -14,7 +15,27 @@ typedef struct FemuReadObservation {
     uint32_t channels, luns_per_channel, page_bytes, page_read_ns;
     uint64_t *lun_pages;
     uint64_t *lun_initial_wait_ns;
+    bool full_scan_valid;
+    uint64_t full_scan_pages, full_scan_flash_bytes;
+    uint64_t full_scan_logical_bytes, full_scan_tail_bytes;
+    uint64_t unique_flash_bytes;
 } FemuReadObservation;
+
+static inline uint64_t femu_observe_unique_bytes(uint64_t *coverage,
+                                                uint32_t offset, uint32_t bytes)
+{
+    uint64_t added = 0;
+    while (bytes) {
+        uint32_t bit = offset % 64;
+        uint32_t count = bytes < 64 - bit ? bytes : 64 - bit;
+        uint64_t mask = count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << bit;
+        added += __builtin_popcountll(mask & ~coverage[offset / 64]);
+        coverage[offset / 64] |= mask;
+        offset += count;
+        bytes -= count;
+    }
+    return added;
+}
 
 static inline void femu_observe_page_read(FemuReadObservation *obs,
                                          uint32_t lun, uint64_t service,

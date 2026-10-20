@@ -261,6 +261,10 @@ CemuKvStatus bb_native_kv_batch(NvmeNamespace *ns,
                                CemuKvDevicePage *pages, uint32_t count,
                                bool write, uint64_t start_ns,
                                CemuKvDeviceBatchResult *result);
+CemuKvStatus bb_native_kv_batch_observed(NvmeNamespace *ns,
+    const CemuKvIdentity *identity, CemuKvDevicePage *pages, uint32_t count,
+    bool write, uint64_t start_ns, CemuKvDeviceBatchResult *result,
+    FemuReadObservation *observation);
 CemuKvStatus bb_native_kv_register(NvmeNamespace *ns,
                                   const CemuKvIdentity *identity,
                                   const CemuKvGeometry *geometry);

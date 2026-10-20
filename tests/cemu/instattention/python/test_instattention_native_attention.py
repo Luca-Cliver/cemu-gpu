@@ -1,4 +1,5 @@
 import ctypes as ct
+import json
 import math
 from pathlib import Path
 import tempfile
@@ -8,6 +9,7 @@ import numpy as np
 
 import test_instattention_qemu_io as native_tests
 import test_sparf_stages as stage_tests
+from test_sparf_autonomous_timeline import analyze, summarize_reads, summarize_read_loss
 from cemu_flexgen import KvLayoutConfig, SparfKvCacheLayout, sparf_attention
 from cemu_flexgen.sparf_workflow_abi import pack_grouped_sparf_workflow, SparfWorkflowTrace
 
@@ -33,11 +35,15 @@ class NativeAttentionTest(unittest.TestCase):
             "create": ([ct.c_uint32] * 4, ct.c_void_p),
             "create_budget": ([ct.c_uint32] * 4 + [ct.c_uint64], ct.c_void_p),
             "read": ([ct.c_void_p, ct.c_void_p, ct.c_void_p, ct.c_uint32,
-                      ct.c_void_p, ct.c_size_t, ct.c_uint64, ct.c_void_p], ct.c_bool),
+                      ct.c_void_p, ct.c_size_t, ct.c_uint64, ct.c_void_p, ct.c_void_p], ct.c_bool),
             "free": ([ct.c_void_p], None),
             "append": ([ct.c_void_p] + [ct.c_uint32] * 5 + [ct.c_void_p, ct.c_void_p, ct.c_size_t], ct.c_int),
             "append_batch": ([ct.c_void_p] + [ct.c_uint32] * 4 + [ct.c_void_p, ct.c_void_p, ct.c_size_t], ct.c_int),
             "accepted": ([ct.c_void_p, ct.c_uint32, ct.c_uint32], ct.c_uint64),
+            "memory": ([ct.c_void_p], ct.c_uint64),
+            "settled": ([ct.c_void_p] + [ct.c_uint32] * 4, ct.c_uint64),
+            "committed": ([ct.c_void_p] + [ct.c_uint32] * 4, ct.c_uint64),
+            "read_bytes": ([ct.c_void_p], ct.c_uint64),
             "open": ([ct.c_void_p, ct.c_void_p, ct.c_uint32, ct.c_uint32], ct.c_int),
             "close": ([ct.c_void_p], None),
             "stop_leased": ([ct.c_void_p], None),
@@ -93,9 +99,8 @@ class NativeAttentionTest(unittest.TestCase):
         self.assertEqual(accepted(0, 1), 16)
         self.assertEqual(append(0, 1, 16, 16), 0)
         self.assertEqual(append(1, 1, 0, 32), 0)
-        self.assertEqual(accepted(1, 1), 0)
-        self.assertEqual(append(0, 2, 32, 1), 5)
-        self.assertEqual([accepted(head) for head in range(2)], [32, 32])
+        # APPEND fills final-layout pages immediately; no raw-ring release wait.
+        # Retry capacity backpressure atomically if necessary.
         for attempt in range(100):
             self.native.native_attention_fixture_time(100000)
             status = append(0, 2, 32, 1)
@@ -184,6 +189,15 @@ class NativeAttentionTest(unittest.TestCase):
         self.create()
         for tokens in (15, 16, 253, 256, 259, 531):
             self.append(tokens)
+            if tokens == 531:
+                for attempt in range(1000):
+                    settled = all(self.native.native_attention_fixture_settled(
+                        self.context, batch, layer, head, 1) == tokens
+                        for batch in range(2) for layer in range(2) for head in range(2))
+                    if settled:
+                        break
+                    self.native.native_attention_fixture_time(1000000)
+                self.assertTrue(settled)
             for layer in (0, 1):
                 for ratio in (1, 8):
                     with self.subTest(tokens=tokens, layer=layer, ratio=ratio):
@@ -197,6 +211,66 @@ class NativeAttentionTest(unittest.TestCase):
         self.drain()
         reads = self.execute(self.case(531, layer=1, first_batch=1, batches=1))
         self.assertTrue(all(read[3] == 0 for read in reads))
+
+    def test_native_read_diagnostics_count_only_and_preserve_results(self):
+        self.create()
+        for tokens, sealed in ((15, False), (531, False), (531, True)):
+            self.append(tokens)
+            if sealed:
+                self.drain()
+            else:
+                for attempt in range(1000):
+                    settled = all(self.native.native_attention_fixture_settled(
+                        self.context, batch, layer, head, kind) == tokens
+                        for batch in range(2) for layer in range(2) for head in range(2)
+                        for kind, capacity in ((0, 16), (1, 256), (2, 16)))
+                    if settled:
+                        break
+                    self.native.native_attention_fixture_time(1000000)
+                self.assertTrue(settled)
+            for ratio in (1, 8):
+                with self.subTest(tokens=tokens, sealed=sealed, ratio=ratio):
+                    baseline_case = self.case(tokens, layer=1, first_batch=1, batches=1, ratio=ratio)
+                    measured_case = self.case(tokens, layer=1, first_batch=1, batches=1, ratio=ratio)
+                    self.workflow.configure_autonomous_trace(1)
+                    self.native.native_attention_fixture_time(1000000000)
+                    baseline = self.execute(baseline_case)
+                    self.workflow.configure_autonomous_trace(2)
+                    self.native.native_attention_fixture_time(1000000000)
+                    before = self.native.native_attention_fixture_read_bytes(self.context)
+                    measured = self.execute(measured_case)
+                    actual_bytes = self.native.native_attention_fixture_read_bytes(self.context) - before
+                    self.assertEqual(actual_bytes, sum(read[2] for read in measured))
+                    np.testing.assert_array_equal(baseline_case[0][9], measured_case[0][9])
+                    np.testing.assert_array_equal(baseline_case[0][10], measured_case[0][10])
+                    for original, observed in zip(baseline, measured):
+                        self.assertEqual(original[2:], observed[2:])
+                        self.assertEqual(original[1] - original[0], observed[1] - observed[0])
+                    rows = [json.loads(line) for line in self.workflow.get_autonomous_trace().decode().splitlines()]
+                    reports = analyze(rows)
+                    summary = summarize_reads(reports)
+                    loss = summarize_read_loss(reports)
+                    self.assertEqual(loss["requests"], 1)
+                    self.assertEqual(loss["sparf_flash_bytes"], actual_bytes)
+                    for name, capacity, pages_per_group in (
+                        ("channel_k", 256, 16), ("token_k", 16, 1), ("token_v", 16, 1)
+                    ):
+                        data = reports[0]["read_io"][name]
+                        committed = tokens if sealed else tokens // 512 * 512
+                        expected_pages = 2 * math.ceil(committed / capacity) * pages_per_group
+                        self.assertEqual(data["full_scan"], dict(
+                            pages=expected_pages, flash_bytes=expected_pages * 4096,
+                            logical_bytes=2 * committed * 128 * 2,
+                            tail_bytes=2 * (tokens - committed) * 128 * 2))
+                        self.assertEqual(data["pages"], sum(data["lun_pages"]))
+                        self.assertEqual(sum(summary[name]["channel_page_totals"] or []), data["pages"])
+                        if name != "channel_k" and ratio == 1:
+                            self.assertEqual(data["unique_flash_bytes"], 2 * committed * 128 * 2)
+                            self.assertEqual(data["pages"], expected_pages)
+                            self.assertEqual(data["logical_bytes"], 2 * data["unique_flash_bytes"])
+                        if not sealed and tokens == 15:
+                            self.assertEqual(data["submitted_bytes"], 0)
+                            self.assertEqual(data["model_ns"], 0)
 
     def drain(self):
         for attempt in range(2000):
@@ -229,7 +303,7 @@ class NativeAttentionTest(unittest.TestCase):
             result = ct.create_string_buffer(128)
             success = self.native.native_attention_fixture_read(
                 self.context, metadata, indices.ctypes.data, kind,
-                output.ctypes.data, output.nbytes, start, result)
+                output.ctypes.data, output.nbytes, start, result, None)
             self.assertEqual(success, expect_success)
             fields = [self.native.native_attention_fixture_result(self.context, kind, field)
                       for field in range(8)]
@@ -269,7 +343,13 @@ class NativeAttentionTest(unittest.TestCase):
         self.assertEqual(fields[2], fields[5] * 4096)
 
     def test_phase_plan_budget_and_invalid_selection_fail_without_io(self):
-        self.create(budget=1400000)
+        probe = self.native.native_attention_fixture_create_budget(2, 2, 2, 2, 16 * 1024**2)
+        self.assertTrue(probe)
+        try:
+            budget = self.native.native_attention_fixture_memory(probe) + 8192
+        finally:
+            self.native.native_attention_fixture_free(probe)
+        self.create(budget=budget)
         self.append(531)
         self.drain()
         selected = np.tile(np.arange(531, dtype=np.uint32), (4, 1))

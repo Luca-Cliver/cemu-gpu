@@ -14,6 +14,8 @@ TARGETS = \
 CC = gcc
 CXX = g++
 PYTHON ?= python3
+CEMU_IO_BACKEND ?= ioctl
+export CEMU_IO_BACKEND
 PYTHON_EXECUTABLE := $(shell command -v $(PYTHON))
 CFLAGS = -Wall -Wextra -Wno-unused-function -pedantic -g
 CXXFLAGS = $(CFLAGS)
@@ -31,6 +33,19 @@ instattention:
 
 instattention-device-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
+
+.PHONY: instattention-io-transport-test
+instattention-io-transport-test: instattention
+	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest test_io_transport test_native_kv_client
+	ctest --test-dir $(INSTATTENTION_BUILD_DIR) -R '^io_transport$$' --output-on-failure
+
+.PHONY: instattention-freeze-clock-test
+instattention-freeze-clock-test: instattention
+	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) \
+		$(INSTATTENTION_DIR)/experiments/freeze_clock_probe.py run \
+		--program "$(or $(PROGRAM),/home/lihan/cemu/CEMU/tests/cemu/build/freeze_clock_probe.so)" \
+		--fdm-dir "$(or $(FDM_TEST_DIR),/mnt/fdm0)" \
+		--output "$(or $(PROFILE_OUTPUT),/root/cemu-logs/freeze-clock.json)"
 
 instattention-layout-test:
 	python3 $(INSTATTENTION_DIR)/python/test_kv_layout.py

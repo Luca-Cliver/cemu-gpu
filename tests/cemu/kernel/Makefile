@@ -33,6 +33,9 @@ CXXFLAGS = -Wall -Wextra -O2 -march=native -std=c++11
 $(BUILD_DIR)/vadd.so: vadd.c
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
 
+$(BUILD_DIR)/freeze_clock_probe.so: freeze_clock_probe.c cemu_def.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
 $(BUILD_DIR)/vadd_cuda.so: vadd_cuda.cu
 	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 

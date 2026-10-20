@@ -90,10 +90,9 @@ CemuKvStatus cemu_kv_io_write(CemuKvIo *io, const CemuKvIdentity *identity,
     if (status != CEMU_KV_OK) {
         return status;
     }
-    memcpy(io->scratch, buffer, bytes);
     success = schedule_page(io, true, &candidate);
     if (success) {
-        success = io->ops.transfer(io->opaque, io->scratch,
+        success = io->ops.transfer(io->opaque, (void *)buffer,
                                    candidate.page.backend_offset, bytes, true) == 0;
     }
     status = cemu_kv_map_complete(io->map, &candidate.page, success,

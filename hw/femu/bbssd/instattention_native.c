@@ -127,6 +127,8 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
             append_limit /= 2;
         }
         stq_le_p(buffer + 104, append_limit);
+        stq_le_p(buffer + 112, nns->params->pgs_per_blk);
+        stq_le_p(buffer + 120, 2); /* Direct page assembly + block writeback. */
         status = CEMU_KV_OK;
         break;
     }
@@ -224,6 +226,15 @@ static void native_execute(NvmeNamespace *ns, NvmeRequest *req)
         stq_le_p(buffer + 64, stats.pending_ready_ns);
         stq_le_p(buffer + 72, stats.sealed);
         stq_le_p(buffer + 80, stats.failed);
+        for (size_t index = 0; index < 3; index++) {
+            stq_le_p(buffer + 88 + index * 8, stats.packed[index]);
+        }
+        stq_le_p(buffer + 112, stats.staged_pages);
+        stq_le_p(buffer + 120, stats.write_blocks);
+        stq_le_p(buffer + 128, stats.partial_blocks);
+        stq_le_p(buffer + 136, stats.ready_blocks);
+        stq_le_p(buffer + 144, stats.inflight_blocks);
+        stq_le_p(buffer + 152, stats.peak_inflight_blocks);
         break;
     }
     case CEMU_NATIVE_KV_BUFFER_DRAIN:

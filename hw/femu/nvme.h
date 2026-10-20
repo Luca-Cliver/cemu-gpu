@@ -908,6 +908,8 @@ typedef struct NvmeAsyncEvent {
 } NvmeAsyncEvent;
 
 typedef struct NvmeRequest {
+    void                    (*internal_complete)(struct NvmeRequest *, bool cancelled);
+    void                    *internal_owner;
     struct NvmeSQueue       *sq;
     struct NvmeCQueue       *cq;
     struct NvmeNamespace    *ns;
@@ -1386,6 +1388,8 @@ typedef struct FemuCtrl {
 } FemuCtrl;
 
 void nvme_native_stop(FemuCtrl *n);
+bool nvme_submit_internal_completion(FemuCtrl *n, NvmeRequest *request);
+void nvme_cancel_internal_completions(FemuCtrl *n, void *owner);
 void nvme_native_release_irq(NvmeCQueue *cq);
 
 typedef struct NvmePollerThreadArgument {

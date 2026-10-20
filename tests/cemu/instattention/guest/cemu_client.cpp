@@ -1,4 +1,5 @@
 #include "cemu_client.h"
+#include "io_transport.h"
 
 #include "../../cemu_ioctl.h"
 #include "../../util.h"
@@ -83,8 +84,9 @@ void pwrite_all(int fd, const void *data, std::size_t size, off_t offset)
     const auto *cursor = static_cast<const std::uint8_t *>(data);
     std::size_t written = 0;
     while (written < size) {
-        const ssize_t result = pwrite(fd, cursor + written, size - written,
-                                      offset + static_cast<off_t>(written));
+        const ssize_t result = use_io_uring()
+            ? uring_write(fd, cursor + written, size - written, offset + written)
+            : pwrite(fd, cursor + written, size - written, offset + static_cast<off_t>(written));
         if (result < 0) {
             if (errno == EINTR) {
                 continue;
@@ -103,8 +105,9 @@ void pread_all(int fd, void *data, std::size_t size, off_t offset)
     auto *cursor = static_cast<std::uint8_t *>(data);
     std::size_t read_size = 0;
     while (read_size < size) {
-        const ssize_t result = pread(fd, cursor + read_size, size - read_size,
-                                     offset + static_cast<off_t>(read_size));
+        const ssize_t result = use_io_uring()
+            ? uring_read(fd, cursor + read_size, size - read_size, offset + read_size)
+            : pread(fd, cursor + read_size, size - read_size, offset + static_cast<off_t>(read_size));
         if (result < 0) {
             if (errno == EINTR) {
                 continue;
@@ -130,6 +133,7 @@ void close_fd(int &fd) noexcept
 
 CemuClient::CemuClient(std::string control_path, std::string namespace_path)
 {
+    use_io_uring();
     control_fd_ = ::open(control_path.c_str(), O_RDWR);
     if (control_fd_ < 0) {
         throw_system_error("open " + control_path);
@@ -420,7 +424,9 @@ std::uint32_t CemuClient::execute(const ExecuteOptions &options,
         metadata_size == 0 ? nullptr : metadata_buffer.data(),
         static_cast<std::uint32_t>(metadata_size));
 
-    const int status = ioctl(namespace_fd_, NVME_IOCTL_IO_CMD, &command);
+    const int status = use_io_uring()
+        ? uring_execute(namespace_fd_, command)
+        : ioctl(namespace_fd_, NVME_IOCTL_IO_CMD, &command);
     if (status < 0) {
         throw_system_error("execute CEMU program " + program_name_);
     }

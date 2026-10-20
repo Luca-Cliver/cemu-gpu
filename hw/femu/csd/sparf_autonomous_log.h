@@ -57,7 +57,18 @@ static void sparf_auto_json_read_io(GString *line, const FemuReadObservation *re
         g_string_append_printf(line, "%s%llu", index ? "," : "",
             (unsigned long long)read->lun_initial_wait_ns[index]);
     }
-    g_string_append(line, "]}");
+    g_string_append(line, "]");
+    if (read->full_scan_valid) {
+        g_string_append_printf(line,
+            ",\"full_scan\":{\"pages\":%llu,\"flash_bytes\":%llu,"
+            "\"logical_bytes\":%llu,\"tail_bytes\":%llu},\"unique_flash_bytes\":%llu",
+            (unsigned long long)read->full_scan_pages,
+            (unsigned long long)read->full_scan_flash_bytes,
+            (unsigned long long)read->full_scan_logical_bytes,
+            (unsigned long long)read->full_scan_tail_bytes,
+            (unsigned long long)read->unique_flash_bytes);
+    }
+    g_string_append(line, "}");
 }
 
 static int sparf_auto_log_fd(void)

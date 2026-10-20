@@ -56,6 +56,23 @@ def read_diagnostics(read):
             data["model_end_ns"] == read["deadline_ns"], "IO interval differs from read deadline")
     if data["pages"]:
         require(data["page_bytes"] > 0 and data["page_read_ns"] > 0, "missing NAND geometry")
+    if "full_scan" in data:
+        full = data["full_scan"]
+        for name in ("pages", "flash_bytes", "logical_bytes", "tail_bytes"):
+            timestamp(full[name])
+        timestamp(data["unique_flash_bytes"])
+        require(data["unique_flash_bytes"] <= min(data["logical_bytes"], data["submitted_bytes"]),
+                "unique Flash bytes exceed logical or submitted bytes")
+        require(data["submitted_bytes"] == data["pages"] * data["page_bytes"],
+                "native page/byte counts differ")
+        require(full["flash_bytes"] == full["pages"] * data["page_bytes"] and
+                full["logical_bytes"] <= full["flash_bytes"], "invalid full-scan reference")
+        require(data["pages"] <= full["pages"], "selected pages exceed full scan")
+        require(data["service_ns"] == data["pages"] * data["page_read_ns"],
+                "native NAND service differs from page count")
+        require(data["model_end_ns"] - data["model_start_ns"] ==
+                data["critical_queue_ns"] + data["critical_service_ns"],
+                "native critical path differs from phase deadline")
     result = dict(data)
     result.update(
         model_ns=data["model_end_ns"] - data["model_start_ns"],
@@ -88,8 +105,51 @@ def summarize_reads(reports):
             max(item["lun_pages"]) * len(item["lun_pages"]) / item["pages"]
             for item in items if item["pages"]
         ) if any(item["pages"] for item in items) else None
+        geometries = {(item["channels"], item["luns_per_channel"]) for item in items if item["channels"]}
+        totals["lun_page_totals"] = None
+        totals["channel_page_totals"] = None
+        if len(geometries) == 1:
+            channels, luns = next(iter(geometries))
+            counts = [sum(item["lun_pages"][index] for item in items if item["channels"])
+                      for index in range(channels * luns)]
+            totals.update(channels=channels, luns_per_channel=luns, lun_page_totals=counts,
+                          channel_page_totals=[sum(counts[index:index + luns])
+                                              for index in range(0, len(counts), luns)])
+        native = [item for item in items if "full_scan" in item]
+        totals["native_reference_requests"] = len(native)
+        totals["native_reference_missing"] = len(reports) - len(native)
+        if native:
+            full = {name: sum(item["full_scan"][name] for item in native)
+                    for name in ("pages", "flash_bytes", "logical_bytes", "tail_bytes")}
+            unique = sum(item["unique_flash_bytes"] for item in native)
+            actual = sum(item["submitted_bytes"] for item in native)
+            totals.update(full_scan=full, unique_flash_bytes=unique,
+                          native_submitted_bytes=actual,
+                          page_utilization=unique / actual if actual else None,
+                          page_read_amplification=actual / unique if unique else None,
+                          full_scan_read_fraction=actual / full["flash_bytes"] if full["flash_bytes"] else None)
         summary[phase] = totals
     return summary
+
+
+def summarize_read_loss(reports):
+    complete = [row for row in reports if all(
+        row["read_io"][phase] is not None and "full_scan" in row["read_io"][phase]
+        for phase in ("channel_k", "token_k", "token_v"))]
+    result = dict(reference="same-phase committed/tail snapshot; counting only, no extra IO or dense timing",
+                  requests=len(complete), missing_requests=len(reports) - len(complete))
+    if not complete:
+        return result
+    dense = sum(row["read_io"][phase]["full_scan"]["flash_bytes"]
+                for row in complete for phase in ("token_k", "token_v"))
+    selected = sum(row["read_io"][phase]["submitted_bytes"]
+                   for row in complete for phase in ("token_k", "token_v"))
+    screening = sum(row["read_io"]["channel_k"]["submitted_bytes"] for row in complete)
+    result.update(dense_kv_flash_bytes=dense, selected_kv_flash_bytes=selected,
+                  channel_k_flash_bytes=screening, sparf_flash_bytes=selected + screening,
+                  kv_saved_bytes=dense - selected, net_saved_bytes=dense - selected - screening,
+                  net_saved_fraction=(dense - selected - screening) / dense if dense else None)
+    return result
 
 
 def select_records(records, latest_session=False, min_tokens=0, max_tokens=None):
@@ -310,7 +370,9 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--read-summary", type=Path)
     parser.add_argument("--boundary-summary", type=Path)
+    parser.add_argument("--read-loss-summary", type=Path)
     parser.add_argument("--require-read-diagnostics", action="store_true")
+    parser.add_argument("--require-native-read-reference", action="store_true")
     parser.add_argument("--latest-session", action="store_true")
     parser.add_argument("--min-tokens", type=int, default=0)
     parser.add_argument("--max-tokens", type=int)
@@ -330,10 +392,14 @@ def main():
             require(concurrency["cross_request_io_compute_ns"] > 0,
                     "no observed cross-request IO/CU overlap in virtual time")
         summary = summarize_reads(reports)
+        read_loss = summarize_read_loss(reports)
         boundaries = summarize_boundaries(reports)
         if args.require_read_diagnostics:
             require(all(not phase["missing_requests"] for phase in summary.values()),
                     "read diagnostics missing; enable CEMU_SPARF_READ_DIAGNOSTICS=1 and rerun")
+        if args.require_native_read_reference:
+            require(read_loss["requests"] > 0 and read_loss["missing_requests"] == 0,
+                    "native full-scan reference missing; rebuild and enable native read diagnostics")
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(1, f"[sparf-autonomous] FAIL/INCOMPLETE: {error}\n")
     if args.output:
@@ -342,6 +408,8 @@ def main():
         args.read_summary.write_text(json.dumps(summary, indent=2) + "\n")
     if args.boundary_summary:
         args.boundary_summary.write_text(json.dumps(boundaries, indent=2) + "\n")
+    if args.read_loss_summary:
+        args.read_loss_summary.write_text(json.dumps(read_loss, indent=2) + "\n")
     total_overlap = sum(row["qk_v_target_overlap_ns"] for row in reports)
     print(f"[sparf-autonomous] PASS: {len(reports)} requests; IO/CU exclusion and QK/V→PV dependencies valid")
     print(f"[sparf-autonomous] target QK/V overlap={total_overlap / 1e6:.6f} ms; "
@@ -374,6 +442,15 @@ def main():
         print(f"[sparf-read] {phase}: active_luns_mean={values['active_luns_mean']}, "
               f"worst_lun_max/mean={values['lun_max_to_mean']}, "
               f"virtual_deadline_lateness_sum={values['virtual_deadline_to_ready_ns'] / 1e6:.6f}ms")
+        print(f"[sparf-read] {phase}: channel_pages={values['channel_page_totals']}; "
+              f"LUN pages={values['lun_page_totals']}")
+        if values["native_reference_requests"]:
+            print(f"[sparf-read] {phase}: native references={values['native_reference_requests']}, "
+                  f"missing={values['native_reference_missing']}, "
+                  f"full_scan={values['full_scan']}, unique_flash_bytes={values['unique_flash_bytes']}, "
+                  f"page_utilization={values['page_utilization']}, "
+                  f"page_read_amplification={values['page_read_amplification']}")
+    print(f"[sparf-read-loss] {json.dumps(read_loss, sort_keys=True)}")
     print("[sparf-read] Phase/counter sums are not end-to-end latency; LUNs and QK/V may overlap")
 
 

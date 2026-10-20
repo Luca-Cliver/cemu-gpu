@@ -1,9 +1,12 @@
 #include "cemu_client.h"
+#include "io_transport.h"
 #include "../../util.h"
 
 #include <cstring>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include <pybind11/numpy.h>
@@ -71,6 +74,75 @@ std::vector<std::uint8_t> copy_python_buffer(const py::buffer &buffer)
 PYBIND11_MODULE(_cemu_client, module)
 {
     module.doc() = "Guest-side Python bindings for CEMU computational-storage commands";
+    module.def("guest_clock_snapshot", []() {
+        const auto steady = std::chrono::steady_clock::now();
+        const auto high_resolution = std::chrono::high_resolution_clock::now();
+        const auto system = std::chrono::system_clock::now();
+        return py::make_tuple(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(steady.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(high_resolution.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(system.time_since_epoch()).count());
+    });
+    module.def("guest_clock_info", []() {
+        py::dict result;
+        result["steady_is_steady"] = std::chrono::steady_clock::is_steady;
+        result["high_resolution_is_steady"] = std::chrono::high_resolution_clock::is_steady;
+        result["high_resolution_is_system"] = std::is_same_v<
+            std::chrono::high_resolution_clock, std::chrono::system_clock>;
+        result["high_resolution_is_steady_clock"] = std::is_same_v<
+            std::chrono::high_resolution_clock, std::chrono::steady_clock>;
+        return result;
+    });
+    module.def("io_uring_available", &cemu::instattention::io_uring_available);
+    using cemu::instattention::UringNvmeRequest;
+    py::class_<UringNvmeRequest>(module, "UringNvmeRequest")
+        .def("done", &UringNvmeRequest::done)
+        .def("result", [](const UringNvmeRequest &request) {
+            cemu::instattention::NvmeCompletion completion;
+            {
+                py::gil_scoped_release release;
+                completion = request.result();
+            }
+            const auto &data = request.data();
+            return py::make_tuple(completion.status, completion.result,
+                py::bytes(reinterpret_cast<const char *>(data.data()), data.size()));
+        });
+    module.def("uring_wait_any", &cemu::instattention::uring_wait_any,
+               py::call_guard<py::gil_scoped_release>());
+    module.def("uring_nvme_submit", [](int descriptor, py::bytes packed_command,
+                                        py::bytes payload) {
+        std::string raw = packed_command;
+        std::string data = payload;
+        if (raw.size() != sizeof(nvme_passthru_cmd))
+            throw py::value_error("invalid NVMe passthrough structure size");
+        nvme_passthru_cmd command = {};
+        std::memcpy(&command, raw.data(), sizeof(command));
+        std::vector<std::uint8_t> owned(data.begin(), data.end());
+        py::gil_scoped_release release;
+        return cemu::instattention::uring_submit_nvme(descriptor, command, std::move(owned));
+    });
+    module.def("uring_nvme", [](int descriptor, py::bytes packed_command,
+                                 py::bytes payload) {
+        std::string raw = packed_command;
+        std::string data = payload;
+        if (raw.size() != sizeof(nvme_passthru_cmd))
+            throw py::value_error("invalid NVMe passthrough structure size");
+        nvme_passthru_cmd command = {};
+        std::memcpy(&command, raw.data(), sizeof(command));
+        if (command.data_len != data.size())
+            throw py::value_error("NVMe payload length mismatch");
+        command.addr = data.empty() ? 0 : reinterpret_cast<std::uint64_t>(data.data());
+        int status;
+        {
+            py::gil_scoped_release release;
+            status = cemu::instattention::uring_execute(descriptor, command);
+        }
+        return py::make_tuple(status, command.result, py::bytes(data));
+    }, py::arg("descriptor"), py::arg("command"), py::arg("payload"));
+    module.def("uring_copy_file_range", &cemu::instattention::uring_copy,
+               py::arg("source_fd"), py::arg("destination_fd"), py::arg("size"),
+               py::arg("offset_src"), py::arg("offset_dst"),
+               py::call_guard<py::gil_scoped_release>());
 
     py::enum_<ProgramTarget>(module, "ProgramTarget")
         .value("HOST", ProgramTarget::Host)
@@ -153,6 +225,21 @@ PYBIND11_MODULE(_cemu_client, module)
                      std::memcpy(result.mutable_data(), data.data(), data.size());
                  }
                  return result;
+             },
+             py::arg("range_index"), py::arg("size"),
+             py::arg("range_offset") = 0)
+        .def("read_range_bytes",
+             [](const CemuClient &client, std::size_t range_index,
+                std::size_t size, std::uint64_t range_offset) {
+                 std::vector<std::uint8_t> data;
+                 {
+                     py::gil_scoped_release release;
+                     data = client.read_range(range_index, size, range_offset);
+                 }
+                 if (data.empty()) {
+                     return py::bytes("");
+                 }
+                 return py::bytes(reinterpret_cast<const char *>(data.data()), data.size());
              },
              py::arg("range_index"), py::arg("size"),
              py::arg("range_offset") = 0)

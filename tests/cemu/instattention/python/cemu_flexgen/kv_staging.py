@@ -6,6 +6,7 @@ from typing import Any, Tuple
 import numpy as np
 
 from phase_profiler import profile_scope
+from cemu_io import copy_file_range
 
 from .kv_layout import (
     BLOCK_ALIGNMENT,
@@ -289,7 +290,7 @@ class KvStagingManager:
     ) -> None:
         copied = 0
         while copied < size:
-            result = os.copy_file_range(
+            result = copy_file_range(
                 source_fd,
                 destination_fd,
                 size - copied,

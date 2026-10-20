@@ -18,6 +18,7 @@ typedef struct Fixture {
     uint64_t schedule_start;
     CemuKvPhysicalPage scheduled_page;
     size_t transfers;
+    const void *write_source;
     size_t schedules;
     size_t prepare_count;
     size_t dirty_count;
@@ -56,6 +57,9 @@ static int transfer(void *opaque, void *buffer, uint64_t offset, size_t bytes, b
 
     fixture->transfers++;
     fixture->last_offset = offset;
+    if (write) {
+        fixture->write_source = buffer;
+    }
     if (fixture->fail_io) {
         if (!write) {
             memset(buffer, 0x55, bytes / 2);
@@ -149,13 +153,16 @@ static void test_roundtrip(void)
         memset(input, 0x10 + kind, sizeof(input));
         assert(cemu_kv_io_write(fixture.io, &identity, &coordinate, 16, input,
                                 sizeof(input), 100, &written[kind]) == CEMU_KV_OK);
+        assert(fixture.write_source == input); /* Borrow original immutable page. */
         assert(fixture.last_offset == written[kind].page.backend_offset);
         assert(pread(fixture.descriptor, disk, sizeof(disk), fixture.last_offset) == sizeof(disk));
         assert(memcmp(disk, input, sizeof(input)) == 0);
         assert(written[kind].transferred_bytes == sizeof(input));
+        /* Source may be reused as soon as the synchronous write returns. */
+        memset(input, 0xa5, sizeof(input));
         assert(cemu_kv_io_read(fixture.io, &identity, &coordinate, output,
                                sizeof(output), 101, &read) == CEMU_KV_OK);
-        assert(memcmp(input, output, sizeof(input)) == 0);
+        assert(memcmp(disk, output, sizeof(output)) == 0);
         assert(read.page.ticket == written[kind].page.ticket);
         assert(read.start_ns == written[kind].ready_ns);
         assert(read.ready_ns >= read.start_ns + 40);

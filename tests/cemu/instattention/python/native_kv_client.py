@@ -6,6 +6,8 @@ import stat
 import struct
 import time
 
+from cemu_io import io_backend, uring_bindings
+
 
 PAGE_BYTES = 4096
 VERSION = 1
@@ -31,6 +33,7 @@ class Passthrough(ctypes.Structure):
 
 class LinuxTransport:
     def __init__(self, path):
+        self.backend = io_backend()
         if ctypes.sizeof(Passthrough) != 72:
             raise RuntimeError("unsupported NVMe ioctl ABI")
         self.descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC)
@@ -47,7 +50,8 @@ class LinuxTransport:
             os.close(self.descriptor)
             raise
 
-    def __call__(self, opcode, fields, payload=None, namespace=1):
+    @staticmethod
+    def _prepare(opcode, fields, payload=None, namespace=1):
         size = PAGE_BYTES
         if opcode == BUFFER_APPEND_BATCH:
             if payload is None or not 0 < len(payload) <= APPEND_MAX_BYTES:
@@ -65,6 +69,29 @@ class LinuxTransport:
             command.addr = command.data_len = 0
         for number, value in enumerate(fields, 10):
             setattr(command, f"cdw{number}", value)
+        return command, data
+
+    def submit_append(self, fields, payload):
+        if self.backend != "uring":
+            raise RuntimeError("asynchronous native APPEND requires io_uring")
+        module = uring_bindings()
+        if not callable(getattr(module, "uring_nvme_submit", None)) or not callable(
+                getattr(module, "uring_wait_any", None)):
+            raise RuntimeError("rebuild _cemu_client for asynchronous native APPEND; no ioctl fallback")
+        command, data = self._prepare(BUFFER_APPEND_BATCH, fields, payload)
+        return module.uring_nvme_submit(self.descriptor, bytes(command), data.raw)
+
+    @staticmethod
+    def wait_any(requests):
+        return uring_bindings().uring_wait_any(requests)
+
+    def __call__(self, opcode, fields, payload=None, namespace=1):
+        command, data = self._prepare(opcode, fields, payload, namespace)
+        if self.backend == "uring":
+            status, result, received = uring_bindings().uring_nvme(
+                self.descriptor, bytes(command), data.raw if command.data_len else b""
+            )
+            return status, result, received if command.data_len else data.raw
         status = self.libc.ioctl(self.descriptor, 0xC0484E43, ctypes.byref(command))
         if status < 0:
             error = ctypes.get_errno()
@@ -159,7 +186,7 @@ def buffer_row(stream, token, value=False):
 def run_buffer_contract(transport):
     inspect(transport)
     task = secrets.randbits(32)
-    packet = struct.pack("<8IQI", 2, 1, 1, 128, 600, 8, 2, PAGE_BYTES, 1024 * 1024, 32)
+    packet = struct.pack("<8IQI", 2, 1, 1, 128, 600, 8, 2, PAGE_BYTES, 2 * 1024 * 1024, 32)
     checked(transport, BUFFER_REGISTER, coordinates(task), packet.ljust(PAGE_BYTES, b"\0"))
 
     def stats(stream):

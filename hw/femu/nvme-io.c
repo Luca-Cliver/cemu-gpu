@@ -172,6 +172,49 @@ typedef struct NvmeMemoryCopyCmd {
     uint32_t    rsvd13[3];
 } NvmeMemoryCopyCmd;
 
+bool nvme_submit_internal_completion(FemuCtrl *n, NvmeRequest *request)
+{
+    if (!n->native_kv || !n->poller_on || !request->internal_complete ||
+        !request->internal_owner) {
+        return false;
+    }
+    while (!qatomic_read(&n->native_stop)) {
+        if (femu_ring_enqueue(n->to_poller[1], (void *)&request, 1) == 1) {
+            return true;
+        }
+        g_usleep(10);
+    }
+    return false;
+}
+
+void nvme_cancel_internal_completions(FemuCtrl *n, void *owner)
+{
+    NvmeRequest *request;
+
+    if (!n->native_kv || !n->poller_on) {
+        return;
+    }
+    qemu_mutex_lock(&n->native_lock);
+    while (femu_ring_dequeue(n->to_poller[1], (void *)&request, 1) == 1) {
+        if (request->internal_complete && request->internal_owner == owner) {
+            request->internal_complete(request, true);
+        } else if (pqueue_insert(n->pq[1], request)) {
+            abort();
+        }
+    }
+    for (size_t position = 1; position <= pqueue_size(n->pq[1]);) {
+        request = n->pq[1]->d[position];
+        if (request->internal_complete && request->internal_owner == owner) {
+            pqueue_remove(n->pq[1], request);
+            request->internal_complete(request, true);
+            position = 1;
+        } else {
+            position++;
+        }
+    }
+    qemu_mutex_unlock(&n->native_lock);
+}
+
 static void nvme_process_cq_cpl(FemuCtrl *n, int index_poller)
 {
     NvmeCQueue *cq = NULL;
@@ -236,6 +279,11 @@ static void nvme_process_cq_cpl(FemuCtrl *n, int index_poller)
         now = clock_ns();
         if (now < req->stat.expire_time) {
             break;
+        }
+        if (req->internal_complete) {
+            pqueue_pop(pq);
+            req->internal_complete(req, false);
+            continue;
         }
         if (req->cmd.opcode == NVME_CMD_CSD_EXEC) {
             // uint64_t context_switch_time = req->stat.reqlat -

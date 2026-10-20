@@ -87,6 +87,15 @@ CemuKvStatus bb_native_kv_batch(NvmeNamespace *ns,
                                bool write, uint64_t start_ns,
                                CemuKvDeviceBatchResult *result)
 {
+    return bb_native_kv_batch_observed(ns, identity, pages, count, write,
+                                      start_ns, result, NULL);
+}
+
+CemuKvStatus bb_native_kv_batch_observed(NvmeNamespace *ns,
+    const CemuKvIdentity *identity, CemuKvDevicePage *pages, uint32_t count,
+    bool write, uint64_t start_ns, CemuKvDeviceBatchResult *result,
+    FemuReadObservation *observation)
+{
     NvmNamespace *nns = native_owner(ns);
     CemuKvDeviceBatchResult candidate = { .ready_ns = start_ns };
     CemuKvStatus status = CEMU_KV_OK;
@@ -101,6 +110,14 @@ CemuKvStatus bb_native_kv_batch(NvmeNamespace *ns,
         }
     }
     g_mutex_lock(&nns->native_io_lock);
+    if (observation && !write && !observation->lun_pages) {
+        observation->channels = nns->params->nchs;
+        observation->luns_per_channel = nns->params->luns_per_ch;
+        observation->page_bytes = nns->params->secsz * nns->params->secs_per_pg;
+        observation->page_read_ns = nns->params->pg_rd_lat;
+        observation->lun_pages = g_new0(uint64_t, nns->params->nchs * nns->params->luns_per_ch);
+        observation->lun_initial_wait_ns = g_new0(uint64_t, nns->params->nchs * nns->params->luns_per_ch);
+    }
     for (uint32_t index = 0; index < count; index++) {
         CemuKvDevicePage *page = &pages[index];
 
@@ -109,6 +126,12 @@ CemuKvStatus bb_native_kv_batch(NvmeNamespace *ns,
         candidate.ready_ns = MAX(candidate.ready_ns, page->result.ready_ns);
         if (status != CEMU_KV_OK) {
             break;
+        }
+        if (observation && !write) {
+            const CemuKvPhysicalPage *physical = &page->result.page.physical;
+            femu_observe_page_read(observation,
+                physical->channel * observation->luns_per_channel + physical->lun,
+                observation->page_read_ns, page->result.ready_ns - start_ns);
         }
         candidate.completed_pages++;
         candidate.transferred_bytes += page->result.transferred_bytes;

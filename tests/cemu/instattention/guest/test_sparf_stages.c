@@ -360,7 +360,11 @@ uint64_t execute_autonomous(void **ranges, long long *lengths, void *metadata, i
         GString *complete = sparf_auto_json(&trace, metadata, 0, 1, false, result);
         g_string_append_len(autonomous_trace_json, complete->str, complete->len);
         g_string_free(complete, TRUE);
-        for (int index = 0; index < 3; ++index) g_array_free(trace.computes[index].spans, TRUE);
+        for (int index = 0; index < 3; ++index) {
+            g_array_free(trace.computes[index].spans, TRUE);
+            g_free(trace.reads[index].io.lun_pages);
+            g_free(trace.reads[index].io.lun_initial_wait_ns);
+        }
     }
     return result;
 }

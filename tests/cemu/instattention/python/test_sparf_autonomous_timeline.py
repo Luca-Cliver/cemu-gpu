@@ -1,10 +1,13 @@
 from copy import deepcopy
+import json
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
-from analyze_sparf_autonomous import SCHEMA, analyze, select_records, summarize_reads, summarize_concurrency, summarize_boundaries
+from analyze_sparf_autonomous import SCHEMA, analyze, select_records, summarize_reads, summarize_concurrency, summarize_boundaries, summarize_read_loss
 
 
 def stamp(time):
@@ -121,6 +124,64 @@ class AutonomousTimelineTest(unittest.TestCase):
         self.assertEqual(summary["observed_requests"], 0)
         self.assertEqual(summary["missing_requests"], 1)
         self.assertIsNone(summary["tail_fraction"])
+        self.assertEqual(summarize_read_loss(analyze(sample()))["missing_requests"], 1)
+
+    def native_sample(self, full_pages=4):
+        rows = self.diagnostic_sample()
+        for read in rows[1]["reads"]:
+            read["io"].update(unique_flash_bytes=256, full_scan=dict(
+                pages=full_pages, flash_bytes=4096 * full_pages,
+                logical_bytes=2048, tail_bytes=64))
+        return rows
+
+    def test_native_read_loss_keeps_screening_cost_and_negative_savings(self):
+        reports = analyze(self.native_sample())
+        loss = summarize_read_loss(reports)
+        self.assertEqual(loss["dense_kv_flash_bytes"], 32768)
+        self.assertEqual(loss["selected_kv_flash_bytes"], 24576)
+        self.assertEqual(loss["channel_k_flash_bytes"], 12288)
+        self.assertEqual(loss["net_saved_bytes"], -4096)
+        self.assertEqual(loss["net_saved_fraction"], -0.125)
+        channel = summarize_reads(reports)["channel_k"]
+        self.assertEqual(channel["page_read_amplification"], 48)
+        self.assertEqual(channel["page_utilization"], 1 / 48)
+        self.assertEqual(channel["channel_page_totals"], [2, 1])
+        self.assertEqual(summarize_read_loss(analyze(self.native_sample(8)))["net_saved_bytes"], 28672)
+
+    def test_native_partial_reference_is_not_reported_as_complete(self):
+        rows = self.native_sample()
+        del rows[1]["reads"][1]["io"]["full_scan"]
+        loss = summarize_read_loss(analyze(rows))
+        self.assertEqual(loss["requests"], 0)
+        self.assertNotIn("net_saved_bytes", loss)
+
+    def test_native_reference_validation(self):
+        for changes in (dict(unique_flash_bytes=513), dict(submitted_bytes=8192),
+                        dict(service_ns=0), dict(critical_queue_ns=0),
+                        dict(full_scan=dict(pages=2, flash_bytes=8192, logical_bytes=100, tail_bytes=0))):
+            rows = self.native_sample()
+            rows[1]["reads"][0]["io"].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                analyze(rows)
+
+    def test_native_report_cli_and_missing_reference(self):
+        with tempfile.TemporaryDirectory(prefix="native-read-report-") as directory:
+            trace = Path(directory) / "trace.jsonl"
+            summary = Path(directory) / "summary.json"
+            loss = Path(directory) / "loss.json"
+            command = [sys.executable, str(Path(__file__).resolve().parents[1] /
+                       "experiments/analyze_sparf_autonomous.py"), str(trace),
+                       "--require-read-diagnostics", "--require-native-read-reference",
+                       "--read-summary", str(summary), "--read-loss-summary", str(loss)]
+            trace.write_text("\n".join(json.dumps(row) for row in self.native_sample()))
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(loss.read_text())["net_saved_bytes"], -4096)
+            self.assertEqual(json.loads(summary.read_text())["channel_k"]["channel_page_totals"], [2, 1])
+            trace.write_text("\n".join(json.dumps(row) for row in self.diagnostic_sample()))
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("native full-scan reference missing", result.stderr)
 
     def test_tail_only_and_unmapped_reads(self):
         rows = self.diagnostic_sample()

@@ -1,12 +1,15 @@
+import json
 import math
 import os
 from contextlib import ExitStack
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,7 +21,7 @@ from cemu_flexgen.sparf_workflow_abi import SPARF_WORKFLOW_COMMAND, SparfWorkflo
 
 
 class NativeCsdPipelineTest(unittest.TestCase):
-    def start_device(self, directory, stack):
+    def start_device(self, directory, stack, read_diagnostics=False):
         cuda = os.environ.get("CEMU_NATIVE_QTEST_CUDA", "0") == "1"
         if cuda:
             kernel = ROOT / "tests/cemu/build/sparf_attention_devptr.so"
@@ -28,8 +31,13 @@ class NativeCsdPipelineTest(unittest.TestCase):
             kernel = Path(directory) / "sparf.so"
             subprocess.run(["c++", "-std=c++17", "-shared", "-fPIC", "-O2",
                             str(ROOT / "tests/cemu/kernel/sparf_attention.cc"), "-o", str(kernel)], check=True)
-        device = NativeQtest(directory, ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json",
-                             cuda=cuda)
+        self.timeline = Path(directory) / "device-timeline.jsonl"
+        with patch.dict(os.environ, {
+            "CEMU_SPARF_AUTONOMOUS_TIMELINE": str(self.timeline),
+            "CEMU_SPARF_READ_DIAGNOSTICS": str(int(read_diagnostics)),
+        }):
+            device = NativeQtest(directory, ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json",
+                                 cuda=cuda)
         stack.callback(device.close)
         self.device = device
         packet = str(kernel).encode() + b"\0sparf_attention\0"
@@ -44,7 +52,7 @@ class NativeCsdPipelineTest(unittest.TestCase):
 
     def test_native_nvme_fdm_mrs_attention_and_reset(self):
         with tempfile.TemporaryDirectory(prefix="native-csd-") as directory, ExitStack() as stack:
-            device, offsets = self.start_device(directory, stack)
+            device, offsets = self.start_device(directory, stack, read_diagnostics=True)
             self.call(0, 0x21, (0, 1, 0, 0, 0, 0), 3,
                       struct.pack("<IIQQQ", 1, 4096, 0, 0, 0), rejected=True)
             self.call(1, 1, (0, 0, 0, 0, 0, 0), 2, rejected=True)
@@ -66,6 +74,16 @@ class NativeCsdPipelineTest(unittest.TestCase):
             for tokens in (15, 17, 259):
                 store.append_batch(0, previous, keys[previous:tokens], values[previous:tokens])
                 previous = tokens
+                if tokens == 259:
+                    # Direct assembly no longer stalls on tiny raw rings. Wait
+                    # explicitly for 12 full blocks (2 batches x (2 K + 2 V +
+                    # 2 channel-K)); leave the last three tokens in DRAM.
+                    deadline = time.monotonic() + 5
+                    while store.statistics()["write_blocks"] != 12:
+                        self.assertLess(time.monotonic(), deadline)
+                        device.command("clock_step 1000000")
+                        time.sleep(0.001)
+                    self.assertGreater(store.statistics()["staged_pages"], 0)
                 for ratio in (1, 8):
                     top_k = math.ceil(tokens / ratio)
                     shaped_k = keys[:tokens].reshape(tokens, 2, 2, 128)
@@ -92,6 +110,30 @@ class NativeCsdPipelineTest(unittest.TestCase):
             self.assertEqual(stats["sealed"], 1)
             self.assertGreater(stats["write_bytes"], 0)
             self.assertGreater(stats["read_bytes"], 0)
+            records = [json.loads(line) for line in self.timeline.read_text().splitlines()]
+            completed = [record for record in records if record.get("event") == "complete"]
+            self.assertEqual(len(completed), 6)
+            submitted_bytes = 0
+            for record in completed:
+                self.assertTrue(record["success"])
+                self.assertEqual(len(record["reads"]), 3)
+                for read in record["reads"]:
+                    self.assertIn("io", read, "native production admission disabled read diagnostics")
+                    observation = read["io"]
+                    self.assertIn("full_scan", observation)
+                    self.assertIn("unique_flash_bytes", observation)
+                    self.assertEqual(sum(observation["lun_pages"]), observation["pages"])
+                    submitted_bytes += observation["submitted_bytes"]
+            self.assertEqual(submitted_bytes, stats["read_bytes"])
+            loss_path = Path(directory) / "read-loss.json"
+            analysis = subprocess.run([
+                sys.executable,
+                str(ROOT / "tests/cemu/instattention/experiments/analyze_sparf_autonomous.py"),
+                str(self.timeline), "--latest-session", "--require-read-diagnostics",
+                "--require-native-read-reference", "--read-loss-summary", str(loss_path),
+            ], capture_output=True, text=True)
+            self.assertEqual(analysis.returncode, 0, analysis.stdout + analysis.stderr)
+            self.assertTrue(loss_path.is_file())
             metadata = store.pack_workflow(layout, 0, tokens, 4, 16, top_k, 0,
                 approximate_runtime_ns=1000000000, exact_qk_runtime_ns=300000, pv_runtime_ns=1000)
             device.write(DATA, metadata)
@@ -173,6 +215,13 @@ class NativeCsdPipelineTest(unittest.TestCase):
             self.assertEqual(stats["failed"], 0)
             self.assertGreater(stats["read_bytes"], 0)
             self.assertGreater(stats["write_bytes"], 0)
+
+            records = [json.loads(line) for line in self.timeline.read_text().splitlines()]
+            completed = [record for record in records if record.get("event") == "complete"]
+            self.assertEqual(len(completed), 6)
+            for record in completed:
+                for read in record["reads"]:
+                    self.assertNotIn("io", read)
 
     def call(self, queue, opcode, fields, namespace, packet=None, rejected=False, **kwargs):
         if packet is not None:

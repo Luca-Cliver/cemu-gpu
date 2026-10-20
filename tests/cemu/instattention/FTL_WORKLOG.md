@@ -1403,3 +1403,298 @@ KV head 编号，两者不要混用。
 这轮没有使用真实 GPU、OPT-13B checkpoint 或现有实验系统盘，没有跑 Guest FDMFS 驱动
 和 CUDA 全流程，也没有重新测量论文规模性能。下一轮仍需在专用 native Guest 中验证
 OPT-125M/OPT-13B 的实际 GPU 路径，再做同配置性能对照；上述 326 项不能替代这一步。
+
+## 32. 2026-10-09 Guest 提交路径对齐 CEMU io_uring
+
+本轮只修改 Guest 客户端和测试，不修改 QEMU、linux-cemu、native FTL、SparF、runtime
+或 freezing。目标是沿用 `cemu_benchmark.cpp` 的 SQE128/CQE32、NVMe uring passthrough
+和完成事件分发机制，不是通过修改时间模型或消除设备资源排队来加速。
+
+- 新增 `guest/io_transport.{h,cpp}`：一个共享 depth-64 ring，由单个 C++ dispatcher
+  提交并收取 CQE；按请求地址分发完成，持有重复的文件描述符。
+  同步适配接口在 CQE 返回前持有原有缓冲区，dispatcher 借用这些缓冲区，不额外复制
+  一份暂存数据；若后续增加立即返回的底层 async API，必须另行管理 payload 所有权。
+  接受队列有界，完整处理短提交、负 errno、正 NVMe status 和 command result。
+  遇到调度器致命错误先阻止新提交，并等待已提交请求完成，再释放它们的缓冲区。
+- `CEMU_IO_BACKEND=uring` 显式选择；默认仍为 `ioctl`。缺少依赖或内核不支持时不
+  静默回退。CMake 可在旧 Host 上只构建 ioctl 后端。
+- 已接入 Execute、C++ 客户端 FDM 读写、native KV 命令和 dense staging 的
+  `copy_file_range`。管理操作仍用 ioctl；其他旧 Python pread/pwrite 未一并迁移。
+- CEMU 的 compute namespace 将 passthrough `metadata` 字段复用为 Execute `dlen`，
+  uring 打包保留该字段，不能当作标准 NVMe 的独立 metadata 指针拒绝。
+- 现有 Python worker、Future、槽位租约和依赖等待保留；同步 API 等待 dispatcher
+  的 promise。这是传输机制对齐，不声称已经将 runner 完全改成 benchmark 的 CQE
+  状态机，也不声称能提升性能或修复直通 GPU 的冻结时钟问题。
+
+验证情况：
+
+- `_cemu_client` 的 uring-enabled 与 ioctl-only 两种构建通过。Host 默认 liburing 2.0
+  和 NVMe UAPI 较旧；uring 构建在 `/tmp/cemu-uring-client` 使用现有
+  `/home/lihan/liburing` 和 linux-cemu 的 NVMe UAPI，没有安装或替换系统库。
+- 7 个相关 Python unittest 模块共 53 项通过：transport、native 客户端、KV staging、
+  SparF slot/grouped backend、native contracts、应用异步接口。
+- Host 5.15 在沙箱外也不支持 SQE128/CQE32（EINVAL），因此 Host CTest 明确 SKIP。
+- 使用现有 Guest 内核启动临时 TCG/initramfs VM，无系统盘、GPU 或现有模型；真实
+  io_uring 的 128 调用者并发读写、数据校验、短读/EOF、单个失败 CQE 后继续读写通过。
+  最终日志 `/tmp/cemu-uring-final-guest.log`，`CEMU_URING_GUEST_TEST_EXIT=0`。
+- 额外尝试在临时 TCG VM 挂载小型 native FEMU，启动在 NVMe probe 阶段报
+  `IO queues not created` / `cemu_dev_add` 空指针，尚未执行 transport 设备测试。
+  没有为此修改原生驱动；不能把普通文件 ring 测试当作 NVMe/FDM/OPT 全流程通过。
+  已提供 `test_io_transport --cemu HOST_VADD_LIBRARY` 供正常 native Guest 验证
+  INFO/status 和 ioctl/uring 的 FDM、MRS、Execute 结果。
+
+下一步：正常 native Guest 先跑 transport 测试和小型 OPT smoke，再用相同 ratio/config
+对照完整推理。命令见 README 的 Guest io_uring transport 小节。不要据此调整 FTL 或
+冻结机制，也不要把原有 functional PASS 等同于这条新传输路径已经验证。
+
+### 2026-10-10 Guest Python 3.13 transport 测试隔离修复
+
+Guest 的 5 项 transport unittest 出现 `namespace() has no copy_file_range` 和
+描述符 `3 != 42`。原因是测试 mock 了共享的 `importlib.import_module`，影响使用
+`pkgutil.resolve_name` 的字符串 patch 目标解析，后续 os.open 等 mock 没有安装到真实
+模块；不能将其解释为 NVMe/CQE 传输失败。修复仅替换 `cemu_io` 内的 importlib 引用，
+不修改全局导入器；增加目标解析隔离、设备 open 参数和返回描述符断言。
+
+Host Python 3.10 默认解析方式下 6 项通过；将 unittest 的目标解析改为
+`pkgutil.resolve_name` 后，旧代码复现相同 AttributeError，修复后 6 项通过。
+7 个相关模块共 54 项通过，diff 检查通过。没有在 Host 运行实际 Python 3.13，仍需
+Guest 重跑 `instattention-io-transport-test`，之后再验证完整推理。本次不改生产传输、
+设备代码、FTL 或时间模型，不需要因此重启 QEMU。
+
+### 2026-10-10 native INFO uring 拒绝与初始化失败清理
+
+Guest 普通文件 ring 测试通过后，全流程在第二次 native INFO（0xc2）返回
+`status=0x4002, core=1`，随后未打开的 Attention backend 被 writer.flush 调用，
+覆盖原始异常。代码审查发现 linux-cemu 的 nvme_uring_cmd_io 使用未初始化的局部
+nvme_command，且仅对 namespace 3 赋值 metadata；namespace 1 无独立 metadata 时
+会将未初始化字段传到设备。native 命令要求 mptr=0，因此存在确定的随机拒绝缺陷，
+与第一次 INFO 通过、下一次拒绝的现象吻合；仍需新内核 Guest 确认实际修复效果。
+
+- linux-cemu/drivers/nvme/host/ioctl.c：构造 uring 命令前整体清零，与 ioctl 路径一致；
+  保留 namespace 3 的 Execute metadata/dlen 语义，不放宽设备字段校验。
+- Prefill writer 仅 flush 已打开的 backend；无 is_open 属性的原有 backend 保持原行为。
+  增加初始化失败时保留原异常、成功打开时正常 flush 的回归测试。
+- 现有可选 C++ 设备测试将 INFO ioctl/uring 比较扩展为 128 次，普通文件测试不变。
+
+验证：相关 56 项 Python 测试通过；uring 客户端重编译通过；Guest 内核 ioctl.o
+目标编译通过；两个仓库 diff 检查通过。尚未重新链接 vmlinux 或重启实际 Guest。
+当前配置 CONFIG_NVME_CORE=y、CONFIG_BLK_DEV_NVME=y，必须重编译 vmlinux 并重启
+Guest 才能使用内核修复；无需重启宿主机或改动 GPU 绑定。重启后先只读重复 INFO，
+再执行完整 OPT 推理；不将本地单元测试宣称为 NVMe 设备验证通过。
+
+## 33. 独立冻结时钟探针（2026-10-10）
+
+后续核查：旧 `e2e_native.log` Guest Compute 均值约10.097ms，后端实际计算均值
+1761.232ms、目标9.949ms，证实旧实验曾排除实际计算。初始脚本有 KVM，`b98f78fc5`
+删除显式 KVM 参数，`b33871c78`（接入VFIO）再次启用KVM；历史实际启动命令/clocksource
+缺失，不能仅凭脚本断言旧实验使用TCG。核心 QEMU 时钟文件与初始版本无差异。
+
+对照探针增加同一次 Execute 的 Guest Python/C++ 三种 chrono 时钟、空区间开销及
+环境记录；启动脚本支持显式TCG/KVM、默认共同CPU型号qemu64、保存关键文件哈希。
+不修改冻结机制、FTL或运行预算。旧schema=1结果仍可分析；C++各时钟增长比单独输出，
+不因Python分类就宣称所有时钟一致。真实TCG/KVM结果需在宿主机分别运行，不能用
+本地单元测试或qtest替代。
+
+验证：8项探针单元测试通过；临时目录完整编译 `_cemu_client` 成功，本地20ms等待
+的 Python/C++ 四种计时读数一致，确认绑定可用（不是Guest冻结验证）；脚本语法、
+非法加速器/TCG-host参数拒绝、diff检查通过。当前执行环境无可用 `/dev/kvm`，
+未启动真实KVM/TCG Guest对照，未停止或改动现有虚拟机。
+
+Guest KVM/qemu64复测发现：Execute已经返回，随后旧 `read_range()` 构造 NumPy
+数组时触发 wheel 的 X86_V2 最低指令集检查，尚未完成对照采样。修复为新增
+`read_range_bytes()`（复用同一个C++范围校验/对齐/FDM读取，只改Python返回类型），
+时钟探针用stdlib struct解析bytes；保留旧数组接口，不改CPU型号或冻结机制。
+新增禁用NumPy导入的完整探针控制流回归（模拟设备），确认十次Execute、九次bytes
+读取；不把它当真实Guest硬件验证。
+
+后续同一KVM进程（PID1999578）实测，仅切Guest clocksource：目标100ms时，
+kvm-clock的0/200/1000ms实际等待对应Python中位数100.239/300.319/1100.197ms；
+HPET对应100.044/100.179/100.147ms。C++三种chrono时钟表现一致，两组功能区间
+QEMU虚拟增量均为0。HPET计数在hw/timer/hpet.c中基于QEMU_CLOCK_VIRTUAL。
+
+按用户确认，native-opt-guest-test.sh默认选择Guest HPET，加载模型前检查切换，
+在应用日志记录设置/最终时钟源，失败不回退。可显式指定kvm-clock诊断对照，但警告
+其计时语义。保留HPET到手工更改/重启；不修改Host时钟、原有启动脚本或冻结机制。
+直接Make/Python路径不自动改Guest时钟，完整推理及CUDA/异步行为仍需验证。
+
+目的：验证 Guest kvm-clock/perf_counter 是否包含 CEMU 功能执行冻结区间，不能从
+clocksource 名称或 wall 减模型预算直接下结论。原版 benchmark 使用 Guest 应用时钟，
+此测试先检查该计时前提，不修改目标 runtime、FTL、GPU 路径或 freezing。
+
+- 新增 Host CPU 算子 `kernel/freeze_clock_probe.c`：一个4KiB FDM MR，内部等待
+  0/200/1000ms，回传 Host CLOCK_MONOTONIC、请求ID和等待参数；目标预算始终100ms。
+- `experiments/freeze_clock_probe.py`：Guest 预热一次后执行九次，保存 perf_counter
+  Execute区间；结果读取不计入Execute。离线关联本次QEMU的功能执行及调度完成记录，
+  用Host增量、Guest增量、冻结内虚拟增量和设备虚拟区间联合判断，噪声/零预算返回不确定。
+- CEMU `compute.c/sched.c` 仅增加默认关闭的 `CEMU_COMPUTE_CLOCK_TRACE=1` 观测：
+  在冻结内采样virtual，解冻后输出日志；调度完成处输出received/start/finish virtual。
+  不改变进入/退出冻结代码，不额外推进时钟，不增减运行预算；日志会扰动未冻结区间，
+  不应用于正式性能结论。完成记录位于设备调度器，不是Guest返回。
+- Native模式原本拒绝普通Execute，初次隔离测试验证了该限制；不为探针放开native安全检查。
+  新增独立 `femu-scripts/run-freeze-clock-test.sh` 使用legacy FEMU、4GiB Guest RAM、
+  全新16MiB后端、8MiB FDM、系统盘overlay，不使用VFIO/CUDA，不修改原run-csd脚本。
+  必须先关闭使用backing image的VM，测试期间不得改写backing image。
+
+验证：6项Host单元测试通过，涵盖算子ABI/等待/非法输入和分析器的包含/排除/不确定/缺失/
+重复/预算异常；Host算子和QEMU编译通过；真实隔离legacy QEMU qtest验证0/20ms算子、
+FDM结果和成对双时钟日志通过（qtest时钟受手工驱动，不能证明KVM时钟结论）；脚本语法、
+diff检查通过。尚未运行真实KVM Guest探针，操作命令见README“冻结时钟独立验证”。
+
+## 34. Native Prefill APPEND 有界多在途（2026-10-13）
+
+本次只改变 Guest 提交与回收：不修改 QEMU、native FTL/tail、freezing、目标时间、
+128KiB传输上限或token组粒度。此前的多head命令仍然是提交一条、等一条；现在
+`CEMU_IO_BACKEND=uring` 下 Prefill 使用 `CEMU_NATIVE_APPEND_DEPTH`（默认8，1～64）。
+深度1保留原串行路径；ioctl、单token Decode、未声明批量APPEND能力的旧设备不改。
+
+- `guest/io_transport.cpp/.h`：新增持有payload和复制fd的异步NVMe handle，
+  submit返回handle而非等待CQE；wait-any通过条件变量等待任意就绪结果。共享ring的
+  dispatcher仍负责实际SQE提交和CQE回收，不改设备调度。Python等待期间释放GIL。
+- `native_kv_client.py`：新增只供批量APPEND使用的submit/wait-any接口，旧同步接口保留；
+  新API缺失时报错要求重编译绑定，不静默退回ioctl。
+- `native_kv_store.py`：将某层KV分为互不重叠的batch/head范围，有界填充在途窗口。
+  同一head前一包被接受后才能提交下一包，不依赖跨请求完成顺序；背压原包重试，
+  不推进accepted前缀。发生永久错误/超时时停止补充并收回所有在途请求后再使Future失败。
+  成功仅代表所有APPEND已接受，后台NAND写回仍由原final drain保证。
+- 统计新增 `client_append_queue_depth` / `client_append_peak_inflight`；后者只是
+  writer已提交未回收的handle峰值，不证明设备同时执行这么多命令。native worker仍串行。
+
+验证：41项Python测试通过（传输、native store、上层异步），覆盖乱序完成、窗口补充、
+多head payload、连续两次追加、背压不越序、提交/CQE错误收尾、超时、ioctl/depth1/Decode
+回归。含/不含liburing的C++绑定均编译成功；C++ handle就绪/状态测试执行，真实ring测试
+因本机io_uring_queue_init返回EPERM跳过。另尝试独立TCG/initramfs native Guest，150秒
+内未到测试入口，不能算设备验证通过；未使用现有系统盘/VFIO/GPU，未影响已有VM。
+新增Guest C++测试支持八请求窗口native INFO；真实APPEND及OPT-13B完整推理仍需Guest复测。
+命令见README“Native Prefill: multiple APPENDs in flight”，深度1/8对照必须使用新native会话，
+保持输入、ratio、时钟源、设备配置一致；性能变化不等价于模拟精度改进。
+
+## 2026-10-13：native 读取损失诊断与同状态全量参照
+
+目的：拆分 B4/P1024/D16 的 Flash 读取量，而非先改变布局获得更好的结果。
+本次不改映射规则、NAND 时间预算、调度、freezing 或 Guest NVMe ABI。
+
+- native storage 回调将可选 `FemuReadObservation` 传入完整阶段 gather 和批量内部读取。
+  使用现有页执行结果的物理 channel/LUN、deadline 与 `pg_rd_lat` 统计服务/排队；
+  同一阶段跨多个 batch 保留计数，仍使用原来的最大完成时间，不重复调用 NAND 调度。
+- gather 在已有 buffer 锁保护下计算每个 KV head 的全量 committed 页数与 tail 字节，
+  包含终端部分页。`full_scan` 仅计数，不额外读取或改变发布状态。三个阶段各自取快照，
+  dense K/V 参照只累计 token-K/token-V，Channel-K 的额外扫描单独扣除。
+- 同时记录按页对齐前后去重量，以及页内区间并集 `unique_flash_bytes`，避免 GQA
+  多 query-head 重复引用同一 KV head 导致页利用率失真。tail 命中不记为 Flash IO。
+- 分析器新增 native 参照验证、分阶段 channel/LUN 页分布、页利用率/读放大，以及
+  `kv_saved_bytes`、`channel_k_flash_bytes`、`net_saved_bytes`（允许负数）。没有诊断或
+  部分请求缺参照时明确标记 missing，不补零，不把全量参照当作 dense 实测耗时。
+- 启动脚本不再硬编码关闭读取诊断；设置 `CEMU_SPARF_READ_DIAGNOSTICS=1` 时要求
+  `CEMU_NATIVE_TIMELINE=1`，输出并保存实际开关值。默认仍关闭，避免污染常规性能测量。
+
+验证：QEMU 编译通过；61 项测试通过，包含实际 native FTL/backend 适配器、Attention
+工作流、旧 grouped 路径、分析器和 CLI。新增用例覆盖 tail-only、混合命中、GQA 去重、
+末尾部分页、跨 batch LUN 排队、负净收益及缺字段拒绝；开关前后输出、目标预算、实际
+读取字节数一致，参照统计不产生额外 IO。启动开关校验和 `git diff --check` 通过。
+这些是 Host 上受控时钟/临时 backend 测试，尚未替代真实 Guest OPT-13B 完整复测。
+已有 QEMU 需正常重启后开启诊断再运行原配置；步骤见 README 的“Native 读取收益与页/LUN 排队诊断”。
+
+### 2026-10-13：修复 native 实际提交入口遗漏诊断开关
+
+Guest 分析器报告 `read diagnostics missing` 后发现，`sparf_submit_autonomous()`
+仍用 `group_session && enabled` 初始化 trace；native 只绑定 `native_attention`，
+因此即使启动脚本传入开关也不会采集或输出读取诊断。前面的单元 fixture 手动开启
+trace，未覆盖这一实际入口。现改为 grouped 或 native 任一路径均遵循诊断开关，
+不改执行预算、布局、调度或 freezing。
+
+在 `test_native_csd_pipeline.py` 增加实际 QEMU NVMe→native Attention→JSONL→分析器
+回归：开启时六个请求均含三阶段 IO/full_scan/unique_flash_bytes，LUN 页计数与总页数
+相等，日志累计实际读取字节与设备统计一致，严格分析器生成 read-loss 汇总；关闭时
+正常完成小 OPT Prefill/Decode 且不输出 IO 字段。旧二进制已复现字段缺失失败；修复后
+QEMU 编译通过，两个 qtest 与 22 个分析器测试全部通过。测试不使用 GPU 或现有 Guest。
+旧日志无法事后补齐未采集的统计；需要正常停止旧 QEMU，以新二进制和诊断开关重启，
+再运行真实 Guest 测试。完整 OPT-13B/CUDA 尚待用户复测。
+
+
+### 2026-10-16：native 一页一组、按物理块聚合下放
+
+用户要求把原来的组就绪即写改为：页级 group 在设备 DRAM 聚合为完整 block 再下放，
+并继续按 head/token/channel 寻址读回。本次保留地址/PPA 目录及页内字节布局，重写
+`instattention_buffer.c` 的缓冲与写回状态，未把旧 grouped/FDM 后端混入 native。
+
+- token-K/V 的组为一页；channel-K 的每个 `(token span, channel stripe)` 也是独立一页。
+  为兼容现有几何 ABI，`channel_group_pages` 名称保留，解释为同跨度的页组数量。
+- raw rings → 有界 DRAM 页池 → 按 batch/layer/layout/NAND-channel 隔离的块队列。
+  不同 head 的页可以填同一个物理块，队列与 mapping 的分配域一致。
+  达到 `pgs_per_blk` 后提交整块，内部可按 1–256 页拆调用；目标起点一致，等待最大 deadline。
+- `packed[3]` 控制 raw ring 复用，`committed[3]` 保留为 NAND 完成的连续 token 前缀。
+  页池目录在目标完成前保留，读请求按页判断 raw ring / staged page / NAND，支持乱序完成。
+  `gather`、生产 Attention `gather_phase` 和只计数的 full-scan 参照均按真实页状态更新。
+- 页池预留各物理分配域可能的残块，加一个完整 head token span 的组页余量；注册预算不足
+  返回 LIMIT，不能在 APPEND 中永久 PENDING。OPT-13B b4-p1024-d16 两端启动预算同步改为 6 GiB。
+- terminal drain 才允许残页补零/残块刷出。底层仍是 page program，不是新增 NAND block-program
+  命令；没有新增 GC、擦除回收、DRAM 重排或 DMA 时延模型，也没有据此证明写放大为 1。
+- INFO 的 112/120 字节追加 block 页数和策略版本；STATUS 的 88 字节起追加 packed[3]、
+  staged pages、完整块/残块完成计数、待提交完整块数，Python statistics 同步解析。
+
+验证：QEMU 编译通过；39 项地址/映射/IO/客户端/生产适配器/Attention 测试通过。
+新增 C 场景验证未满块零 NAND 写、16 heads 的 16 页落入同一物理块、batch_pages=1、
+冻结 deadline 期间从 DRAM 读、channel 页横跨两块且前半已落盘/后半仍暂存、低预算拒绝。
+9 项实际 QEMU qtest（含 native NVMe/FDM/MRS/SparF）通过，另 1 项小型合成 OPT
+Prefill/Decode 全链路 qtest 通过。测试用临时镜像、CPU 算子，不使用现有 VM/GPU。
+本地 Unix socket 在沙箱内受限，qtest 经允许后在沙箱外运行；Host Python 扩展单独编译到
+`/tmp/cemu-page-block-client`，没有覆盖 Guest 的 Python 3.13 构建产物。
+真实 Guest OPT-13B/CUDA 尚未重跑；新实现需重启 QEMU，旧实验日志不能视为本策略结果。
+
+
+### 2026-10-16：APPEND 直接组装最终布局页，移除两层写入中转
+
+在上述块聚合版本基础上，按用户要求将 wire → raw ring → 最终布局页 改为 wire → 最终布局页。
+
+- 删除 NativeKvHeadState.packed/queued、raw K/V rings、组页任务队列、enqueue_ready 和
+  pack_ready_span。`native_kv_buffer_append_batch()` 在锁内先检查整包 head 前缀、reader，
+  并用 `append_layout(..., NULL)` 计算所需新页。空间不足直接 PENDING，所有页和 head 均不变；
+  足够时第二遍直接填 token-K、channel-K、token-V 页，整包可见后返回。
+- 页在第一次追加时分配并清零，每次只写新增 token。channel-K 在接收路径直接写入
+  `[channels_per_page][token_capacity]`，不保留原始 K 副本。未满页也在页目录中可读；页满后
+  `enqueue_page()` 入块队列。worker 只负责满块下放、目标 deadline 和页回收。
+- 页池预留各物理分配域残块、各 head 未满页及最大整包追加余量。没有可提交块时仍可容纳
+  下一合法 APPEND；空间不足时已有满块/在途块能释放空间。注册不足仍返回 LIMIT。
+- `cemu_kv_io_write()` 删除写 scratch memcpy，直接把不可变页指针交给同步 transfer。
+  明确 transfer 不修改写入源、不保留指针的契约；IO 测试验证原指针直达回调及返回后源复用。
+  读取 scratch 保留，用于隔离失败的 backend 读取，防止部分失败污染调用者输出。
+- DRAM gather 可按连续页片段一次 memcpy，免去逐 token 查页/复制；tail_copies 现在计实际
+  DRAM 片段复制次数，tail_bytes 仍为设备 DRAM 命中字节。STATUS packed[3] 保留字段兼容，
+  三者均等于 accepted；INFO 策略版本由 1 改为 2，NVMe 命令 ABI 版本不变。
+- 完整块下放、显式 drain 才允许残块、NAND 时间模型及 PPA 寻址保留。布局重排从后台前移到
+  APPEND 内，ACK 前的软件耗时和背压时机可能变化，不能把少了 memcpy 直接等同于已测得加速。
+
+验证：QEMU 构建及 git diff --check 通过；39 项地址/映射/IO/客户端/Attention Host 回归通过。
+新增真实容量背压测试：冻结 NAND 时钟，16 heads 非页对齐追加直至页池耗尽，验证 pending
+不改数据、不分配页、不推进任何 head；推进时间后同包重试成功，立即重用输入缓冲，drain 后
+逐 token 校验三种布局。既有测试覆盖部分页、跨页/跨 channel group、跨块、lease、写失败及取消。
+8 项 NVMe qtest、1 项 NVMe/FDM/MRS/SparF 诊断 qtest、1 项小型合成 OPT Prefill/Decode qtest
+最终均通过。诊断用例原先依赖小 ring 背压隐式等待写回；直接组页后该等待不再存在，现显式
+等待预期 12 个完整块完成，再验证 NAND 读取，末尾 3 token 继续从 DRAM 读取。
+测试只使用临时镜像及 CPU；没有运行真实 Guest OPT-13B/CUDA 性能测试，没有改变计时模型。
+当前 native buffer 预算保持原脚本 6 GiB；真实 session 需重启 QEMU 才能使用新实现。
+
+### 2026-10-17：块写回接入原生 poller 完成队列
+
+修复 writer 提交一块后等待其最大 NAND deadline、再提交下一块的人工串行化。
+保持直接组页、物理分配域和 page program 模型，改变完成事件的组织方式：
+
+- `buffer_worker()` 提交块内各批页面，计算原有最大 ready_ns，然后通过
+  `nvme_submit_internal_completion()` 把内部 NvmeRequest 放入现有 `to_poller[1]`。
+  writer 随即继续选择后续块，不等前一块 NAND deadline；队列满或事件池耗尽仍可背压。
+- `nvme_process_cq_cpl()` 使用现有优先队列及 `clock_ns()` 到期检查，内部请求到期调用
+  `complete_writeback()`；不访问 Guest SQ/CQ，不发送 CQE，不占 CU 或添加 PCIe 时间。
+  普通 Guest 请求路径不变，未修改 freezing、目标时钟或 NAND 参数。
+- 每个在途块独立持有不可变页链；完成前 DRAM 目录保持可读，完成后删除目录项、推进
+  committed 连续前缀并回收页。乱序完成不会误回收其他块，也不会越过未完成前缀。
+- 有界完成事件池计入内存预算。STATUS offset 144/152 增加 inflight_blocks 和
+  peak_inflight_blocks，Python statistics 同步解析；数值包含准备提交的块。
+- stop/reset 先停止 writer，再从原生 ring/pq 取消该 buffer 的事件，最后释放内存。
+  取消不推进 committed、不计成功完成，不需要推进冻结的虚拟时钟。
+
+验证覆盖：不同 channel 的四块同时在途；快 channel 先完成、慢 channel 保留 DRAM；
+同一 LUN 的后续块继续排队；目标时刻前不回收，目标时刻后页复用；部分组、drain、
+失败及停止路径；实际 QEMU 内部事件不产生 Guest CQE，reset 可取消未到期事件。
+生产 QEMU 构建通过；Host 定向回归与真实 QEMU qtest 通过（临时镜像、CPU 算子，
+含小型合成 OPT Prefill/Decode 与 NumPy Attention 对照）。未执行真实 OPT-13B/CUDA
+性能测试，不能据此声称已测得加速或论文时间对齐；需重启 QEMU 后复测完整流程。

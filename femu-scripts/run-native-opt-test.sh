@@ -14,7 +14,13 @@ parent=${CEMU_NATIVE_TEST_PARENT:-/data/lihan/cemu-native-opt}
 config=$repo/tests/cemu/instattention/experiments/configs/native_opt125m_smoke.json
 csd_target=${CEMU_NATIVE_CSD_TARGET:-cpu}
 timeline=${CEMU_NATIVE_TIMELINE:-0}
+read_diagnostics=${CEMU_SPARF_READ_DIAGNOSTICS:-0}
+device_init_order=${CEMU_DEVICE_INIT_ORDER:-vfio-first}
 vcpus=${CEMU_NATIVE_VCPUS:-4}
+if [[ "$device_init_order" != vfio-first && "$device_init_order" != femu-first ]]; then
+    echo 'CEMU_DEVICE_INIT_ORDER must be vfio-first or femu-first.' >&2
+    exit 1
+fi
 if ! [[ "$vcpus" =~ ^[1-9][0-9]*$ ]]; then
     echo 'CEMU_NATIVE_VCPUS must be a positive integer.' >&2
     exit 1
@@ -48,6 +54,14 @@ if [[ "$timeline" != 0 && "$timeline" != 1 ]]; then
     echo 'CEMU_NATIVE_TIMELINE must be 0 or 1.' >&2
     exit 1
 fi
+if [[ "$read_diagnostics" != 0 && "$read_diagnostics" != 1 ]]; then
+    echo 'CEMU_SPARF_READ_DIAGNOSTICS must be 0 or 1.' >&2
+    exit 1
+fi
+if [[ "$read_diagnostics" == 1 && "$timeline" != 1 ]]; then
+    echo 'Read diagnostics require CEMU_NATIVE_TIMELINE=1.' >&2
+    exit 1
+fi
 model=${1:-OPT-125M}
 boot_mode=${CEMU_NATIVE_BOOT_MODE:-rescue}
 os_image=${CEMU_NATIVE_OS_IMAGE:-}
@@ -77,7 +91,8 @@ case "$profile" in
             exit 1
         fi
         config=$repo/femu-scripts/cemu_config_opt13b_sparf_engines2.json
-        buffer_budget=1073741824
+        # Raw rings plus bounded page staging for block-level native writeback.
+        buffer_budget=6442450944
         page_limit=2097152
         ;;
     *) echo 'CEMU_NATIVE_PROFILE must be smoke or b4-p1024-d16.' >&2; exit 1 ;;
@@ -128,7 +143,8 @@ if [[ "$timeline" == 1 ]]; then
 fi
 printf '%s\n' "csd_target=$csd_target" "program=$operator" "profile=$profile" \
     "guest_memory=$memory" "guest_vcpus=$vcpus" "native_buffer_budget=$buffer_budget" "native_page_limit=$page_limit" \
-    "timeline=$timeline_path" "cuda_library_path=${CEMU_CUDA_LIBRARY_PATH:-}" \
+    "timeline=$timeline_path" "read_diagnostics=$read_diagnostics" "device_init_order=$device_init_order" \
+    "cuda_library_path=${CEMU_CUDA_LIBRARY_PATH:-}" \
     "${cuda_env[@]}" > "$directory/guest-logs/launch-settings.txt"
 models=$(readlink -f -- "$models")
 if [[ -n "$os_image" ]]; then
@@ -148,6 +164,8 @@ if [[ "$csd_target" == cuda ]]; then
     printf 'CSD Host GPU: CUDA_VISIBLE_DEVICES=%s, local CUDA ordinal=0 (not the Guest GPU).\n' "$CUDA_VISIBLE_DEVICES"
 fi
 printf 'Device timeline: %s\n' "${timeline_path:-disabled}"
+printf 'Native read diagnostics: %s (page/LUN counters; full-scan reference issues no IO).\n' "$read_diagnostics"
+printf 'Device initialization order: %s\n' "$device_init_order"
 echo 'Stop any VM using the OS backing image or this VFIO GPU before starting.'
 if [[ "$boot_mode" == normal ]]; then
     echo 'Normal systemd/login boot; use only the updated native-aware cemu-mount.sh. SSH: localhost:2222.'
@@ -158,16 +176,25 @@ echo 'Do NOT format or mount native NVM as a filesystem.'
 echo 'Guest setup and OPT command: tests/cemu/instattention/README.md, Native Guest OPT-125M section.'
 echo 'Shutdown: poweroff in normal mode; sync; /sbin/poweroff -f in rescue mode. Each launch creates a fresh native NVM session.'
 
+femu_device="femu,ftl_mode=instattention,config_file=$config,nvm_backend_file=$directory/nvm.img,native_kv_buffer_budget=$buffer_budget,native_kv_page_limit=$page_limit"
+vfio_device="vfio-pci,host=$gpu,id=guestgpu0"
+early_device=$vfio_device
+late_device=$femu_device
+if [[ "$device_init_order" == femu-first ]]; then
+    early_device=$femu_device
+    late_device=$vfio_device
+fi
+
 cd "$repo/tests/cemu"
 env "${cuda_env[@]}" CEMU_COMPUTE_LOG=progress CEMU_COMPUTE_LOG_INTERVAL=1000 \
-    CEMU_SPARF_AUTONOMOUS_TIMELINE="$timeline_path" CEMU_SPARF_READ_DIAGNOSTICS=0 \
+    CEMU_SPARF_AUTONOMOUS_TIMELINE="$timeline_path" CEMU_SPARF_READ_DIAGNOSTICS="$read_diagnostics" \
     "$qemu" -name "CEMU-native-$model-smoke" \
     -machine q35,accel=kvm -global q35-pcihost.pci-hole64-size=256G \
     -cpu host -smp "$vcpus" -m "$memory" \
-    -device "vfio-pci,host=$gpu,id=guestgpu0" \
+    -device "$early_device" \
     -kernel "$kernel" -initrd "$initrd" \
     -drive "file=$os_image,if=virtio,format=qcow2" \
-    -device "femu,ftl_mode=instattention,config_file=$config,nvm_backend_file=$directory/nvm.img,native_kv_buffer_budget=$buffer_budget,native_kv_page_limit=$page_limit" \
+    -device "$late_device" \
     -append "root=LABEL=rootfs console=ttyS0 ${boot_args[*]} cemu_native_opt_smoke=1 cemu_native_model=$model cemu_native_profile=$profile cemu_native_csd_target=$csd_target" \
     -nographic "${network_args[@]}" \
     -fsdev "local,path=$repo,security_model=none,readonly=on,id=cemusrc" \

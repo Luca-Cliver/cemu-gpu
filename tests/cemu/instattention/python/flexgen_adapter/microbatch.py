@@ -173,7 +173,8 @@ class FlexGenMicrobatchKvWriter:
         for request in requests:
             request.result()
         for backend in self.backends:
-            backend.flush()
+            if getattr(backend, "is_open", True):
+                backend.flush()
 
     def close(self) -> None:
         try:

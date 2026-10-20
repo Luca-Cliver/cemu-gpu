@@ -308,6 +308,7 @@ static void job_finish(ComputeEngine *ce, CsfScheduler *scheduler,
     req->stat.exec.runtime += job->runtime;
     req->cqe.n.rsvd += req->stat.exec.queueing_time;
     if (job->sparf_trace_command) sparf_trace_job_finish(job);
+    compute_clock_trace_finish(job);
 
     // job group statistics
     if (!job_is_indirect(job)) {

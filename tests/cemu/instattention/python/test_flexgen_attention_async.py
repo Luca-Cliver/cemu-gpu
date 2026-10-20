@@ -334,6 +334,29 @@ class FlexGenAttentionAsyncTest(unittest.TestCase):
         np.testing.assert_array_equal(backend.calls[0][1], keys)
         np.testing.assert_array_equal(backend.calls[0][2], values)
 
+    def test_microbatch_writer_preserves_backend_open_failure(self):
+        backend = BlockingPrefillBackend(self.layout)
+        backend.is_open = False
+
+        def flush():
+            self.fail("unopened backend must not be flushed")
+
+        backend.flush = flush
+        writer = FlexGenMicrobatchKvWriter((backend,))
+        with self.assertRaisesRegex(RuntimeError, "native INFO failed"):
+            with writer:
+                raise RuntimeError("native INFO failed")
+        self.assertIsNone(writer._executor)
+
+    def test_microbatch_writer_flushes_open_backend(self):
+        backend = BlockingPrefillBackend(self.layout)
+        backend.is_open = True
+        flushed = []
+        backend.flush = lambda: flushed.append(True)
+        with FlexGenMicrobatchKvWriter((backend,)):
+            pass
+        self.assertEqual(flushed, [True])
+
     def _new_backend(self):
         return FlexGenAttentionBackend(
             layout=self.layout,

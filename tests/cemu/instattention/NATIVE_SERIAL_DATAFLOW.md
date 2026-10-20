@@ -31,7 +31,7 @@
 
 1. Host 启动 QEMU，建立 native NVM 的 mapping、backend、tail 管理器和工作线程；Guest GPU 通过 VFIO 提供给 Guest。选用 CUDA CSD 时，Host 计算使用另外配置的 CSD GPU。
 2. Guest 脚本运行 `test_opt_cemu_pipeline.py`，主线开关为 `--functional --attention-mode sparf --sparf-native --sparf-autonomous`；脚本设置 `batch-size == gpu-batch-size`、`--attention-slots 2`。
-3. `NativeKvStore.open()` 通过 `/dev/ng0n1` 查询 INFO：确认设备身份、容量、计算支持和 APPEND 最大 payload。随后 BUFFER_REGISTER 发送任务/代际和 B/L/H/d、最大 token 数、dtype、页/分组几何、buffer 预算及后台 batch 页数。Host 据此建立每个 stream 的 ring 和前缀状态；各层共享这个 store。
+3. `NativeKvStore.open()` 通过 `/dev/ng0n1` 查询 INFO：确认设备身份、容量、计算支持和 APPEND 最大 payload。随后 BUFFER_REGISTER 发送任务/代际和 B/L/H/d、最大 token 数、dtype、页/分组几何、buffer 预算及后台 batch 页数。Host 据此建立共享的最终布局页池和每个 stream 的前缀状态；各层共享这个 store。
 4. 每个 Attention slot 的 `CemuDevice.open()` 打开 compute/control 设备，加载并激活 CPU 或 CUDA 功能程序，创建 11 个 FDM 文件及 MRS。文件按最大 T/k 容量分配，对齐后注册，不是每次 Attention 重新分配历史 KV。
 5. `CemuClient.create_memory_ranges()` → Guest `cemu_create_mrs()` → `fdmfs_get_memory_range()`，把文件对应的 FDM 起点/长度交给设备。之后 Execute 使用 program ID、MRS ID 找到这些范围。
 6. 预载权重，进入 `run_functional_pipeline()`。这时建立好的只是 KV 容器；prompt KV 由随后 Prefill 产生并追加。
@@ -93,7 +93,7 @@ Guest GPU K/V
   → ioctl(/dev/ng0n1, BUFFER_APPEND_BATCH, 坐标与 token/head 数)
   → QEMU NVMe SQ → bb_native_submit → native_worker → native_execute
   → PRP 数据读入 Host wire buffer → native_kv_buffer_append_batch
-  → 检查这一包所有 head 的前缀、reader 和容量 → 复制进原始 K/V ring
+  → 检查这一包所有 head 的前缀、reader 和容量 → 直接填入三种最终布局的 DRAM 页
   → accepted 前缀前进 → CQ 完成 → Guest ioctl 返回
 ```
 
@@ -103,11 +103,11 @@ FP16、`d=128` 时，一个 token/head 的 K+V 是 512 B。128 KiB 上限下，P
 
 命令字段定义见 [native_kv.h](../../../include/hw/femu/native_kv.h)：CDW10 为版本/本包 token 数，CDW11/12 为 task/generation，CDW13 为 batch/layer，CDW14 为 first-head/head-count，CDW15 为首 token。Guest `LinuxTransport.__call__()` 将 payload 放入普通 Guest 内存，构造带 addr/data_len 的 passthrough 结构；Guest NVMe 驱动将其映射成 PRP。这里的 PRP 是 Guest 内存地址描述，不是 Guest GPU 显存的 P2P 映射。
 
-Host 在 buffer 锁内先检查**整包全部 head**，全部可写才复制并推进 accepted；任何 head 有 reader、K/V ring 剩余容量不足，就整包返回 pending，不推进其中一部分 head。Guest 等待 100 μs 后重试，当前背压总超时为 120 s。一次 `append_batch()` 可以由多个命令组成，整个 Python 调用不是跨命令事务；后续命令失败时会把 session 标为失败，不回滚此前已接收的包。
+Host 在 buffer 锁内先检查**整包全部 head**，全部可写才复制并推进 accepted；任何 head 有 reader、整包所需新页超过页池空闲容量，就整包返回 pending，不推进其中一部分 head。Guest 等待 100 μs 后重试，当前背压总超时为 120 s。一次 `append_batch()` 可以由多个命令组成，整个 Python 调用不是跨命令事务；后续命令失败时会把 session 标为失败，不回滚此前已接收的包。
 
 旧设备不报告批量能力或请求上限为 0 时，才回退到 `BUFFER_APPEND=0xCD`：stream 外层、8-token tile 内层，每包补齐 4 KiB，Decode 也每 head 一包。**旧版的固定 4 KiB 命令数不能继续描述当前默认路径。**
 
-成功 APPEND 的 CQ 路径会加传输目标延迟，但不等待后台 NAND 写完；buffer 预算和 ring 容量也不会因为 wire payload 从 4 KiB 增大到 128 KiB 而自动放大。统计时成功命令和重试必须分开。
+成功 APPEND 的 CQ 路径会加传输目标延迟，但不等待后台 NAND 写完；buffer 预算和页池容量也不会因为 wire payload 从 4 KiB 增大到 128 KiB 而自动放大。统计时成功命令和重试必须分开。
 
 adapter 的 stream 编号通过 `_coordinate()` 转成 `(batch,layer,head)`；设备内部再使用自身的 stream 展平方式。不要把 Guest 的线性 stream ID 直接当 PPA 或 Host 数组下标。
 
@@ -143,17 +143,17 @@ adapter 的 stream 编号通过 `_coordinate()` 转成 `(batch,layer,head)`；�
 
 Host 从 SQ 取命令时记录 `stime=clock_ns()`，进入 native worker。Host 根据注册的 d/元素大小及命令里的 token/head 数计算 `transfer_bytes=2*count*heads*d*element_bytes`，验证上限/MDTS，再用 `dma_write_prp()` 将 payload 拷入临时 wire buffer。随后才进入 tail 检查和 memcpy。
 
-tail 是每个 stream 的环形数组。`accepted=1024` 表示 `[0,1024)` 已接收，下一个合法追加位置为 1024；它不是最后一个 token 的下标。追加一个 token 后变为 1025。FP16/d128/C8 几何下 K ring 容量 512 token、V ring 容量 32 token，写入地址分别按 `token % 512` / `token % 32` 取槽，但只有旧数据已安全写回才允许覆盖。
+当前 tail 由最终布局的 DRAM 页组成，原始 K/V ring 已移除。`accepted=1024` 表示
+`[0,1024)` 的三种布局均已填入设备页，下一个合法 token 是 1024。
 
-容量检查实际上是：
+APPEND 在 buffer 锁内先验证所有 head 的 accepted、reader 状态，并通过 `append_layout(..., NULL)`
+统计整包新增页需求。只有 `needed <= free_pages` 才执行第二遍 `append_layout(..., input)`，
+直接填 token-K、channel-K、token-V 页，再推进所有 head 的 accepted。空间不足整包 PENDING，
+不分配页、不改旧页、不推进任意 head；前缀不匹配则报错。
 
-```text
-K 占用 = accepted - min(token_K_committed, channel_K_committed)
-V 占用 = accepted - token_V_committed
-新增 count 必须同时不超过 K、V 的剩余容量，且 readers == 0
-```
-
-前缀不匹配是错误，不会用 pending 无限重试；reader 占用或容量不足才返回 pending。整包任一 head 不满足条件，所有 head 都不复制到 tail。全部通过后，Host 逐 head/token 将包内 K/V 复制到各自 ring、推进 accepted、把可写组放入 ready 队列并唤醒后台 worker。
+部分页从分配时就存在于页目录并清零，后续 APPEND 按 token 偏移继续填入；完整页通过
+`enqueue_page()` 挂到目标分配域的块队列，后台只负责满块写入。`packed[3]` 仅作为兼容统计
+字段保留，均等于 accepted，不再存在后台组页进度。
 
 **pending 也已经发生一次 Guest→Host wire buffer 的 payload 拷贝**，因为容量检查在 PRP 取数之后。client 对 `status=0xC,result=5` 等待请求的 100 μs 再重新 ioctl；实际恢复受调度影响，并非保证精确 100 μs。单 ioctl 设置 10 s timeout，单包 pending 重试循环的期限是 120 s。当前 pending 将 `data_size/pcie_lat` 设为 0，没有按这些已执行的拷贝计入成功包的 PCIe 目标模型。
 
@@ -167,27 +167,31 @@ request.expire = rx_next + propagation_delay
 
 实际还要等 native worker 把请求送到 poller、当前虚拟时间达到 expire、Guest CQ 有空间，才发布完成项。**不是在 tail memcpy 完成后再额外睡完整 trans 时间**；若功能处理耗时已经跨过目标 deadline，poller 不会重新补等同样的时间。Guest 随后处理 CQ，内核同步调用返回 status/result，client 才推进本地 `_accepted`。
 
-因此成功保证本包已被接收，可通过设备 Flash/tail 组合路径读取；不保证“此时仍全部只在 tail”，因为后台可能已经写回部分数据，也不保证三种 NAND 布局都完成。传输命令分包不决定 NAND 页分组：20 KiB APPEND 的 40 份 K/V 分散进 40 个 stream ring，各自按 token/channel 组条件写回，不是直接 program 五个连续页。
+因此成功保证本包已被接收，可通过设备 Flash/tail 组合路径读取；不保证“此时仍全部只在 tail”，因为后台可能已经写回部分数据，也不保证三种 NAND 布局都完成。传输命令分包不决定 NAND 页分组：20 KiB APPEND 的 40 份 K/V 直接填入各自的 token/channel 布局页，页满后等待块聚合，不是直接 program 五个连续页。
 
 4 个包不是一个事务：若包 0/1 成功、包 2 pending，只重试包 2，包 3 尚未发送；若包 2 最终报错，前两个包不会回滚，session 标为失败。四包全成功后，adapter 才更新这一层全部 batch 的 V mean，然后继续 Attention。不能把一个单包 CQ 成功理解为本层全部 160 heads 都已完成追加。
 
 ### 设备后台如何变成三种页
 
-每个 stream 有一个 K ring、一个 V ring。K ring 同时供 token-K 与 channel-K 写回使用，回收进度受两者较慢的一方限制。
+`native_kv_buffer_append_batch()` 在接收阶段调用 `append_layout()`，从 wire buffer 直接生成最终布局：
 
-以 4 KiB 页、FP16、`d=128`、`channels_per_page=8` 为例：
-
-| 持久布局 | 一个页/组保存什么 | raw tail 的容量 |
+| 布局 | 4 KiB、FP16、d=128、C=8 时的页内数据 | APPEND 如何填入 |
 |---|---|---|
-| token-K | 每页 16 个 token，每 token 完整 128 维 | K ring 512 token，供两种 K 布局共享 |
-| channel-K | 每页 8 维 × 256 token；完整 128 维需 16 页一组 | 同上；后台 pack 时转成维度连续的布局 |
-| token-V | 每页 16 个 token，每 token 完整 128 维 | V ring 32 token |
+| token-K | `[16 tokens][128 channels]` | 按行复制 K，跨页时分段 |
+| channel-K | `[8 channels][256 tokens]`，128 维共 16 个独立页组 | 直接将 wire 中的 K 元素写到 channel-major 位置 |
+| token-V | `[16 tokens][128 channels]` | 按行复制 V，跨页时分段 |
 
-`buffer_worker()` 的过程：ready 队列 → `pack_batch()` 复制/转置/补零 → `bb_native_kv_batch(write)` → mapping/PPA → backend 写真实字节并安排 NAND 目标时间 → 等目标 deadline → 分别推进三类 `committed` 前缀 → 允许旧 ring 位置复用。
+每次只填本包新增 token。未满页保持可读；页满后入块队列。`buffer_worker()` 不再复制/转置，
+只按 `(batch, layer, kind, NAND channel)` 选出达到 `pages_per_block` 的队列，取一块页，
+调用 `bb_native_kv_batch(write)` → mapping/PPA → backend 写字节及 NAND 目标调度 → 等整块
+最大 deadline → 释放页并推进三类连续 committed 前缀。
 
-`batch_pages` 是批次上限，并不保证每次都有这么多页。这个 worker 等当前批次目标完成后才发布并处理下一批。APPEND 接收完成、backend 字节已写、目标 NAND 完成、committed 发布是不同事件。
+正常写入要求整块就绪，底层逐页 program；terminal drain 封口未满页并允许残块下放。
+页池预算覆盖各域残块、各 head 部分页和最大整包追加余量，避免无法凑块却持续 PENDING。
 
-PPA 分配入口为 [instattention_mapping.c](../../../hw/femu/bbssd/instattention_mapping.c) 的 `cemu_kv_map_reserve()`；页 I/O 为 [instattention_io.c](../../../hw/femu/bbssd/instattention_io.c)。`cemu_kv_io_write()` 先 reserve 页、复制到 I/O scratch，调用 schedule 安排 NAND 目标 deadline，再把字节写 backend、登记写结果；buffer worker 等 deadline 到达后才发布 committed。读写共享 NAND/LUN 调度状态，读已写页还会遵守其写完成依赖。
+`batch_pages` 是内部调用的页数上限，可以小于 channel 页组数量或物理块页数。一个完整块可拆成多次调用，使用同一提交起点；worker 等当前块所有页的最大目标完成时间后才发布并处理后续工作。APPEND 接收完成、backend 字节已写、目标 NAND 完成、committed 发布是不同事件。
+
+PPA 分配入口为 [instattention_mapping.c](../../../hw/femu/bbssd/instattention_mapping.c) 的 `cemu_kv_map_reserve()`；页 I/O 为 [instattention_io.c](../../../hw/femu/bbssd/instattention_io.c)。`cemu_kv_io_write()` 先 reserve 页，调用 schedule 安排 NAND 目标 deadline，再直接借用暂存页指针把字节写 backend、登记写结果；buffer worker 等 deadline 到达后才发布 committed。读写共享 NAND/LUN 调度状态，读已写页还会遵守其写完成依赖。
 
 ### 谁在执行，谁在等待
 
@@ -199,7 +203,7 @@ PPA 分配入口为 [instattention_mapping.c](../../../hw/femu/bbssd/instattenti
 | Guest 内核 NVMe 驱动 | 把 passthrough 或 FDM I/O 转成命令、映射 PRP、提交 SQ、接收 CQ 唤醒调用者 |
 | Host NVMe poller | `nvme_process_sq_io()` 读取 Guest SQ，创建请求并分派；`nvme_process_cq_cpl()` 在目标完成时间到达后向 Guest CQ 写完成项 |
 | Host native worker | 从 `to_ftl` 接收 native 命令，处理 INFO/REGISTER/APPEND/DRAIN 等，完成后入 `to_poller` |
-| Host buffer worker | 独立处理凑齐的组或 drain 残组；pack、写页、等待 NAND deadline、发布 committed；不需要 Guest 再发一条普通 NVMe Write |
+| Host buffer worker | 按物理分配域等待满块；分批写页、等待整块 NAND deadline、发布 committed；drain 允许残块；不需要 Guest 再发一条普通 NVMe Write |
 | Host SparF autonomous worker | 从 engine 队列取得父 Execute，推进选择、内部 gather、功能计算和各阶段等待 |
 | Host CU scheduler | 调度 approximate/exact/PV 的内部目标计算任务，将完成事件送回父 workflow；它们不是 Guest 新发的三个 Execute |
 
@@ -256,7 +260,7 @@ CPU target 用 Host CPU `.so` 完成 exact QK/PV；CUDA target 使用 [sparf_att
 调用链：[instattention_attention.c](../../../hw/femu/bbssd/instattention_attention.c) `native_kv_attention_read()` → [instattention_buffer.c](../../../hw/femu/bbssd/instattention_buffer.c) `native_kv_buffer_gather_phase()` → [instattention_device.c](../../../hw/femu/bbssd/instattention_device.c) `bb_native_kv_batch()`。
 
 1. 把全部选中维度/token 转为 native ranges，检查 accepted 前缀。
-2. 在 buffer 锁内，按每种布局的 committed 边界划分数据来源。已发布部分读 Flash 页；未发布部分直接读 raw tail。三种布局的边界可能不同。
+2. 在 buffer 锁内按页判断来源：页仍在暂存目录时直接读取 DRAM 页（包括未满页）；否则按逻辑坐标查 PPA、读取 Flash。不同通道/页组可先后落盘，不能仅凭连续 `committed` 前缀判断。
 3. 最新实现对**整个读取阶段**建立页片段计划并去重，同一页即使服务多个 range 也只读一次；然后按 `batch_pages` 分批读取并 scatter 回原顺序。没有跨 Attention 的读缓存。
 4. 每批调用实际 mapping/backend/NAND 模型；批次使用同一个阶段 start，最终 ready 取所有实际调度 deadline 的最大值。总耗时不是简单“批数×单批延迟”。
 5. 记录真实读取页数/Flash bytes、tail bytes 和批数；临时计划也检查注册内存预算。当前规划、读取、scatter 仍持有 buffer 锁。
@@ -287,11 +291,11 @@ FDM 数据传输入口为 [guest/cemu_client.cpp](guest/cemu_client.cpp) 的 `wr
 | 次序 / 数据 | 从哪里 → 到哪里 | 搬运机制、入口及返回条件 |
 |---|---|---|
 | 1. 本层新 K/V | Guest GPU → Guest NumPy | adapter `_kv()` 使用 `.detach().contiguous().cpu().numpy()`，由 PyTorch/CUDA 完成 GPU→CPU 数据拷贝；数据可在 CPU 使用后打包 |
-| 2. APPEND payload | Guest NumPy → Guest ioctl buffer → Host wire buffer → Host tail | transpose/tobytes 和 ctypes 建包；驱动映射 PRP；`native_execute()` 的 `dma_write_prp()` 读 Guest 地址；buffer 函数 memcpy 到各 head ring；接收并到达 CQ 完成条件后 ioctl 返回 |
-| 3. 满组或 drain 残组 | Host tail → batch scratch → 页 I/O scratch → Host NVM backend | `pack_batch()` 复制/转置，`bb_native_kv_batch()` → `cemu_kv_io_write()` → `native_page_transfer()` → `backend_rw_internal_checked()`；字节写与 NAND 目标完成分离 |
+| 2. APPEND payload | Guest NumPy → Guest ioctl buffer → Host wire buffer → Host 最终布局 DRAM 页 | transpose/tobytes 和 ctypes 建包；驱动映射 PRP；`native_execute()` 的 `dma_write_prp()` 读 Guest 地址；buffer 函数直接填 token-K/channel-K/token-V 页；接收并到达 CQ 完成条件后 ioctl 返回 |
+| 3. 满块下放（drain 可刷残块） | DRAM 暂存页池 → Host NVM backend | 按目标分配域等待满块后，`bb_native_kv_batch()` → `cemu_kv_io_write()` → `native_page_transfer()` → `backend_rw_internal_checked()`；字节写与 NAND 目标完成分离 |
 | 4. Q / mean | Guest GPU Q / Guest CPU mean → Guest 对齐 I/O buffer → Host FDM MR0/MR4 | `_decode_args()` 导出 Q/构造 mean；`write_tensor()` → `write_range()` → FDM `pwrite()`；Guest 内核生成 ns2 memory write，Host PRP copy 写 FDM |
 | 5. Execute metadata | Guest metadata buffer → Host 请求 data_buffer | compute ns3 passthrough，Host `program_execute()` PRP copy；MRS ID 引用已经存在的 FDM 张量，不再次上传它们 |
-| 6. channel-K / selected K,V | Host NVM backend 页及 Host tail → Host FDM MR1/MR2/MR3 | native 内部函数直接读页、取 tail 并 scatter；无需 Guest 发 Read，不把历史 KV 绕回 Guest |
+| 6. channel-K / selected K,V | Host NVM backend 页及 DRAM 暂存页 → Host FDM MR1/MR2/MR3 | native 内部函数直接读页、取 tail 并 scatter；无需 Guest 发 Read，不把历史 KV 绕回 Guest |
 | 7. 选择与近似计算 | FDM Q/channel-K → Host 工作数组 → alpha MR7 和所选索引 | Host C 代码读写、dtype 转换、排序/点积/softmax；channels、token 索引、scores 等是工作数组，不是全部另建 MRS |
 | 8. exact / PV，CUDA target | Host FDM RAM ↔ Host CSD GPU mirror | `backend_cuda_prepare_device()` 同步脏输入后运行 kernel；输出标记 device dirty。exact 使用 MR0/2/7/8，PV 使用 MR8/3/9；按数据脏状态同步，不必每个 MR 每次全量往返 |
 | 9. mean 补行 | Host FDM MR4 → MR3 的额外一行 | Host memcpy；PV 同时消费 selected V 和 mean，概率最后一项为 `1-alpha` |
@@ -309,12 +313,12 @@ FDM 数据传输入口为 [guest/cemu_client.cpp](guest/cemu_client.cpp) 的 `wr
 1. 进入本层时，该层 160 个 KV stream 已接收 token `0..1023`。Guest GPU 由位置 1024 的 hidden 算出 Q/K/V。
 2. K 和 V 各 40 KiB，合计 80 KiB。当前 128 KiB 批量能力下，同一 batch 的 40 heads 合为 20 KiB 一包，共 4 个成功 APPEND；重试不算在这 4 个里。所有 stream accepted 变成 1025，Guest 更新 mean。
 3. 上传 40 KiB Q 和 40 KiB mean，准备一个 `T=1025,k=129` 的父 Execute；该命令涵盖本层全部 160 个 vector。
-4. Host 每个 vector 选 16 个维度，MR1 的逻辑 channel-K 数据为 `160*16*1025*2 = 5,248,000 B`。其中哪些字节取页、哪些取 tail，以该阶段各 stream 的 channel-K committed 为准。
+4. Host 每个 vector 选 16 个维度，MR1 的逻辑 channel-K 数据为 `160*16*1025*2 = 5,248,000 B`。其中哪些字节取页、哪些取 tail，按该阶段各 stream 的 channel-K 页所在位置判断。
 5. approximate 后每个 vector 选 129 个 token；MR2 selected-K 为 `160*129*128*2 = 5,283,840 B`。MR3 selected-V 有同样大小的有效 V，另预留 40 KiB mean 行，总计 5,324,800 B。
 6. MR7 alpha 为 `160*4 = 640 B`；MR8 含每个 vector 的 129 个精确概率和 1 个 mean 权重，计 `160*130*4 = 83,200 B`。PV 输出 MR9 为 40 KiB。
 7. 等 PV 的目标调度完成，Host 释放 lease/引用，父请求进入 `to_poller`，CQ 完成；Guest Execute ioctl 返回。随后 Guest 回读 40 KiB 输出及 trace，future 完成；输出再上传 Guest GPU，才继续 Wo/MLP。
 
-上述几 MiB 的 MR1/2/3 是**设备内部工作集**，没有逐阶段传给 Guest。单个新增 token 未满组时留在 tail，依然参与三种 gather 的当前前缀；已落页的历史则走页读取。是否读到 NAND，取决于整个前缀和各布局的 committed，而不是只看本次新增一个 token。
+上述几 MiB 的 MR1/2/3 是**设备内部工作集**，没有逐阶段传给 Guest。单个新增 token 未满组时留在 tail，依然参与三种 gather 的当前前缀；已落页的历史则走页读取。是否读到 NAND，取决于对应页的 DRAM 暂存/NAND 状态，而不是只看本次新增一个 token。
 
 ## 6. Decode 结束后还做什么
 

@@ -36,6 +36,36 @@ static uint64_t monotonic_ns(void)
     return (uint64_t)timestamp.tv_sec * 1000000000ULL + timestamp.tv_nsec;
 }
 
+static bool compute_clock_trace_enabled(void)
+{
+    static gsize initialized;
+    static bool enabled;
+    if (g_once_init_enter(&initialized)) {
+        enabled = g_strcmp0(getenv("CEMU_COMPUTE_CLOCK_TRACE"), "1") == 0;
+        g_once_init_leave(&initialized, 1);
+    }
+    return enabled;
+}
+
+void compute_clock_trace_finish(ComputeJob *job)
+{
+    if (!compute_clock_trace_enabled()) {
+        return;
+    }
+    fprintf(stderr, "CEMU_CLOCK_TRACE {\"event\":\"completion\",\"pid\":%d,"
+            "\"controller\":%d,\"program\":%u,\"probe_id\":%llu,"
+            "\"host_ns\":%llu,\"received_virtual_ns\":%llu,"
+            "\"start_virtual_ns\":%llu,\"finish_virtual_ns\":%llu,"
+            "\"scheduled_runtime_ns\":%llu}\n",
+            (int)getpid(), job->req->ns->ctrl->drive_id, job->program->pind,
+            (unsigned long long)job->args.cparam2,
+            (unsigned long long)monotonic_ns(),
+            (unsigned long long)job->req->stat.stime,
+            (unsigned long long)job->stat.start_time,
+            (unsigned long long)job->stat.finish_time,
+            (unsigned long long)job_exec_time(job));
+}
+
 #include "sparf_timeline.h"
 
 static int sparf_timeline_fd(void)
@@ -2167,6 +2197,8 @@ static uint64_t run_functional_modeling(ComputeJob *job)
     const uint64_t requested_runtime = runtime;
     uint64_t freeze_entry_ns = 0;
     uint64_t workflow_runtime = 0;
+    bool clock_trace = compute_clock_trace_enabled();
+    uint64_t frozen_virtual_start = 0, frozen_virtual_end = 0;
     bool attention_workflow =
         (uint64_t)job->args.cparam1 == CEMU_ATTENTION_WORKFLOW_COMMAND;
     bool sparf_workflow =
@@ -2199,6 +2231,7 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             runtime -= freeze_entry_ns;
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
+        if (clock_trace) frozen_virtual_start = clock_ns();
         if (sparf_workflow) {
             if (observe) {
                 observe->command_start = monotonic_ns();
@@ -2215,6 +2248,7 @@ static uint64_t run_functional_modeling(ComputeJob *job)
             res = run_program_by_target(job);
         }
         clock_gettime(CLOCK_MONOTONIC, &te);
+        if (clock_trace) frozen_virtual_end = clock_ns();
         realtime = (te.tv_sec-ts.tv_sec)* 1000000000LL + (te.tv_nsec-ts.tv_nsec);
         if (attention_workflow || sparf_workflow) {
             runtime = workflow_runtime > freeze_entry_ns
@@ -2246,6 +2280,24 @@ static uint64_t run_functional_modeling(ComputeJob *job)
         }
 
         set_sched_runtime(job, runtime);
+
+        if (clock_trace) {
+            fprintf(stderr, "CEMU_CLOCK_TRACE {\"event\":\"functional\",\"pid\":%d,"
+                    "\"controller\":%d,\"program\":%u,\"probe_id\":%llu,"
+                    "\"host_start_ns\":%llu,\"host_end_ns\":%llu,"
+                    "\"virtual_start_ns\":%llu,\"virtual_end_ns\":%llu,"
+                    "\"requested_runtime_ns\":%llu,\"effective_runtime_ns\":%llu,"
+                    "\"freeze_entry_ns\":%llu}\n",
+                    (int)getpid(), job->req->ns->ctrl->drive_id, program->pind,
+                    (unsigned long long)job->args.cparam2,
+                    (unsigned long long)ts.tv_sec * 1000000000ULL + ts.tv_nsec,
+                    (unsigned long long)te.tv_sec * 1000000000ULL + te.tv_nsec,
+                    (unsigned long long)frozen_virtual_start,
+                    (unsigned long long)frozen_virtual_end,
+                    (unsigned long long)requested_runtime,
+                    (unsigned long long)runtime,
+                    (unsigned long long)freeze_entry_ns);
+        }
 
     if (collect_compute_stats) {
         atomic_fetch_add_explicit(&csd_total_compute_ns,
@@ -2639,7 +2691,8 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
         trace->engine = -1;
         trace->engines = namespace->params->sparf_engines;
         trace->compute_units = namespace->ce->nr_cu;
-        trace->read_diagnostics = group_session && sparf_auto_read_diagnostics_enabled();
+        trace->read_diagnostics = (group_session || native_attention) &&
+            sparf_auto_read_diagnostics_enabled();
         trace->group_write_order = group_session ?
             (group_session->buffer->kind_major ? "kind" : "fifo") : NULL;
         job->sparf_autonomous->timeline = trace;

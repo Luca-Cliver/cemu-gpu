@@ -20,6 +20,8 @@ sys.path.insert(0, os.environ.get("CEMU_INSTATTENTION_BUILD_DIR", str(PROJECT_DI
 sys.path.insert(0, str(PROJECT_DIR / "python"))
 sys.path.insert(0, str(PROJECT_DIR))
 
+from cemu_io import io_backend
+
 from cemu_flexgen import (
     AttentionBufferConfig,
     CemuAttentionDevice,
@@ -1013,6 +1015,7 @@ def diagnose_generations(
 
 
 def main():
+    print(f"[opt-cemu] Guest I/O backend={io_backend()} (management commands remain ioctl)", flush=True)
     args = parse_args()
     selected_modes = sum(
         mode is not None and mode is not False

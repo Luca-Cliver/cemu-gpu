@@ -80,6 +80,8 @@ typedef struct ComputeJob {
     struct ubpf_jit_args args;
 } ComputeJob;
 
+void compute_clock_trace_finish(ComputeJob *job);
+
 void sparf_trace_job_finish(ComputeJob *job);
 void sparf_trace_job_enqueue(ComputeJob *job);
 

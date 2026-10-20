@@ -1,6 +1,8 @@
+import os
 import secrets
 import struct
 import time
+from collections import deque
 from threading import RLock
 
 import numpy as np
@@ -17,10 +19,10 @@ class NativeKvStore:
     def __init__(self, layout, batches, layers, heads, max_tokens, microbatch_size,
                  device_path="/dev/ng0n1", control_path="/dev/nvme0c3",
                  namespace_path="/dev/ng0n3", budget=64 * 1024**2, batch_pages=32,
-                 transport_factory=LinuxTransport, append_batch_bytes=None):
+                 transport_factory=LinuxTransport, append_batch_bytes=None, append_queue_depth=None):
         if (min(batches, layers, heads, max_tokens, microbatch_size, budget) <= 0 or
                 batches % microbatch_size or max(batches, layers, heads) > 65536 or
-                layout.head_dim > 256 or not layout.channel_group_pages <= batch_pages <= 256):
+                layout.head_dim > 256 or not 1 <= batch_pages <= 256):
             raise ValueError("invalid native KV geometry or write batch size")
         self.layout = layout
         self.batches, self.layers, self.heads = batches, layers, heads
@@ -45,6 +47,13 @@ class NativeKvStore:
             raise ValueError("invalid native APPEND transfer limit")
         self._append_requested_bytes = append_batch_bytes
         self._append_batch_bytes = 0
+        self._append_queue_depth = (
+            int(os.environ.get("CEMU_NATIVE_APPEND_DEPTH", "8"))
+            if append_queue_depth is None else append_queue_depth)
+        if (type(self._append_queue_depth) is not int or
+                not 1 <= self._append_queue_depth <= 64):
+            raise ValueError("native APPEND queue depth must be in [1, 64]")
+        self._append_peak_inflight = 0
 
     def _call(self, opcode, fields, payload=None, retry=False):
         deadline = time.monotonic() + 120
@@ -128,7 +137,11 @@ class NativeKvStore:
             tile = PAGE_BYTES // (2 * self.layout.head_dim * self.layout.dtype.itemsize)
             try:
                 if self._append_batch_bytes:
-                    self._append_heads(first_stream, token, keys, values)
+                    if (len(keys) > 1 and self._append_queue_depth > 1 and
+                            getattr(self._transport, "backend", None) == "uring"):
+                        self._append_heads_uring(first_stream, token, keys, values)
+                    else:
+                        self._append_heads(first_stream, token, keys, values)
                     return
                 for column in range(keys.shape[1]):
                     stream = first_stream + column
@@ -164,6 +177,64 @@ class NativeKvStore:
                     self._accepted[stream] = token + start + count
                 column += heads
 
+    def _append_heads_uring(self, first_stream, token, keys, values):
+        row_bytes = 2 * self.layout.head_dim * self.layout.dtype.itemsize
+        tile = min(self.layout.token_group_tokens, self._append_batch_bytes // row_bytes)
+        ready = deque()
+        column = 0
+        while column < keys.shape[1]:
+            batch, layer, head = self._coordinate(first_stream + column)
+            heads = min(self.heads - head, keys.shape[1] - column,
+                        self._append_batch_bytes // (tile * row_bytes))
+            ready.append(dict(column=column, heads=heads, start=0, batch=batch,
+                              layer=layer, head=head, deadline=None))
+            column += heads
+        active = []
+        try:
+            while ready or active:
+                while ready and len(active) < self._append_queue_depth:
+                    lane = ready.popleft()
+                    start, column, heads = lane["start"], lane["column"], lane["heads"]
+                    count = min(tile, len(keys) - start)
+                    fields = list(coordinates(self.task, self.generation, batch=lane["batch"],
+                        layer=lane["layer"], head=lane["head"], token=token + start, valid=count))
+                    fields[4] |= heads << 16
+                    packet = b"".join(array[start:start + count, column:column + heads]
+                        .transpose(1, 0, 2).tobytes() for array in (keys, values))
+                    if lane["deadline"] is None:
+                        lane["deadline"] = time.monotonic() + 120
+                    self._append_attempts += 1
+                    request = self._transport.submit_append(tuple(fields), packet)
+                    active.append((request, lane, count))
+                    self._append_peak_inflight = max(self._append_peak_inflight, len(active))
+                completed = self._transport.wait_any([item[0] for item in active])
+                request, lane, count = active.pop(completed)
+                status, result, _ = request.result()
+                if status:
+                    if status != 0xC or result != 5:
+                        raise RuntimeError(f"native KV opcode={BUFFER_APPEND_BATCH:#x} status={status:#x} core={result}")
+                    self._append_retries += 1
+                    if time.monotonic() >= lane["deadline"]:
+                        raise TimeoutError("native KV backpressure did not clear within 120 seconds")
+                    ready.append(lane)
+                    time.sleep(0.0001)
+                    continue
+                self._append_commands += 1
+                self._appended_head_tokens += count * lane["heads"]
+                lane["start"] += count
+                lane["deadline"] = None
+                for stream in range(first_stream + lane["column"],
+                                    first_stream + lane["column"] + lane["heads"]):
+                    self._accepted[stream] = token + lane["start"]
+                if lane["start"] < len(keys):
+                    ready.append(lane)
+        finally:
+            for request, _, _ in active:
+                try:
+                    request.result()
+                except BaseException:
+                    pass
+
     def pack_workflow(self, layout, layer, tokens, query_heads, top_r, top_k, stream_base, **kwargs):
         self.check_ready()
         per_microbatch = self.layers * self.microbatch_size * self.heads
@@ -194,10 +265,17 @@ class NativeKvStore:
             stats = dict(zip(("accepted_stream0", "token_k", "channel_k", "token_v", "memory_bytes",
                              "write_bytes", "read_bytes", "write_batches", "pending_ready_ns", "sealed", "failed"),
                             struct.unpack_from("<11Q", data)))
+            stats.update(zip(("packed_token_k", "packed_channel_k", "packed_token_v",
+                              "staged_pages", "write_blocks", "partial_blocks", "ready_blocks"),
+                             struct.unpack_from("<7Q", data, 88)))
+            stats.update(zip(("inflight_blocks", "peak_inflight_blocks"),
+                             struct.unpack_from("<2Q", data, 144)))
             stats.update(client_append_attempts=self._append_attempts,
                          client_append_batch_max_bytes=self._append_batch_bytes,
                          client_append_commands=self._append_commands,
                          client_append_backpressure_retries=self._append_retries,
+                         client_append_queue_depth=self._append_queue_depth,
+                         client_append_peak_inflight=self._append_peak_inflight,
                          client_appended_head_tokens=self._appended_head_tokens)
             return stats
 
