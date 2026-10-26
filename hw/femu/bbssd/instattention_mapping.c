@@ -4,6 +4,7 @@
 typedef struct KvTask {
     CemuKvIdentity identity;
     CemuKvLayout layout;
+    uint32_t *placement_cursors;
 } KvTask;
 
 typedef enum KvPageState {
@@ -39,6 +40,8 @@ struct CemuKvMap {
     size_t hash_size;
     size_t domain_count;
     uint64_t next_block[128];
+    uint32_t *next_lane_block;
+    uint32_t lane_count;
 };
 
 static uint64_t hash_field(uint64_t hash, uint64_t value)
@@ -136,17 +139,24 @@ CemuKvStatus cemu_kv_map_create(const CemuKvMapConfig *config, CemuKvMap **resul
     CemuKvPhysicalPage first = {0};
     uint64_t offset;
     size_t bytes = sizeof(CemuKvMap), hash_size;
+    uint32_t lane_count;
 
     if (!config || !result || !config->namespace_id || !config->max_tasks ||
         !config->max_pages || config->max_pages > SIZE_MAX / 2 ||
+        (config->placement != CEMU_KV_PLACEMENT_LEGACY &&
+         config->placement != CEMU_KV_PLACEMENT_BALANCED) ||
         !cemu_kv_physical_offset(&config->nand, &first, config->backend_bytes, &offset)) {
         return CEMU_KV_INVALID;
     }
     hash_size = config->max_pages * 2;
+    lane_count = config->nand.channels * config->nand.luns_per_channel *
+                 config->nand.planes_per_lun;
     if (!add_allocation(config->max_tasks, sizeof(KvTask), &bytes) ||
         !add_allocation(config->max_pages, sizeof(KvPage), &bytes) ||
         !add_allocation(config->max_pages, sizeof(KvDomain), &bytes) ||
         !add_allocation(hash_size, sizeof(size_t), &bytes) ||
+        (config->placement == CEMU_KV_PLACEMENT_BALANCED &&
+         !add_allocation(lane_count, sizeof(uint32_t), &bytes)) ||
         !add_allocation(hash_size, sizeof(size_t), &bytes) ||
         bytes > config->memory_budget_bytes) {
         return CEMU_KV_LIMIT;
@@ -157,14 +167,19 @@ CemuKvStatus cemu_kv_map_create(const CemuKvMapConfig *config, CemuKvMap **resul
     }
     map->config = *config;
     map->hash_size = hash_size;
+    map->lane_count = lane_count;
     map->stats.memory_bytes = bytes;
     map->tasks = calloc(config->max_tasks, sizeof(*map->tasks));
     map->pages = calloc(config->max_pages, sizeof(*map->pages));
     map->domains = calloc(config->max_pages, sizeof(*map->domains));
     map->page_hash = calloc(hash_size, sizeof(*map->page_hash));
     map->domain_hash = calloc(hash_size, sizeof(*map->domain_hash));
+    if (config->placement == CEMU_KV_PLACEMENT_BALANCED) {
+        map->next_lane_block = calloc(lane_count, sizeof(*map->next_lane_block));
+    }
     if (!map->tasks || !map->pages || !map->domains ||
-        !map->page_hash || !map->domain_hash) {
+        !map->page_hash || !map->domain_hash ||
+        (config->placement == CEMU_KV_PLACEMENT_BALANCED && !map->next_lane_block)) {
         cemu_kv_map_destroy(map);
         return CEMU_KV_NO_MEMORY;
     }
@@ -175,6 +190,10 @@ CemuKvStatus cemu_kv_map_create(const CemuKvMapConfig *config, CemuKvMap **resul
 void cemu_kv_map_destroy(CemuKvMap *map)
 {
     if (map) {
+        for (size_t index = 0; index < map->stats.tasks; index++) {
+            free(map->tasks[index].placement_cursors);
+        }
+        free(map->next_lane_block);
         free(map->tasks);
         free(map->pages);
         free(map->domains);
@@ -188,7 +207,8 @@ CemuKvStatus cemu_kv_map_register(CemuKvMap *map,
                                 const CemuKvIdentity *identity,
                                 const CemuKvGeometry *geometry)
 {
-    size_t index;
+    size_t index, bytes, cursor_count;
+    uint32_t *cursors = NULL;
     CemuKvLayout layout;
     CemuKvStatus status = find_task(map, identity, &index);
 
@@ -202,7 +222,27 @@ CemuKvStatus cemu_kv_map_register(CemuKvMap *map,
     if (map->stats.tasks == map->config.max_tasks) {
         return CEMU_KV_LIMIT;
     }
-    map->tasks[map->stats.tasks++] = (KvTask){ .identity = *identity, .layout = layout };
+    bytes = map->stats.memory_bytes;
+    if (map->config.placement == CEMU_KV_PLACEMENT_BALANCED) {
+        cursor_count = 0;
+        if (!add_allocation(geometry->layers, 3, &cursor_count) ||
+            !add_allocation(cursor_count, sizeof(*cursors), &bytes) ||
+            bytes > map->config.memory_budget_bytes) {
+            return CEMU_KV_LIMIT;
+        }
+        cursors = calloc(cursor_count, sizeof(*cursors));
+        if (!cursors) {
+            return CEMU_KV_NO_MEMORY;
+        }
+        for (index = 0; index < cursor_count; index++) {
+            cursors[index] = (index / 3 + (index % 3) * map->lane_count / 3) %
+                             map->lane_count;
+        }
+    }
+    map->tasks[map->stats.tasks++] = (KvTask){
+        .identity = *identity, .layout = layout, .placement_cursors = cursors,
+    };
+    map->stats.memory_bytes = bytes;
     return CEMU_KV_OK;
 }
 
@@ -217,6 +257,7 @@ CemuKvStatus cemu_kv_map_reserve(CemuKvMap *map,
     KvDomain candidate, *domain;
     const CemuKvNandGeometry *nand;
     uint64_t ordinal, lanes;
+    uint32_t lane = 0, *cursor = NULL;
     bool new_block;
     CemuKvStatus status = find_task(map, identity, &task_index);
 
@@ -248,7 +289,24 @@ CemuKvStatus cemu_kv_map_reserve(CemuKvMap *map,
         candidate = *domain;
     }
     new_block = !domain || candidate.next_page == nand->pages_per_block;
-    if (new_block) {
+    if (new_block && map->config.placement == CEMU_KV_PLACEMENT_BALANCED) {
+        cursor = &map->tasks[task_index].placement_cursors[
+            (size_t)location.key.layer * 3 + location.key.kind];
+        lane = *cursor;
+        while (map->next_lane_block[lane] == nand->blocks_per_plane) {
+            lane = (lane + 1) % map->lane_count;
+            if (lane == *cursor) {
+                return CEMU_KV_NO_SPACE;
+            }
+        }
+        candidate.active = (CemuKvPhysicalPage){
+            .channel = lane % nand->channels,
+            .lun = (lane / nand->channels) % nand->luns_per_channel,
+            .plane = lane / (nand->channels * nand->luns_per_channel),
+            .block = map->next_lane_block[lane],
+        };
+        candidate.next_page = 0;
+    } else if (new_block) {
         ordinal = map->next_block[candidate.channel];
         lanes = (uint64_t)nand->luns_per_channel * nand->planes_per_lun;
         if (ordinal >= lanes * nand->blocks_per_plane) {
@@ -278,7 +336,12 @@ CemuKvStatus cemu_kv_map_reserve(CemuKvMap *map,
     }
     *domain = candidate;
     if (new_block) {
-        map->next_block[candidate.channel]++;
+        if (cursor) {
+            map->next_lane_block[lane]++;
+            *cursor = (lane + 1) % map->lane_count;
+        } else {
+            map->next_block[candidate.channel]++;
+        }
         map->stats.claimed_blocks++;
     }
     map->pages[map->stats.reserved_pages] = (KvPage){

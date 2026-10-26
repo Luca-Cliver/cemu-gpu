@@ -641,6 +641,9 @@ CemuKvStatus bb_native_io_create(NvmeNamespace *ns, size_t max_tasks,
         .backend_bytes = ns->backend->size,
         .max_tasks = max_tasks, .max_pages = max_pages,
         .memory_budget_bytes = memory_budget_bytes,
+        .placement = ns->ctrl->native_kv_placement &&
+                     !strcmp(ns->ctrl->native_kv_placement, "balanced") ?
+                     CEMU_KV_PLACEMENT_BALANCED : CEMU_KV_PLACEMENT_LEGACY,
     };
     status = cemu_kv_io_create(&config, &operations, nns, result);
     if (status == CEMU_KV_OK) {

@@ -389,6 +389,8 @@ void bb_native_namespace_init(NvmeNamespace *ns, Error **errp)
     }
     ns->ctrl->to_ftl = nns->to_ftl;
     femu_log("CEMU FTL mode=instattention: native KV ABI=1, fresh namespace, no LBA IO\n");
+    femu_log("Native KV block placement: %s\n",
+             ns->ctrl->native_kv_placement ? ns->ctrl->native_kv_placement : "legacy");
     return;
 fail:
     error_setg(errp, "Cannot initialize native KV namespace");
@@ -399,6 +401,10 @@ int bb_native_submit(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
 {
     NvmNamespace *nns = nvm_ns(ns);
 
+    if (nns->fdm_kvbuffer_initialized && cmd->opcode != CEMU_NATIVE_KV_INFO) {
+        req->status = NVME_CMD_SEQ_ERROR | NVME_DNR;
+        return 1;
+    }
     switch (cmd->opcode) {
     case CEMU_NATIVE_KV_INFO:
     case CEMU_NATIVE_KV_REGISTER:

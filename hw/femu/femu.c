@@ -6,6 +6,7 @@
 #include "./param.h"
 #include "bbssd/bb.h"
 #include "csd/compute.h"
+#include "fdm_kv_binding.h"
 #include "qemu/uuid.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@ static void nvme_clear_ctrl(FemuCtrl *n, bool shutdown)
 
     /* Coperd: pause nvme poller at earliest convenience */
     n->dataplane_started = false;
+    fdm_kv_bindings_clear(n);
 
     if (shutdown) {
         femu_debug("shutting down NVMe Controller ...\n");
@@ -699,6 +701,16 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
     n->native_kv = n->ftl_mode && !strcmp(n->ftl_mode, "instattention");
+    if (n->native_kv_placement && strcmp(n->native_kv_placement, "legacy") &&
+        strcmp(n->native_kv_placement, "balanced")) {
+        error_setg(errp, "Unknown native_kv_placement: %s", n->native_kv_placement);
+        return;
+    }
+    if (!n->native_kv && n->native_kv_placement &&
+        !strcmp(n->native_kv_placement, "balanced")) {
+        error_setg(errp, "native_kv_placement=balanced requires ftl_mode=instattention");
+        return;
+    }
     if (parse_config(n)) {
         if (n->native_kv) {
             error_setg(errp, "Invalid native KV namespace geometry");
@@ -845,6 +857,8 @@ static void femu_exit(PCIDevice *pci_dev)
             return;
         }
         nvme_clear_ctrl(n, true);
+    } else {
+        fdm_kv_bindings_clear(n);
     }
 
     for (int i = 0; i < n->num_namespaces; i++) {
@@ -879,6 +893,7 @@ static Property femu_props[] = {
     DEFINE_PROP_STRING("nvm_backend_file", FemuCtrl, nvm_backend_file),
     DEFINE_PROP_UINT64("native_kv_buffer_budget", FemuCtrl, native_kv_buffer_budget, 64 * MiB),
     DEFINE_PROP_UINT32("native_kv_page_limit", FemuCtrl, native_kv_page_limit, 65536),
+    DEFINE_PROP_STRING("native_kv_placement", FemuCtrl, native_kv_placement),
     DEFINE_PROP_STRING("ftl_mode", FemuCtrl, ftl_mode),
     DEFINE_PROP_END_OF_LIST(),
 };

@@ -9,6 +9,8 @@
 #include "hw/femu/backend/backend.h"
 #include "hw/femu/attention_workflow_abi.h"
 #include "hw/femu/sparf_workflow_abi.h"
+#include "hw/femu/fdm_kv_binding.h"
+#include "hw/femu/fdm_kv_attention.h"
 #include "sparf_writeback.h"
 #include "sparf_group_buffer.h"
 #include "sparf_wait.h"
@@ -367,7 +369,9 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
     bool buffered = header.flags & CEMU_SPARF_WORKFLOW_BUFFERED;
     bool grouped = header.flags & CEMU_SPARF_WORKFLOW_GROUPED;
     bool native = header.flags & CEMU_SPARF_WORKFLOW_NATIVE;
-    if (native != controller->native_kv || (native && (!grouped || !autonomous))) return false;
+    bool fdm = header.flags & CEMU_SPARF_WORKFLOW_FDM;
+    if ((native && fdm) || (native || fdm) != controller->native_kv ||
+        ((native || fdm) && (!grouped || !autonomous))) return false;
     if (grouped && (!autonomous || buffered || extents || header.token_head_stride ||
         header.token_batch_stride || header.token_layer_stride || header.channel_stride ||
         header.channel_head_stride || header.channel_batch_stride || header.channel_layer_stride ||
@@ -378,14 +382,15 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         (staged && (header.reserved[0] < CEMU_SPARF_STAGE_SELECT ||
                     header.reserved[0] > CEMU_SPARF_STAGE_PV || !header.reserved[1])) ||
         numr != (staged ? CEMU_SPARF_STAGED_RANGES : CEMU_SPARF_WORKFLOW_RANGES) ||
-        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED | CEMU_SPARF_WORKFLOW_NATIVE)) ||
+        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED | CEMU_SPARF_WORKFLOW_NATIVE | CEMU_SPARF_WORKFLOW_FDM)) ||
         (!grouped && (!header.token_k_extents || !header.channel_k_extents || !header.token_v_extents)) ||
         header.token_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.channel_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.token_v_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         length != sizeof(header) + extents * sizeof(struct cemu_sparf_workflow_extent) +
                   (buffered ? sizeof(struct cemu_sparf_buffer_tail) : 0) +
-                  (grouped ? sizeof(struct cemu_sparf_group_binding) : 0) ||
+                  (fdm ? sizeof(struct cemu_sparf_fdm_binding) :
+                   grouped ? sizeof(struct cemu_sparf_group_binding) : 0) ||
         (header.dtype != CEMU_SPARF_FLOAT16 && header.dtype != CEMU_SPARF_FLOAT32) ||
         !header.batch_size || !header.num_query_heads || !header.num_kv_heads ||
         !header.head_dim || !header.max_seq_len || !header.valid_tokens ||
@@ -450,6 +455,11 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         return false;
     }
     if (grouped) {
+        if (fdm) {
+            struct cemu_sparf_fdm_binding binding;
+            memcpy(&binding, (const uint8_t *)data + sizeof(header), sizeof(binding));
+            return binding.session_id && binding.generation && binding.nvm_nsid == 1;
+        }
         if (native) {
             struct cemu_sparf_native_binding binding;
             memcpy(&binding, (const uint8_t *)data + sizeof(header), sizeof(binding));
@@ -578,6 +588,8 @@ static void init_mrs_slab(void *elem, void *arg)
     mrs->rsid = (*rsid)++;
     mrs->mr = NULL;
     mrs->numr = 0;
+    mrs->in_use = 0;
+    mrs->fdm_kv_binding = NULL;
     pthread_spin_init(&mrs->lock, 0);
 }
 
@@ -663,6 +675,7 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             return NVME_MR_SET_EXCEEDED;
         }
         mrs->in_use = false;
+        mrs->fdm_kv_binding = NULL;
         mrs->numr = numr;
         mrs->mr = g_malloc0(sizeof(MemoryRange) * numr);
         mrs->mr_addr = g_malloc0(sizeof(void *) * numr);
@@ -671,7 +684,8 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             uint32_t nsid = le32_to_cpu(mr[i].nsid);
             uint32_t len = le32_to_cpu(mr[i].len);
             uint64_t sb = le64_to_cpu(mr[i].sb);
-            NvmeNamespace *mns = nvme_find_namespace(n, nsid);
+            NvmeNamespace *mns = nsid && nsid <= n->num_namespaces ?
+                nvme_find_namespace(n, nsid) : NULL;
             if (mns == NULL || (n->native_kv && (mns->csi != NVME_CSI_MEMORY || !len ||
                 sb > mns->backend->size || len > mns->backend->size - sb))) {
                 free(mrs->mr);
@@ -706,7 +720,7 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             return NVME_INVALID_FIELD;
         }
         femu_debug("free mrs rsid %d, mrs %p, numr %d\n", rsid, mrs, mrs->numr);
-        if (mrs->in_use) {
+        if (!fdm_kv_unbind(mrs) || mrs->in_use) {
             pthread_spin_unlock(&memory_range_set_slab(ns)->lock);
             return NVME_MR_SET_IN_USE;
         }
@@ -729,6 +743,32 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
             return NVME_DNR;
         }
         cqe->n.result = 0;
+    } else if (sel == CEMU_FDM_KV_BIND_SELECTOR) {
+        if (rsid == 0 || rsid > MAX_RSID ||
+            le32_to_cpu(cmd->cdw10) != (sel | ((uint32_t)rsid << 16)) ||
+            le32_to_cpu(cmd->cdw11) != sizeof(FDMKV_BindParams_t) ||
+            le32_to_cpu(cmd->cdw12) > MAX_PIND || cmd->cdw13 || cmd->cdw14 || cmd->cdw15 ||
+            cmd->fuse || cmd->psdt || cmd->res1 || cmd->res2 || cmd->mptr) {
+            return NVME_INVALID_FIELD;
+        }
+        FDMKV_BindParams_t wire;
+        if (dma_write_prp(n, (uint8_t *)&wire, sizeof(wire), prp1, prp2)) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        pthread_spin_lock(&memory_range_set_slab(ns)->lock);
+        MemoryRangeSet *mrs = memory_range_set_get(ns, rsid);
+        uint32_t program_index = le32_to_cpu(cmd->cdw12);
+        Program *program = program_index ? program_get(ns, program_index) : NULL;
+        if (program) {
+            pthread_mutex_lock(&program->lock);
+        }
+        uint16_t status = fdm_kv_bind(ns, mrs, &wire, program);
+        if (program) {
+            pthread_mutex_unlock(&program->lock);
+        }
+        pthread_spin_unlock(&memory_range_set_slab(ns)->lock);
+        cqe->n.result = 0;
+        return status;
     } else {
         femu_err("memory_range_set_management: sel %u not supported!\n", sel);
         return NVME_INVALID_FIELD;
@@ -1090,6 +1130,10 @@ static uint16_t program_activation(NvmeNamespace *ns, NvmeCmd *cmd, NvmeCqe *cqe
     pthread_mutex_lock(&program->lock);
     if (sel == 0) {
         // deactivate program
+        if (qatomic_read(&program->fdm_kv_users)) {
+            pthread_mutex_unlock(&program->lock);
+            return NVME_PROGRAM_IN_USE;
+        }
         // TODO fix jobs_running when cu>1
         // if (qatomic_load_acquire(&program->jobs_running) > 0) {
         //     pthread_mutex_unlock(&program->lock);
@@ -1132,7 +1176,8 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     uint32_t chunk_nlb = le32_to_cpu(exec->chunk_nlb) + 1;
     uint32_t runtime = le32_to_cpu(exec->runtime);
     if (n->native_kv && (numr ||
-        dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) ||
+        (dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) &&
+         dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_fdm_binding)) ||
         cparam1 != CEMU_SPARF_WORKFLOW_COMMAND)) return NVME_INVALID_FIELD;
     SparfDispatchTrace dispatch = {0};
     if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND && sparf_timeline_fd() >= 0) {
@@ -1193,7 +1238,8 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     req->data_buffer = data_buffer;
     if (n->native_kv && (program->is_indirect || numr ||
         cparam1 != CEMU_SPARF_WORKFLOW_COMMAND ||
-        dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) ||
+        (dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) &&
+         dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_fdm_binding)) ||
         ((struct cemu_sparf_workflow_header *)data_buffer)->version != CEMU_SPARF_AUTONOMOUS_VERSION)) {
         g_free(req->data_buffer);
         req->data_buffer = NULL;
@@ -2430,7 +2476,11 @@ finish:
         sparf_group_unbind(state->group_session, header, &binding);
     }
     if (state->storage_read) {
-        native_kv_attention_close(state->storage_opaque);
+        if (state->storage_read == fdm_kv_attention_read) {
+            fdm_kv_attention_close(state->storage_opaque);
+        } else {
+            native_kv_attention_close(state->storage_opaque);
+        }
         g_free(state->storage_opaque);
     }
     g_free(state);
@@ -2590,6 +2640,7 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
     bool admitted = false, referenced = false, pinned = false;
     SparfGroupSession *group_session = NULL;
     NativeKvAttention *native_attention = NULL;
+    FDMKV_Attention_t *fdm_attention = NULL;
     uint16_t status = NVME_INVALID_FIELD;
     if (!rsid || rsid > MAX_RSID || le32_to_cpu(command->numr) ||
         program->is_indirect ||
@@ -2627,7 +2678,12 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
                                   mrs->mr_len, request->data_buffer,
                                   le32_to_cpu(command->dlen), request->ns->ctrl)) goto reject;
     struct cemu_sparf_workflow_header *header = request->data_buffer;
-    if (header->flags & CEMU_SPARF_WORKFLOW_NATIVE) {
+    if (header->flags & CEMU_SPARF_WORKFLOW_FDM) {
+        struct cemu_sparf_fdm_binding binding;
+        memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
+        fdm_attention = g_new0(FDMKV_Attention_t, 1);
+        if (!fdm_kv_attention_open(request->ns->ctrl, &binding, header, fdm_attention)) goto reject;
+    } else if (header->flags & CEMU_SPARF_WORKFLOW_NATIVE) {
         struct cemu_sparf_native_binding binding;
         NvmeNamespace *nvm = nvme_find_namespace(request->ns->ctrl, 1);
         CemuKvIdentity identity = { .controller = request->ns->ctrl->drive_id, .namespace_id = 1 };
@@ -2685,13 +2741,17 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
         job->sparf_autonomous->storage_read = native_kv_attention_read;
         job->sparf_autonomous->storage_opaque = native_attention;
     }
+    if (fdm_attention) {
+        job->sparf_autonomous->storage_read = fdm_kv_attention_read;
+        job->sparf_autonomous->storage_opaque = fdm_attention;
+    }
     job->sparf_autonomous->rsid = rsid;
     if (sparf_auto_log_fd() >= 0) {
         SparfAutonomousTrace *trace = g_new0(SparfAutonomousTrace, 1);
         trace->engine = -1;
         trace->engines = namespace->params->sparf_engines;
         trace->compute_units = namespace->ce->nr_cu;
-        trace->read_diagnostics = (group_session || native_attention) &&
+        trace->read_diagnostics = (group_session || native_attention || fdm_attention) &&
             sparf_auto_read_diagnostics_enabled();
         trace->group_write_order = group_session ?
             (group_session->buffer->kind_major ? "kind" : "fifo") : NULL;
@@ -2707,6 +2767,10 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
     qemu_sem_post(&namespace->sparf_autonomous_wakeup);
     return NVME_SUCCESS;
 reject:
+    if (fdm_attention) {
+        fdm_kv_attention_close(fdm_attention);
+        g_free(fdm_attention);
+    }
     if (native_attention) {
         native_kv_attention_close(native_attention);
         g_free(native_attention);

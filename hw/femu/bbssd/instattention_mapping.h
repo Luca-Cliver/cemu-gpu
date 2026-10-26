@@ -17,6 +17,11 @@ typedef enum CemuKvStatus {
     CEMU_KV_NO_MEMORY
 } CemuKvStatus;
 
+typedef enum CemuKvPlacement {
+    CEMU_KV_PLACEMENT_LEGACY,
+    CEMU_KV_PLACEMENT_BALANCED
+} CemuKvPlacement;
+
 typedef struct CemuKvMapConfig {
     uint32_t controller;
     uint32_t namespace_id;
@@ -25,6 +30,7 @@ typedef struct CemuKvMapConfig {
     size_t max_tasks;
     size_t max_pages;
     size_t memory_budget_bytes;
+    CemuKvPlacement placement;
 } CemuKvMapConfig;
 
 typedef struct CemuKvPageRef {

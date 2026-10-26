@@ -910,6 +910,7 @@ typedef struct NvmeAsyncEvent {
 typedef struct NvmeRequest {
     void                    (*internal_complete)(struct NvmeRequest *, bool cancelled);
     void                    *internal_owner;
+    bool                    fdm_kv_pending;
     struct NvmeSQueue       *sq;
     struct NvmeCQueue       *cq;
     struct NvmeNamespace    *ns;
@@ -1378,8 +1379,10 @@ typedef struct FemuCtrl {
     char*            nvm_backend_file;
     uint64_t         native_kv_buffer_budget;
     uint32_t         native_kv_page_limit;
+    char            *native_kv_placement;
     char            *ftl_mode;
     bool            native_kv;
+    GList          *fdm_kv_bindings;
     bool            native_stop;
     bool            native_ready;
     uint64_t        native_inflight;

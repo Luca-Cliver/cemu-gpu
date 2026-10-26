@@ -11,6 +11,14 @@
 #define CEMU_SPARF_WORKFLOW_BUFFERED 2U
 #define CEMU_SPARF_WORKFLOW_GROUPED 4U
 #define CEMU_SPARF_WORKFLOW_NATIVE 8U
+#define CEMU_SPARF_WORKFLOW_FDM 16U
+
+struct cemu_sparf_fdm_binding {
+    uint64_t session_id;
+    uint64_t generation;
+    uint32_t batch_first;
+    uint32_t nvm_nsid;
+};
 
 struct cemu_sparf_native_binding {
     uint32_t task;
@@ -104,8 +112,10 @@ struct cemu_sparf_stage_context {
 };
 
 #if defined(__cplusplus)
+static_assert(sizeof(cemu_sparf_fdm_binding) == 24, "SparF FDM binding ABI changed");
 static_assert(sizeof(cemu_sparf_stage_context) == 96, "SparF context ABI changed");
 #else
+_Static_assert(sizeof(struct cemu_sparf_fdm_binding) == 24, "SparF FDM binding ABI changed");
 _Static_assert(sizeof(struct cemu_sparf_stage_context) == 96,
                "SparF context ABI changed");
 #endif

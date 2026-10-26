@@ -24,6 +24,7 @@ typedef struct MemoryRangeSet {
     void **mr_addr;
     long long *mr_len;
     int in_use;
+    struct FDMKV_Binding *fdm_kv_binding;
     pthread_spinlock_t lock;
 } MemoryRangeSet;
 
@@ -74,6 +75,7 @@ typedef struct Program {
     uint32_t load_size;         // bytes loaded
     bool is_indirect;           // direct or indirect
     unsigned int jobs_running;  // atomic ref count
+    unsigned int fdm_kv_users;
     pthread_mutex_t lock;
 
     uint64_t runtime;

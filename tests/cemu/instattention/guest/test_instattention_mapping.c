@@ -160,7 +160,7 @@ static uint16_t value_at(const CemuKvCoordinate *coordinate)
 }
 
 static void test_data_and_placement(uint32_t page_bytes, uint32_t channels_per_page,
-                                    uint64_t tokens)
+                                    uint64_t tokens, CemuKvPlacement placement)
 {
     CemuKvMapConfig config = configuration();
     CemuKvMap *map = NULL;
@@ -176,6 +176,7 @@ static void test_data_and_placement(uint32_t page_bytes, uint32_t channels_per_p
     config.backend_bytes *= page_bytes / config.nand.page_bytes;
     config.nand.page_bytes = page_bytes;
     config.max_pages = 2048;
+    config.placement = placement;
     shape.page_bytes = page_bytes;
     shape.channels_per_page = channels_per_page;
     shape.max_tokens = tokens;
@@ -199,8 +200,10 @@ static void test_data_and_placement(uint32_t page_bytes, uint32_t channels_per_p
                         for (coordinate.head = 0; coordinate.head < shape.heads; coordinate.head++) {
                             assert(cemu_kv_map_reserve(map, &identity, &coordinate, valid,
                                                        &reference) == CEMU_KV_OK);
-                            assert(reference.physical.channel ==
-                                   (coordinate.token / capacity) % config.nand.channels);
+                            if (placement == CEMU_KV_PLACEMENT_LEGACY) {
+                                assert(reference.physical.channel ==
+                                       (coordinate.token / capacity) % config.nand.channels);
+                            }
                             if (!coordinate.token && !coordinate.channel) {
                                 if (!coordinate.head) {
                                     head_zero = reference;
@@ -376,6 +379,141 @@ static void test_allocation_failure(void)
     assert(!live_allocations);
 }
 
+static void test_balanced(void)
+{
+    CemuKvMapConfig config = configuration();
+    CemuKvGeometry shape = geometry();
+    CemuKvMap *map = NULL;
+    CemuKvIdentity owner = identity;
+    CemuKvCoordinate coordinate = {0};
+    CemuKvPageRef reference, previous[3], output;
+    uint32_t offset;
+    bool *occupied;
+
+    config.placement = CEMU_KV_PLACEMENT_BALANCED;
+    config.max_pages = 2048;
+    shape.heads = 64;
+    assert(cemu_kv_map_create(&config, &map) == CEMU_KV_OK);
+    occupied = calloc(config.backend_bytes / shape.page_bytes, sizeof(*occupied));
+    assert(occupied);
+    for (owner.task = 0; owner.task < 2; owner.task++) {
+        assert(cemu_kv_map_register(map, &owner, &shape) == CEMU_KV_OK);
+        for (coordinate.batch = 0; coordinate.batch < shape.batches; coordinate.batch++) {
+            for (coordinate.layer = 0; coordinate.layer < shape.layers; coordinate.layer++) {
+                unsigned counts[3][8] = {0};
+
+                for (coordinate.head = 0; coordinate.head < shape.heads; coordinate.head++) {
+                    for (coordinate.kind = 0; coordinate.kind < 3; coordinate.kind++) {
+                        assert(cemu_kv_map_reserve(map, &owner, &coordinate, 1,
+                                                   &reference) == CEMU_KV_OK);
+                        CemuKvPhysicalPage physical = reference.physical;
+                        unsigned lane = physical.channel + config.nand.channels *
+                            (physical.lun + config.nand.luns_per_channel * physical.plane);
+
+                        counts[coordinate.kind][lane]++;
+                        assert(!occupied[reference.backend_offset / shape.page_bytes]);
+                        occupied[reference.backend_offset / shape.page_bytes] = true;
+                        assert(physical.page == coordinate.head % config.nand.pages_per_block);
+                        if (physical.page) {
+                            assert(same_block(previous[coordinate.kind].physical, physical));
+                            assert(reference.backend_offset == previous[coordinate.kind].backend_offset +
+                                                               shape.page_bytes);
+                        }
+                        previous[coordinate.kind] = reference;
+                        assert(cemu_kv_map_complete(map, &reference, true, 100) == CEMU_KV_OK);
+                        assert(cemu_kv_map_lookup(map, &owner, &coordinate, 99,
+                                                  &output, &offset) == CEMU_KV_PENDING);
+                        assert(cemu_kv_map_lookup(map, &owner, &coordinate, 100,
+                                                  &output, &offset) == CEMU_KV_OK);
+                        assert(output.backend_offset == reference.backend_offset && !offset);
+                    }
+                }
+                for (unsigned kind = 0; kind < 3; kind++) {
+                    for (unsigned lane = 0; lane < 8; lane++) {
+                        assert(counts[kind][lane] == config.nand.pages_per_block);
+                    }
+                }
+            }
+        }
+    }
+    free(occupied);
+    cemu_kv_map_destroy(map);
+}
+
+static void test_balanced_limits(void)
+{
+    CemuKvMapConfig config = configuration();
+    CemuKvMap *map = NULL;
+    CemuKvGeometry shape = geometry();
+    CemuKvCoordinate coordinate = {0};
+    CemuKvPageRef reference, first, unchanged;
+    CemuKvMapStats before;
+    bool occupied[8] = {0};
+    size_t base_bytes, task_bytes = (size_t)shape.layers * 3 * sizeof(uint32_t);
+
+    config.placement = CEMU_KV_PLACEMENT_BALANCED;
+    for (size_t failure = 1; failure <= 7; failure++) {
+        allocation_attempts = 0;
+        fail_allocation = failure;
+        assert(cemu_kv_map_create(&config, &map) == CEMU_KV_NO_MEMORY);
+        assert(!map && !live_allocations);
+    }
+    fail_allocation = 0;
+    assert(cemu_kv_map_create(&config, &map) == CEMU_KV_OK);
+    base_bytes = cemu_kv_map_stats(map).memory_bytes;
+    fail_allocation = allocation_attempts + 1;
+    assert(cemu_kv_map_register(map, &identity, &shape) == CEMU_KV_NO_MEMORY);
+    assert(cemu_kv_map_stats(map).tasks == 0);
+    assert(cemu_kv_map_stats(map).memory_bytes == base_bytes);
+    fail_allocation = 0;
+    assert(cemu_kv_map_register(map, &identity, &shape) == CEMU_KV_OK);
+    assert(cemu_kv_map_stats(map).memory_bytes == base_bytes + task_bytes);
+    cemu_kv_map_destroy(map);
+    config.memory_budget_bytes = base_bytes + task_bytes - 1;
+    assert(cemu_kv_map_create(&config, &map) == CEMU_KV_OK);
+    assert(cemu_kv_map_register(map, &identity, &shape) == CEMU_KV_LIMIT);
+    assert(cemu_kv_map_stats(map).tasks == 0);
+    cemu_kv_map_destroy(map);
+    config.memory_budget_bytes++;
+    map = create_map(config);
+    cemu_kv_map_destroy(map);
+    config = configuration();
+    config.placement = CEMU_KV_PLACEMENT_BALANCED;
+    config.nand.blocks_per_plane = 1;
+    config.nand.pages_per_block = 2;
+    map = create_map(config);
+    for (unsigned domain = 0; domain < 8; domain++) {
+        coordinate.batch = domain / 6;
+        coordinate.layer = (domain / 3) % 2;
+        coordinate.kind = domain % 3;
+        assert(cemu_kv_map_reserve(map, &identity, &coordinate, 1, &reference) == CEMU_KV_OK);
+        CemuKvPhysicalPage physical = reference.physical;
+        unsigned lane = physical.channel + 2 * (physical.lun + 2 * physical.plane);
+
+        assert(!occupied[lane]);
+        occupied[lane] = true;
+        if (!domain) {
+            first = reference;
+        }
+    }
+    before = cemu_kv_map_stats(map);
+    unchanged = reference;
+    coordinate.kind = 2;
+    for (unsigned retry = 0; retry < 2; retry++) {
+        assert(cemu_kv_map_reserve(map, &identity, &coordinate, 1, &reference) == CEMU_KV_NO_SPACE);
+        assert(memcmp(&unchanged, &reference, sizeof(reference)) == 0);
+        assert(cemu_kv_map_stats(map).claimed_blocks == before.claimed_blocks);
+        assert(cemu_kv_map_stats(map).reserved_pages == before.reserved_pages);
+    }
+    coordinate = (CemuKvCoordinate){ .head = 1 };
+    assert(cemu_kv_map_reserve(map, &identity, &coordinate, 1, &reference) == CEMU_KV_OK);
+    assert(same_block(first.physical, reference.physical) && reference.physical.page == 1);
+    cemu_kv_map_destroy(map);
+    map = NULL;
+    config.placement = 2;
+    assert(cemu_kv_map_create(&config, &map) == CEMU_KV_INVALID && !map);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -384,11 +522,19 @@ int main(int argc, char **argv)
     } else if (strcmp(argv[1], "visibility") == 0) {
         test_visibility();
     } else if (strcmp(argv[1], "data") == 0) {
-        test_data_and_placement(512, 8, 35);
+        test_data_and_placement(512, 8, 35, CEMU_KV_PLACEMENT_LEGACY);
     } else if (strcmp(argv[1], "paper") == 0) {
-        test_data_and_placement(4096, 2, 259);
-        test_data_and_placement(4096, 4, 259);
-        test_data_and_placement(4096, 8, 259);
+        test_data_and_placement(4096, 2, 259, CEMU_KV_PLACEMENT_LEGACY);
+        test_data_and_placement(4096, 4, 259, CEMU_KV_PLACEMENT_LEGACY);
+        test_data_and_placement(4096, 8, 259, CEMU_KV_PLACEMENT_LEGACY);
+    } else if (strcmp(argv[1], "balanced") == 0) {
+        test_balanced();
+        test_data_and_placement(512, 8, 35, CEMU_KV_PLACEMENT_BALANCED);
+        test_data_and_placement(4096, 2, 259, CEMU_KV_PLACEMENT_BALANCED);
+        test_data_and_placement(4096, 4, 259, CEMU_KV_PLACEMENT_BALANCED);
+        test_data_and_placement(4096, 8, 259, CEMU_KV_PLACEMENT_BALANCED);
+    } else if (strcmp(argv[1], "balanced-limits") == 0) {
+        test_balanced_limits();
     } else if (strcmp(argv[1], "exhaustion") == 0) {
         test_exhaustion();
     } else if (strcmp(argv[1], "invalid") == 0) {

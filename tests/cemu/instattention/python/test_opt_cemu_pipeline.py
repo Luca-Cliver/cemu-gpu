@@ -64,6 +64,8 @@ from cemu_flexgen.native_kv_store import NativeKvStore
 from native_kv_client import PAGE_BYTES as NATIVE_PAGE_BYTES
 from phase_profiler import PhaseProfiler, profile_scope
 from runtime_common import partition_kv_cache_by_batch
+from _cemu_client import CemuClient, MemoryRange
+from cemu_flexgen.fdm_kvbuffer_store import FDM_KVbuffer
 
 
 _LOG_START_NS = time.perf_counter_ns()
@@ -152,6 +154,13 @@ def parse_args():
     parser.add_argument("--sparf-native", action="store_true")
     parser.add_argument("--native-kv-device", default="/dev/ng0n1")
     parser.add_argument("--native-kv-budget", type=positive_integer, default=64 * 1024**2)
+    parser.add_argument("--fdm-internalbuf", action="store_true",
+                        help="use the experimental FDM KV buffer instead of native/grouped storage")
+    parser.add_argument("--fdm-buffer-meta-bytes", type=positive_integer,
+                        help="metadata allocation in bytes; required with --fdm-internalbuf, 4096-byte aligned")
+    parser.add_argument("--fdm-buffer-data-bytes", type=positive_integer,
+                        help="KV buffer allocation in bytes; required with --fdm-internalbuf, 4096-byte aligned")
+    parser.add_argument("--fdm-aggregate-program", default="./build/fdm_kv_aggregate.so")
     parser.add_argument("--sparf-grouped", action="store_true",
                         help="use the device-owned grouped KV pool (requires autonomous functional SparF)")
     parser.add_argument("--sparf-group-channels-per-page", type=positive_integer, default=8,
@@ -1017,6 +1026,16 @@ def diagnose_generations(
 def main():
     print(f"[opt-cemu] Guest I/O backend={io_backend()} (management commands remain ioctl)", flush=True)
     args = parse_args()
+    if args.fdm_internalbuf:
+        if (args.attention_mode != "sparf" or not args.sparf_autonomous or not args.functional or
+                args.sparf_kv_buffer_tokens or args.sparf_device_writeback):
+            raise ValueError("FDM KV requires functional autonomous SparF without legacy buffering/writeback")
+        if args.sparf_native or args.sparf_grouped:
+            raise ValueError("--fdm-internalbuf cannot be combined with --sparf-native or --sparf-grouped")
+        if args.fdm_buffer_meta_bytes is None or args.fdm_buffer_data_bytes is None:
+            raise ValueError("--fdm-internalbuf requires --fdm-buffer-meta-bytes and --fdm-buffer-data-bytes")
+        if args.fdm_buffer_meta_bytes % 4096 or args.fdm_buffer_data_bytes % 4096:
+            raise ValueError("FDM buffer metadata and data capacities must be multiples of 4096 bytes")
     selected_modes = sum(
         mode is not None and mode is not False
         for mode in (args.benchmark, args.functional, args.trace_file)
@@ -1059,7 +1078,7 @@ def main():
         raise RuntimeError("PyTorch cannot access the Guest GPU")
 
     model_directory = require_directory("model directory", args.model_dir)
-    nvm_root = Path(tempfile.gettempdir()) if args.sparf_native else require_directory("NVM directory", args.nvm_dir)
+    nvm_root = Path(tempfile.gettempdir()) if args.sparf_native or args.fdm_internalbuf else require_directory("NVM directory", args.nvm_dir)
     fdm_root = require_directory("FDM directory", args.fdm_dir)
     default_program = (
         f"./build/{'sparf_attention' if args.attention_mode == 'sparf' else 'dense_attention'}"
@@ -1214,7 +1233,10 @@ def main():
         f"decode_steps={args.decode_steps}, attention_slots={args.attention_slots}"
     )
     if args.attention_mode == "sparf":
-        if args.sparf_native:
+        if args.fdm_internalbuf:
+            log(f"[opt-cemu] FDM KV: metadata={args.fdm_buffer_meta_bytes}, data={args.fdm_buffer_data_bytes}; "
+                "pwrite -> automatic aggregation -> KV FTL; no NVM files; one input packet in flight")
+        elif args.sparf_native:
             streams = args.batch_size * config.num_hidden_layers * config.num_key_value_heads
             packet_tokens = NATIVE_PAGE_BYTES // (2 * config.head_dim * layout_dtype.itemsize)
             prefill_commands = streams * ((prompt_length + packet_tokens - 1) // packet_tokens)
@@ -1265,7 +1287,27 @@ def main():
                 max_seq_len, gpu_batch_size, device_path=args.native_kv_device,
                 control_path=args.control, namespace_path=args.namespace,
                 budget=args.native_kv_budget, batch_pages=args.sparf_group_write_batch_pages)
-        if grouped_capacity is not None:
+        elif args.fdm_internalbuf:
+            grouped_store = FDM_KVbuffer(
+                layout=SparfGroupLayout(config.head_dim,
+                                        args.sparf_group_channels_per_page,
+                                        dtype=layout_dtype
+                ),
+                batches = args.batch_size,
+                layers = config.num_hidden_layers,
+                heads = config.num_key_value_heads,
+                max_tokens = max_seq_len,
+                microbatch_size = gpu_batch_size,
+                fdm_directory=fdm_path,
+                meta_bytes=args.fdm_buffer_meta_bytes,
+                data_bytes=args.fdm_buffer_data_bytes,
+                control_path=args.control,
+                namespace_path=args.namespace,
+                batch_pages=args.sparf_group_write_batch_pages,
+                aggregate_program=args.fdm_aggregate_program,
+            )
+
+        elif grouped_capacity is not None:
             grouped_store = SparfGroupedDevice(
                 SparfGroupLayout(
                     config.head_dim,
@@ -1427,7 +1469,9 @@ def main():
             for backend in cemu_backends:
                 backend_stack.enter_context(backend)
             if args.attention_mode == "sparf":
-                log(f"[opt-cemu] KV storage={'native FTL/token-channel addressing' if args.sparf_native else 'legacy/grouped'}")
+                storage_name = ("FDM buffer/pwrite + KV FTL" if args.fdm_internalbuf else
+                                "native FTL/token-channel addressing" if args.sparf_native else "legacy/grouped")
+                log(f"[opt-cemu] KV storage={storage_name}")
                 log(f"[opt-cemu] SparF ready: devices={len(sparf_devices)}, "
                     f"staged={args.sparf_staged}, autonomous={args.sparf_autonomous}, "
                     f"ranges_per_device={12 if args.sparf_staged else 11}, "

@@ -12,6 +12,22 @@ BUILD = Path(os.environ.get("CEMU_QEMU_BUILD_DIR", ROOT / "build")).resolve()
 
 
 class InstattentionQemuIoTest(unittest.TestCase):
+    def test_fdm_kv_layout(self):
+        with tempfile.TemporaryDirectory(prefix="cemu-fdm-aggregate-") as directory:
+            library = Path(directory) / "fdm_kv_aggregate.so"
+            subprocess.run([
+                "cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
+                str(ROOT / "tests/cemu/kernel/fdm_kv_aggregate.c"),
+                str(ROOT / "hw/femu/fdm_kv_layout.c"), "-o", str(library),
+            ], check=True, timeout=120)
+            executable = self.build_sources([
+                "hw/femu/fdm_kv_layout.c",
+                "hw/femu/fdm_kv_buffer.c",
+                "hw/femu/fdm_kv_receive.c",
+                "tests/cemu/instattention/guest/test_fdm_kv_layout.c",
+            ], directory)
+            subprocess.run([str(executable), str(library)], check=True, timeout=30)
+
     def test_native_internal_entry(self):
         self.run_sources([
             "hw/femu/bbssd/ftl.c",

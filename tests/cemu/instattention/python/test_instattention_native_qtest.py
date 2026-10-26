@@ -23,7 +23,13 @@ ASQ, ACQ, IOSQ, IOCQ, DBS, EIS, DATA = [0x100000 + index * 0x10000 for index in 
 
 
 class NativeQtest:
-    def __init__(self, directory, config=CONFIG, *, cuda=False):
+    def __init__(self, directory, config=CONFIG, *, cuda=False, ftl_mode="instattention",
+                 page_limit=65536, placement="legacy"):
+        if ftl_mode not in ("femu", "instattention"):
+            raise ValueError("unsupported FTL mode")
+        if placement not in ("legacy", "balanced"):
+            raise ValueError("unsupported KV placement")
+        self.ftl_mode = ftl_mode
         environment = {**os.environ, "CEMU_CUDA_SYNC": "0"}
         if cuda:
             visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -39,8 +45,9 @@ class NativeQtest:
             "-display", "none", "-nodefaults", "-qtest-log", "/dev/null",
             "-qtest", f"unix:{directory}/qtest.sock,server=on,wait=off",
             "-qmp", f"unix:{directory}/qmp.sock,server=on,wait=off",
-            "-device", f"femu,id=native0,addr=04.0,ftl_mode=instattention,config_file={config},"
-                       f"nvm_backend_file={self.backend}",
+            "-device", f"femu,id=native0,addr=04.0,ftl_mode={ftl_mode},config_file={config},"
+                       f"nvm_backend_file={self.backend},native_kv_page_limit={page_limit},"
+                       f"native_kv_placement={placement}",
         ], cwd=directory, stdout=self.log, stderr=self.log,
             env=environment)
         self.socket = socket.socket(socket.AF_UNIX)
@@ -182,8 +189,9 @@ class NativeQtest:
 
     def close(self):
         try:
-            self.qmp_command("qom-set", {"path": "/machine/peripheral/native0",
-                                       "property": "realized", "value": False})
+            if self.ftl_mode == "instattention":
+                self.qmp_command("qom-set", {"path": "/machine/peripheral/native0",
+                                           "property": "realized", "value": False})
             self.qmp_command("quit")
             self.process.wait(timeout=5)
             if self.process.returncode != 0:
@@ -396,6 +404,22 @@ class NativeDeviceTest(unittest.TestCase):
                     self.assertEqual(backend.read_bytes(), sentinel)
                     if path != backend:
                         self.assertFalse(path.exists())
+
+    def test_invalid_placement_rejected_before_backend_creation(self):
+        with tempfile.TemporaryDirectory(prefix="native-placement-guard-") as directory:
+            backend = Path(directory) / "new.img"
+            for mode, placement in (("instattention", "unknown"), ("femu", "balanced")):
+                with self.subTest(mode=mode, placement=placement):
+                    result = subprocess.run([
+                        str(QEMU), "-machine", "pc", "-accel", "qtest", "-display", "none",
+                        "-nodefaults", "-m", "64M", "-device",
+                        f"femu,ftl_mode={mode},config_file={CONFIG},nvm_backend_file={backend},"
+                        f"native_kv_placement={placement}",
+                    ], cwd=directory, env={**os.environ, "CEMU_CUDA_SYNC": "0"},
+                        capture_output=True, timeout=5)
+                    self.assertGreater(result.returncode, 0)
+                    self.assertIn(b"native_kv_placement", result.stderr)
+                    self.assertFalse(backend.exists())
 
     def test_cuda_init_failure_stops_native_boot(self):
         with tempfile.TemporaryDirectory(prefix="native-cuda-guard-") as directory:

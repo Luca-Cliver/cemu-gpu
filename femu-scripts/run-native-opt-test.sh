@@ -15,8 +15,13 @@ config=$repo/tests/cemu/instattention/experiments/configs/native_opt125m_smoke.j
 csd_target=${CEMU_NATIVE_CSD_TARGET:-cpu}
 timeline=${CEMU_NATIVE_TIMELINE:-0}
 read_diagnostics=${CEMU_SPARF_READ_DIAGNOSTICS:-0}
+kv_placement=${CEMU_NATIVE_KV_PLACEMENT:-legacy}
 device_init_order=${CEMU_DEVICE_INIT_ORDER:-vfio-first}
 vcpus=${CEMU_NATIVE_VCPUS:-4}
+if [[ "$kv_placement" != legacy && "$kv_placement" != balanced ]]; then
+    echo 'CEMU_NATIVE_KV_PLACEMENT must be legacy or balanced.' >&2
+    exit 1
+fi
 if [[ "$device_init_order" != vfio-first && "$device_init_order" != femu-first ]]; then
     echo 'CEMU_DEVICE_INIT_ORDER must be vfio-first or femu-first.' >&2
     exit 1
@@ -97,6 +102,7 @@ case "$profile" in
         ;;
     *) echo 'CEMU_NATIVE_PROFILE must be smoke or b4-p1024-d16.' >&2; exit 1 ;;
 esac
+config=${CEMU_NATIVE_CONFIG:-$config}
 boot_args=()
 network_args=(-nic none)
 case "$boot_mode" in
@@ -144,6 +150,7 @@ fi
 printf '%s\n' "csd_target=$csd_target" "program=$operator" "profile=$profile" \
     "guest_memory=$memory" "guest_vcpus=$vcpus" "native_buffer_budget=$buffer_budget" "native_page_limit=$page_limit" \
     "timeline=$timeline_path" "read_diagnostics=$read_diagnostics" "device_init_order=$device_init_order" \
+    "native_kv_placement=$kv_placement" \
     "cuda_library_path=${CEMU_CUDA_LIBRARY_PATH:-}" \
     "${cuda_env[@]}" > "$directory/guest-logs/launch-settings.txt"
 models=$(readlink -f -- "$models")
@@ -166,6 +173,7 @@ fi
 printf 'Device timeline: %s\n' "${timeline_path:-disabled}"
 printf 'Native read diagnostics: %s (page/LUN counters; full-scan reference issues no IO).\n' "$read_diagnostics"
 printf 'Device initialization order: %s\n' "$device_init_order"
+printf 'Native KV block placement: %s (shared by Native and FDM buffers)\n' "$kv_placement"
 echo 'Stop any VM using the OS backing image or this VFIO GPU before starting.'
 if [[ "$boot_mode" == normal ]]; then
     echo 'Normal systemd/login boot; use only the updated native-aware cemu-mount.sh. SSH: localhost:2222.'
@@ -176,7 +184,7 @@ echo 'Do NOT format or mount native NVM as a filesystem.'
 echo 'Guest setup and OPT command: tests/cemu/instattention/README.md, Native Guest OPT-125M section.'
 echo 'Shutdown: poweroff in normal mode; sync; /sbin/poweroff -f in rescue mode. Each launch creates a fresh native NVM session.'
 
-femu_device="femu,ftl_mode=instattention,config_file=$config,nvm_backend_file=$directory/nvm.img,native_kv_buffer_budget=$buffer_budget,native_kv_page_limit=$page_limit"
+femu_device="femu,ftl_mode=instattention,config_file=$config,nvm_backend_file=$directory/nvm.img,native_kv_buffer_budget=$buffer_budget,native_kv_page_limit=$page_limit,native_kv_placement=$kv_placement"
 vfio_device="vfio-pci,host=$gpu,id=guestgpu0"
 early_device=$vfio_device
 late_device=$femu_device

@@ -5,8 +5,18 @@
 #include "hw/femu/csd/sched.h"
 #include "hw/femu/inc/pqueue.h"
 #include "hw/femu/bbssd/bb.h"
+#include "hw/femu/fdm_kv_binding.h"
+#include "hw/femu/fdm_kv_writer.h"
 
 static int nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
+
+static void queue_io_completion(FemuCtrl *ctrl, NvmeRequest *request)
+{
+    if (femu_ring_enqueue(ctrl->to_poller[request->poller], (void *)&request, 1) != 1 &&
+        ctrl->native_kv && pqueue_insert(ctrl->pq[request->poller], request)) {
+        abort();
+    }
+}
 
 static void nvme_update_sq_eventidx(const NvmeSQueue *sq)
 {
@@ -91,6 +101,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->p2p_req = 0;
         req->sparf_cancelled = NULL;
         req->read_observation = NULL;
+        req->fdm_kv_pending = false;
         if (n->native_kv) {
             n->native_inflight++;
         }
@@ -105,7 +116,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             femu_err("%s, NVME_INVALID_NSID %" PRIu32 "\n", __func__, nsid);
             req->status = NVME_INVALID_NSID | NVME_DNR;
             if (n->native_kv) {
-                femu_ring_enqueue(n->to_poller[req->poller], (void *)&req, 1);
+                queue_io_completion(n, req);
             }
             processed++;
             continue;
@@ -118,7 +129,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             femu_err("Error IO processed! opcode %d\n", cmd.opcode);
         }
         if (finished) {
-            femu_ring_enqueue(n->to_poller[req->poller], (void*)&req, 1);
+            queue_io_completion(n, req);
         }
 
         processed++;
@@ -308,6 +319,14 @@ static void nvme_process_cq_cpl(FemuCtrl *n, int index_poller)
         }
         if (!cq->is_active)
             continue;
+        if (req->fdm_kv_pending) {
+            if (!fdm_kv_complete_write(req)) {
+                pqueue_pop(pq);
+                QTAILQ_INSERT_TAIL(&deferred, req, entry);
+                continue;
+            }
+            now = clock_ns();
+        }
         nvme_post_cqe(cq, req);
         pthread_spin_lock(&sq->lock);
         QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
@@ -422,12 +441,14 @@ void *nvme_poller(void *arg)
 void nvme_native_stop(FemuCtrl *n)
 {
     if (!n->poller_on) {
+        fdm_kv_writers_stop(n);
         return;
     }
     qatomic_set(&n->native_stop, true);
     qemu_thread_join(&n->poller[1]);
     if (n->num_namespaces == 3) compute_native_quiesce(&n->namespaces[2]);
     bb_native_stop(&n->namespaces[0]);
+    fdm_kv_writers_stop(n);
     pqueue_free(n->pq[1]);
     femu_ring_free(n->to_poller[1]);
     g_free(n->pq);

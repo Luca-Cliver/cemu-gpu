@@ -10,6 +10,7 @@ TARGETS = \
 	$(BUILD_DIR)/attention_phases_devptr.so \
 	$(BUILD_DIR)/sparf_attention.so \
 	$(BUILD_DIR)/sparf_attention_devptr.so \
+	$(BUILD_DIR)/fdm_kv_aggregate.so \
 	$(BUILD_DIR)/lz4.so \
 	$(BUILD_DIR)/grep.so \
 	$(BUILD_DIR)/sql.so \
@@ -32,6 +33,9 @@ CXXFLAGS = -Wall -Wextra -O2 -march=native -std=c++11
 
 $(BUILD_DIR)/vadd.so: vadd.c
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
+$(BUILD_DIR)/fdm_kv_aggregate.so: fdm_kv_aggregate.c cemu_def.h ../../../hw/femu/fdm_kv_aggregate.h ../../../hw/femu/fdm_kv_buffer_abi.h ../../../hw/femu/fdm_kv_layout.h ../../../hw/femu/fdm_kv_layout.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ fdm_kv_aggregate.c ../../../hw/femu/fdm_kv_layout.c
 
 $(BUILD_DIR)/freeze_clock_probe.so: freeze_clock_probe.c cemu_def.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<

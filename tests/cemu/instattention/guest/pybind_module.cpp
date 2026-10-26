@@ -202,6 +202,15 @@ PYBIND11_MODULE(_cemu_client, module)
         .def("activate_program", &CemuClient::activate_program)
         .def("create_memory_ranges", &CemuClient::create_memory_ranges,
              py::arg("ranges"))
+        .def("release_memory_ranges", &CemuClient::release_memory_ranges,
+             py::call_guard<py::gil_scoped_release>())
+        .def("bind_fdm_kv_buffer",
+             [](CemuClient &client, const py::buffer &metadata) {
+                 const py::buffer_info info = metadata.request();
+                 const std::size_t size = contiguous_buffer_size(info);
+                 py::gil_scoped_release release;
+                 client.bind_fdm_kv_buffer(info.ptr, size);
+             }, py::arg("metadata"))
         .def("write_range",
              [](CemuClient &client, std::size_t range_index,
                 const py::buffer &buffer, std::uint64_t range_offset) {

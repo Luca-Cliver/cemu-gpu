@@ -40,6 +40,17 @@ instattention-io-transport-test: instattention
 	ctest --test-dir $(INSTATTENTION_BUILD_DIR) -R '^io_transport$$' --output-on-failure
 
 .PHONY: instattention-freeze-clock-test
+.PHONY: instattention-fdm-buffer-init-qtest instattention-fdm-buffer-receive-qtest instattention-fdm-buffer-write-qtest
+instattention-fdm-buffer-receive-qtest: instattention-fdm-buffer-init-qtest
+instattention-fdm-buffer-write-qtest: instattention-fdm-buffer-init-qtest
+
+.PHONY: instattention-fdm-buffer-aggregate-test
+instattention-fdm-buffer-aggregate-test:
+	PYTHONPATH="$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_instattention_qemu_io.InstattentionQemuIoTest.test_fdm_kv_layout
+
+instattention-fdm-buffer-init-qtest:
+	PYTHONPATH="$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_fdm_kv_binding
+
 instattention-freeze-clock-test: instattention
 	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) \
 		$(INSTATTENTION_DIR)/experiments/freeze_clock_probe.py run \
@@ -53,6 +64,9 @@ instattention-layout-test:
 .PHONY: instattention-native-address-test instattention-native-mapping-test instattention-native-io-test
 
 .PHONY: instattention-native-contract-test instattention-native-csd-qtest instattention-native-regression-test
+.PHONY: instattention-fdm-csd-qtest
+instattention-fdm-csd-qtest:
+	PYTHONPATH="$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_native_csd_pipeline.FdmCsdPipelineTest
 instattention-native-address-test instattention-native-mapping-test instattention-native-io-test: instattention-native-contract-test
 
 instattention-native-contract-test:
@@ -303,6 +317,10 @@ instattention-opt-cemu-gpu-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_opt_cemu_pipeline.py \
 		--model-dir "$(MODEL_DIR)" \
 		$(if $(filter 1 true yes,$(SPARF_NATIVE)),--sparf-native) \
+		$(if $(filter 1 true yes,$(FDM_INTERNALBUF)),--fdm-internalbuf) \
+		$(if $(FDM_BUFFER_META_BYTES),--fdm-buffer-meta-bytes "$(FDM_BUFFER_META_BYTES)") \
+		$(if $(FDM_BUFFER_DATA_BYTES),--fdm-buffer-data-bytes "$(FDM_BUFFER_DATA_BYTES)") \
+		$(if $(FDM_AGGREGATE_PROGRAM),--fdm-aggregate-program "$(FDM_AGGREGATE_PROGRAM)") \
 		$(if $(NATIVE_KV_DEVICE),--native-kv-device "$(NATIVE_KV_DEVICE)") \
 		$(if $(NATIVE_KV_BUDGET),--native-kv-budget "$(NATIVE_KV_BUDGET)") \
 		--nvm-dir "$(if $(NVM_TEST_DIR),$(NVM_TEST_DIR),/mnt/nvme0)" \

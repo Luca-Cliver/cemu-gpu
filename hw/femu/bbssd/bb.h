@@ -1,6 +1,7 @@
 #include "../nvme.h"
 #include "instattention_io.h"
 #include "instattention_buffer.h"
+#include "../fdm_kv_buffer_abi.h"
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
@@ -200,9 +201,15 @@ typedef struct NvmNamespace {
     bool native_io_used;
     bool native_stop;
     bool native_started;
+    /*native buffer路径*/
     uint64_t native_deadline;
     uint8_t *native_buffer;
     NativeKvBuffer *native_tail;
+
+    /*fdm buffer路径*/
+    bool fdm_kvbuffer_initialized;
+    FDMKV_Buffer_t *fdm_kv_buffer;
+
     struct line_mgmt lm;
     struct write_pointer wp;
     struct write_pointer kv_wp[3];

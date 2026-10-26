@@ -29,7 +29,8 @@ class NativeKvContractsTest(unittest.TestCase):
     def test_mapping(self):
         self.run_contract("mapping", ["hw/femu/bbssd/instattention_mapping.c",
             "tests/cemu/instattention/guest/test_instattention_mapping.c"],
-            ["identity", "visibility", "data", "paper", "exhaustion", "invalid", "allocation"],
+            ["identity", "visibility", "data", "paper", "exhaustion", "invalid", "allocation",
+             "balanced", "balanced-limits"],
             ["-Wl,--wrap=calloc", "-Wl,--wrap=free"])
 
     def test_io(self):

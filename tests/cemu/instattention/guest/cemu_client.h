@@ -49,6 +49,8 @@ public:
     void activate_program();
 
     std::uint16_t create_memory_ranges(const std::vector<MemoryRange> &ranges);
+    void release_memory_ranges();
+    void bind_fdm_kv_buffer(const void *metadata, std::size_t metadata_size);
 
     void write_range(std::size_t range_index,
                      const void *data,

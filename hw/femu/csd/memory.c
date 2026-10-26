@@ -3,6 +3,8 @@
 #include "hw/femu/nvme-def.h"
 #include "hw/femu/nvme.h"
 #include "memory.h"
+#include "hw/femu/fdm_kv_binding.h"
+#include "hw/femu/fdm_kv_receive.h"
 
 static inline uint16_t check_param(NvmeNamespace *ns, uint64_t sb, uint32_t len, const char *func)
 {
@@ -10,7 +12,7 @@ static inline uint16_t check_param(NvmeNamespace *ns, uint64_t sb, uint32_t len,
         femu_err("%s: sb %lu, len %u not dword-aligned!\n", func, sb, len);
         return NVME_INVALID_FIELD;
     }
-    if (sb + len > ns->backend->size) {
+    if (sb > ns->backend->size || len > ns->backend->size - sb) {
         femu_err("%s: sb (%lu) + fl (%u) > backend size (%lu)!\n", func, sb, len, ns->backend->size);
         return NVME_INVALID_FIELD;
     }
@@ -33,14 +35,19 @@ static uint16_t memory_read(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         return ret;
     }
 
+    MemoryNamespace *memory = ns->private;
+    g_mutex_lock(&memory->fdm_kv_lock);
     if (backend_cuda_prepare_host(ns->backend,
                                   backend_addr(ns->backend, sb), rl) != 0) {
+        g_mutex_unlock(&memory->fdm_kv_lock);
         return NVME_DNR;
     }
     if (dma_read_prp(n, backend_addr(ns->backend, sb), rl, prp1, prp2)) {
         femu_err("memory_read: dma_read_prp error\n");
+        g_mutex_unlock(&memory->fdm_kv_lock);
         return NVME_DNR;
     }
+    g_mutex_unlock(&memory->fdm_kv_lock);
     req->stat.pcie_lat = 0;
     req->stat.data_size = rl;
     req->stat.reqlat += rl / 2;
@@ -67,9 +74,22 @@ static uint16_t memory_write(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         return ret;
     }
 
+    MemoryNamespace *memory = ns->private;
+    g_mutex_lock(&memory->fdm_kv_lock);
+    FDMKV_Binding_t *binding = memory->fdm_kv_binding;
+    bool input = false;
+    ret = fdm_kv_write_check(binding, sb, wl, &input);
+    if (ret) {
+        goto out;
+    }
     if (dma_write_prp(n, backend_addr(ns->backend, sb), wl, prp1, prp2)) {
         femu_err("memory_write: dma_read_prp error\n");
-        return NVME_DNR;
+        if (input) {
+            fdm_kv_receive_fail(binding->buffer);
+            backend_cuda_mark_host_dirty(ns->backend, backend_addr(ns->backend, sb), wl);
+        }
+        ret = input ? NVME_DATA_TRAS_ERROR | NVME_DNR : NVME_DNR;
+        goto out;
     }
 
     backend_cuda_mark_host_dirty(ns->backend,
@@ -80,7 +100,32 @@ static uint16_t memory_write(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     req->stat.reqlat += wl / 2;
     req->stat.expire_time += wl / 2;
     req->cqe.n.result = wl;
-    return NVME_SUCCESS;
+    if (input) {
+        FDMKV_ReceiveResult result = fdm_kv_receive_record(
+            binding->buffer, sb - binding->input_sb, wl, req->stat.expire_time);
+        if (result == FDM_KV_RECEIVE_READY) {
+            if (binding->aggregate_program) {
+                binding->pending_write = req;
+                req->fdm_kv_pending = true;
+                req->stat.expire_time = MAX(req->stat.expire_time,
+                    binding->buffer->receive->max_write_ready_ns);
+            } else {
+                femu_err("FDM KV receive-only binding cannot aggregate; write not acknowledged\n");
+                ret = NVME_INVALID_OPCODE | NVME_DNR;
+            }
+        } else if (result != FDM_KV_RECEIVE_ACCEPTED) {
+            ret = NVME_INVALID_FIELD | NVME_DNR;
+        }
+    }
+out:
+    if (input) {
+        backend_cuda_mark_host_dirty(ns->backend, binding->buffer, binding->buffer->meta_bytes);
+    }
+    if (ret) {
+        req->cqe.n.result = 0;
+    }
+    g_mutex_unlock(&memory->fdm_kv_lock);
+    return ret;
 }
 
 static uint16_t memory_fill(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
@@ -96,7 +141,14 @@ static uint16_t memory_fill(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
         return ret;
     }
 
+    MemoryNamespace *memory = ns->private;
+    g_mutex_lock(&memory->fdm_kv_lock);
+    if (fdm_kv_range_overlaps(memory->fdm_kv_binding, sb, fl)) {
+        g_mutex_unlock(&memory->fdm_kv_lock);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
     backend_fill(ns->backend, sb, fl);
+    g_mutex_unlock(&memory->fdm_kv_lock);
     req->stat.pcie_lat = 0;
     req->stat.data_size = fl;
     req->stat.reqlat += fl / 2;
@@ -254,7 +306,8 @@ static int memory_io_cmd(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
 
 static void memory_init(NvmeNamespace *ns, Error **err)
 {
-    MemoryNamespace *mns = malloc(sizeof(MemoryNamespace));
+    MemoryNamespace *mns = g_new0(MemoryNamespace, 1);
+    g_mutex_init(&mns->fdm_kv_lock);
     ns->private = mns;
     // nvme_init_slm(n, ns);
     if (!ns->ctrl->native_kv)
@@ -263,8 +316,10 @@ static void memory_init(NvmeNamespace *ns, Error **err)
 
 static void memory_exit(NvmeNamespace *ns)
 {
-    if (ns->ctrl->native_kv) {
-        free(ns->private);
+    MemoryNamespace *memory = ns->private;
+    if (memory) {
+        g_mutex_clear(&memory->fdm_kv_lock);
+        g_free(memory);
         ns->private = NULL;
     }
 }

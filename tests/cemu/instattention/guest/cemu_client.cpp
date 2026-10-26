@@ -3,6 +3,7 @@
 
 #include "../../cemu_ioctl.h"
 #include "../../util.h"
+#include "../../../../hw/femu/fdm_kv_buffer_abi.h"
 
 #include <cerrno>
 #include <climits>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <linux/nvme_ioctl.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -340,6 +342,72 @@ std::uint16_t CemuClient::create_memory_ranges(const std::vector<MemoryRange> &r
             ::close(fd);
         }
         throw;
+    }
+}
+
+void CemuClient::release_memory_ranges()
+{
+    ensure_open();
+    if (!memory_ranges_created_) {
+        return;
+    }
+    const int namespace_id = ioctl(namespace_fd_, NVME_IOCTL_ID);
+    if (namespace_id < 0) {
+        throw_system_error("query CEMU compute namespace ID");
+    }
+    nvme_passthru_cmd command = {};
+    command.opcode = 0x21;
+    command.nsid = static_cast<std::uint32_t>(namespace_id);
+    command.cdw10 = 1 | (static_cast<std::uint32_t>(memory_range_set_id_) << 16);
+    const int status = ioctl(namespace_fd_, NVME_IOCTL_ADMIN_CMD, &command);
+    if (status < 0) {
+        throw_system_error("delete CEMU memory range set");
+    }
+    if (status != 0) {
+        throw std::runtime_error("delete CEMU memory range set: status " + std::to_string(status));
+    }
+    memory_ranges_created_ = false;
+    memory_range_set_id_ = 0;
+    for (int &fd : memory_fds_) {
+        close_fd(fd);
+    }
+    memory_fds_.clear();
+    memory_ranges_.clear();
+}
+
+void CemuClient::bind_fdm_kv_buffer(const void *metadata, std::size_t metadata_size)
+{
+    ensure_open();
+    ensure_memory_ranges_created();
+    ensure_program_active();
+    if (program_target_ != static_cast<int>(ProgramTarget::Host)) {
+        throw std::invalid_argument("FDM KV aggregation requires a Host program");
+    }
+    if (memory_ranges_.size() != 2 || !metadata ||
+        metadata_size != sizeof(FDMKV_BindParams_t)) {
+        throw std::invalid_argument("FDM KV binding requires two ranges and an 80-byte descriptor");
+    }
+    const int namespace_id = ioctl(namespace_fd_, NVME_IOCTL_ID);
+    if (namespace_id < 0) {
+        throw_system_error("query CEMU compute namespace ID");
+    }
+    AlignedBuffer buffer(metadata_size);
+    std::memcpy(buffer.data(), metadata, metadata_size);
+    nvme_passthru_cmd command = {};
+    command.opcode = 0x21;
+    command.nsid = static_cast<std::uint32_t>(namespace_id);
+    command.cdw10 = CEMU_FDM_KV_BIND_SELECTOR |
+                    (static_cast<std::uint32_t>(memory_range_set_id_) << 16);
+    command.cdw11 = static_cast<std::uint32_t>(metadata_size);
+    command.cdw12 = program_id_;
+    command.addr = reinterpret_cast<std::uintptr_t>(buffer.data());
+    command.data_len = static_cast<std::uint32_t>(metadata_size);
+    const int status = ioctl(namespace_fd_, NVME_IOCTL_ADMIN_CMD, &command);
+    if (status < 0) {
+        throw_system_error("bind FDM KV buffer");
+    }
+    if (status != 0) {
+        throw std::runtime_error("bind FDM KV buffer: NVMe status " + std::to_string(status));
     }
 }
 
