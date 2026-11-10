@@ -15,6 +15,81 @@ from cemu_flexgen.kv_staging import KvStagingManager
 
 
 class IoTransportTest(unittest.TestCase):
+    def test_pybind_read_into_rejects_unsafe_buffers_before_io(self):
+        import numpy as np
+        from _cemu_client import CemuClient
+
+        # No NVMe management calls: /dev/null is enough to verify buffer checks
+        # run before accessing a memory range or releasing the Python buffer.
+        client = CemuClient("/dev/null", "/dev/null")
+        self.addCleanup(client.close)
+        readonly = np.zeros(8, dtype=np.float16)
+        readonly.flags.writeable = False
+        for bad in (readonly, np.zeros((2, 4))[:, ::2], np.empty(4, dtype=object)):
+            with self.assertRaises((ValueError, BufferError)):
+                client.read_range_into(0, bad)
+
+    def test_read_into_reuses_output_and_rejects_unsafe_buffers(self):
+        import numpy as np
+        from cemu_flexgen.cemu_device import CemuDevice, RangeSpec
+        from phase_profiler import PhaseProfiler
+
+        for profiled in (False, True):
+            profiler = PhaseProfiler(stack=True) if profiled else None
+            device = CemuDevice("test", "./unused.so", "test", [RangeSpec("/unused", 4096)],
+                                profiler=profiler)
+            client = device._client = Mock()
+            timings = dict(binding_prepare_wall=1, buffer_prepare_wall=2, io_wait_wall=3,
+                           buffer_finish_wall=0, binding_finish_wall=5, io_bytes=512)
+
+            def read(index, target, offset, **kwargs):
+                target.fill(17)
+                return (None, timings) if kwargs.get("profile") else None
+
+            client.read_range_into.side_effect = read
+            output = np.empty((2, 128), dtype=np.float16)
+            self.assertIs(device.read_tensor_into(0, output), output)
+            np.testing.assert_array_equal(output, np.full_like(output, 17))
+            client.read_range.assert_not_called()
+            readonly = output.copy()
+            readonly.flags.writeable = False
+            for bad in (readonly, output[:, ::2], np.empty(4, dtype=object)):
+                with self.assertRaisesRegex(ValueError, "writable C-contiguous numeric"):
+                    device.read_tensor_into(0, bad)
+            self.assertEqual(client.read_range_into.call_count, 1)
+            if profiler:
+                metrics = {metric.name: metric for metric in profiler.snapshot()}
+                self.assertEqual(metrics["attention.mr0.read.io_wait_wall"].total_ns, 3)
+            device.close()
+
+    def test_profiled_attention_client_preserves_data_and_execute_arguments(self):
+        import numpy as np
+        from cemu_flexgen.cemu_device import CemuDevice, RangeSpec
+        from phase_profiler import PhaseProfiler
+
+        profiler = PhaseProfiler(stack=True)
+        device = CemuDevice("test", "./unused.so", "test", [RangeSpec("/unused", 4096)],
+                            profiler=profiler, profile_range_names={0: "query"})
+        client = Mock()
+        device._client = client
+        timings = dict(binding_prepare_wall=1, buffer_prepare_wall=2, io_wait_wall=3,
+                       buffer_finish_wall=4, binding_finish_wall=5, io_bytes=512)
+        data = np.arange(8, dtype=np.float32)
+        client.write_range.return_value = None, timings
+        client.read_range.return_value = data.view(np.uint8), timings
+        client.execute.return_value = 17, timings
+        device.write_tensor(0, data)
+        self.assertEqual(client.write_range.call_args.kwargs, {"profile": True})
+        np.testing.assert_array_equal(client.write_range.call_args.args[1], data)
+        np.testing.assert_array_equal(device.read_tensor(0, data.shape, data.dtype), data)
+        self.assertEqual(device.execute(123, 456, metadata=b"metadata"), 17)
+        client.execute.assert_called_once_with(123, 456, 0, 0, 0, b"metadata", profile=True)
+        metrics = {metric.name: metric for metric in profiler.snapshot()}
+        for name in ("attention.query.write", "attention.query.read", "attention.execute"):
+            self.assertEqual(metrics[name + ".io_wait_wall"].total_ns, 3)
+            self.assertEqual(metrics[name + ".io_wait_wall"].count, 1)
+        device.close()
+
     def setUp(self):
         self.environment = patch.dict(os.environ, {"CEMU_IO_BACKEND": "ioctl"})
         self.environment.start()

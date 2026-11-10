@@ -7,11 +7,39 @@ from unittest.mock import Mock, patch
 from native_kv_client import (
     BUFFER_APPEND, BUFFER_DRAIN, INFO, LinuxTransport, PAGE_BYTES,
     BUFFER_APPEND_BATCH, APPEND_MAX_BYTES,
-    retry_buffer, run_buffer_contract, run_contract,
+    require_fresh_namespace, retry_buffer, run_buffer_contract, run_contract,
 )
 
 
 class NativeKVTransportTest(unittest.TestCase):
+    def test_fresh_namespace_check_only_issues_info(self):
+        data = bytearray(PAGE_BYTES)
+        struct.pack_into("<5I", data, 0, 0x31564B4E, 1, 0, 1, PAGE_BYTES)
+        transport = Mock(return_value=(0, 0, bytes(data)))
+        self.assertEqual(require_fresh_namespace(transport), (0, 1))
+        transport.assert_called_once_with(INFO, (1, 0, 0, 0, 0, 0), None)
+
+    def test_used_namespace_rejected_even_after_session_files_are_deleted(self):
+        for index, name in enumerate(("reserved_pages", "written_pages", "failed_pages", "claimed_blocks")):
+            with self.subTest(counter=name):
+                data = bytearray(PAGE_BYTES)
+                struct.pack_into("<5I", data, 0, 0x31564B4E, 1, 0, 1, PAGE_BYTES)
+                struct.pack_into("<Q", data, 40 + 8 * index, 1)
+                transport = Mock(return_value=(0, 0, bytes(data)))
+                with self.assertRaisesRegex(RuntimeError, name + "=1.*relaunch Host QEMU"):
+                    require_fresh_namespace(transport)
+                transport.assert_called_once_with(INFO, (1, 0, 0, 0, 0, 0), None)
+
+    def test_fresh_namespace_check_rejects_invalid_controller_and_info_error(self):
+        transport = Mock(return_value=(0, 0, bytes(PAGE_BYTES)))
+        with self.assertRaisesRegex(RuntimeError, "refusing writes"):
+            require_fresh_namespace(transport)
+        transport.assert_called_once_with(INFO, (1, 0, 0, 0, 0, 0), None)
+        transport = Mock(return_value=(12, 8, bytes(PAGE_BYTES)))
+        with self.assertRaises(AssertionError):
+            require_fresh_namespace(transport)
+        transport.assert_called_once_with(INFO, (1, 0, 0, 0, 0, 0), None)
+
     def test_non_character_device_rejected_before_ioctl(self):
         for mode in (stat.S_IFBLK, stat.S_IFREG):
             with self.subTest(mode=mode), \

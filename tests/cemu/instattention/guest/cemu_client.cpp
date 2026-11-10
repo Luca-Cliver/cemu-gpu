@@ -6,6 +6,7 @@
 #include "../../../../hw/femu/fdm_kv_buffer_abi.h"
 
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,32 @@ namespace {
 
 constexpr std::size_t kIoAlignment = 4096;
 constexpr std::size_t kBlockAlignment = 512;
+
+class ProfileClock {
+public:
+    explicit ProfileClock(IoProfile *profile) : profile_(profile)
+    {
+        if (profile_) {
+            *profile_ = {};
+            previous_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    void mark(std::uint64_t IoProfile::*field)
+    {
+        if (profile_) {
+            const int saved_errno = errno;
+            const auto now = std::chrono::steady_clock::now();
+            profile_->*field = std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous_).count();
+            previous_ = now;
+            errno = saved_errno;
+        }
+    }
+
+private:
+    IoProfile *profile_;
+    std::chrono::steady_clock::time_point previous_;
+};
 
 [[noreturn]] void throw_system_error(const std::string &operation)
 {
@@ -383,9 +410,9 @@ void CemuClient::bind_fdm_kv_buffer(const void *metadata, std::size_t metadata_s
     if (program_target_ != static_cast<int>(ProgramTarget::Host)) {
         throw std::invalid_argument("FDM KV aggregation requires a Host program");
     }
-    if (memory_ranges_.size() != 2 || !metadata ||
+    if (memory_ranges_.size() < 2 || memory_ranges_.size() > CEMU_FDM_KV_MAX_DATA_MRS + 1 || !metadata ||
         metadata_size != sizeof(FDMKV_BindParams_t)) {
-        throw std::invalid_argument("FDM KV binding requires two ranges and an 80-byte descriptor");
+        throw std::invalid_argument("FDM KV binding requires metadata/data ranges and an 80-byte descriptor");
     }
     const int namespace_id = ioctl(namespace_fd_, NVME_IOCTL_ID);
     if (namespace_id < 0) {
@@ -414,8 +441,10 @@ void CemuClient::bind_fdm_kv_buffer(const void *metadata, std::size_t metadata_s
 void CemuClient::write_range(std::size_t range_index,
                              const void *data,
                              std::size_t size,
-                             std::uint64_t range_offset)
+                             std::uint64_t range_offset,
+                             IoProfile *profile)
 {
+    ProfileClock timer(profile);
     validate_range_access(range_index, size, range_offset);
     if (size == 0) {
         return;
@@ -432,14 +461,19 @@ void CemuClient::write_range(std::size_t range_index,
     AlignedBuffer buffer(io_size);
     std::memcpy(buffer.data(), data, size);
     const std::uint64_t file_offset = memory_ranges_[range_index].offset + range_offset;
+    if (profile) profile->bytes = io_size;
+    timer.mark(&IoProfile::prepare_ns);
     pwrite_all(memory_fds_[range_index], buffer.data(), io_size,
                static_cast<off_t>(file_offset));
+    timer.mark(&IoProfile::wait_ns);
 }
 
 std::vector<std::uint8_t> CemuClient::read_range(std::size_t range_index,
                                                  std::size_t size,
-                                                 std::uint64_t range_offset) const
+                                                 std::uint64_t range_offset,
+                                                 IoProfile *profile) const
 {
+    ProfileClock timer(profile);
     validate_range_access(range_index, size, range_offset);
     if (size == 0) {
         return {};
@@ -452,18 +486,54 @@ std::vector<std::uint8_t> CemuClient::read_range(std::size_t range_index,
 
     AlignedBuffer buffer(io_size);
     const std::uint64_t file_offset = memory_ranges_[range_index].offset + range_offset;
+    if (profile) profile->bytes = io_size;
+    timer.mark(&IoProfile::prepare_ns);
     pread_all(memory_fds_[range_index], buffer.data(), io_size,
               static_cast<off_t>(file_offset));
+    timer.mark(&IoProfile::wait_ns);
 
     std::vector<std::uint8_t> result(size);
     std::memcpy(result.data(), buffer.data(), size);
+    timer.mark(&IoProfile::finish_ns);
     return result;
+}
+
+void CemuClient::read_range_into(std::size_t range_index, void *data,
+                                 std::size_t size, std::uint64_t range_offset,
+                                 IoProfile *profile) const
+{
+    ProfileClock timer(profile);
+    validate_range_access(range_index, size, range_offset);
+    if (size == 0) return;
+    if (data == nullptr) throw std::invalid_argument("read_range_into data is null");
+    const std::size_t io_size = round_up(size, kBlockAlignment);
+    if (range_offset + io_size > memory_ranges_[range_index].size) {
+        throw std::out_of_range("aligned read exceeds the memory range");
+    }
+    const auto offset = static_cast<off_t>(memory_ranges_[range_index].offset + range_offset);
+    if (profile) profile->bytes = io_size;
+    // An aligned, sector-sized caller buffer can receive FDM I/O directly.
+    // Otherwise retain the old alignment/padding contract without overrunning it.
+    if (size == io_size && reinterpret_cast<std::uintptr_t>(data) % kIoAlignment == 0) {
+        timer.mark(&IoProfile::prepare_ns);
+        pread_all(memory_fds_[range_index], data, size, offset);
+        timer.mark(&IoProfile::wait_ns);
+    } else {
+        AlignedBuffer buffer(io_size);
+        timer.mark(&IoProfile::prepare_ns);
+        pread_all(memory_fds_[range_index], buffer.data(), io_size, offset);
+        timer.mark(&IoProfile::wait_ns);
+        std::memcpy(data, buffer.data(), size);
+        timer.mark(&IoProfile::finish_ns);
+    }
 }
 
 std::uint32_t CemuClient::execute(const ExecuteOptions &options,
                                   const void *metadata,
-                                  std::size_t metadata_size)
+                                  std::size_t metadata_size,
+                                  IoProfile *profile)
 {
+    ProfileClock timer(profile);
     ensure_program_active();
     ensure_memory_ranges_created();
     if (metadata_size > std::numeric_limits<std::uint32_t>::max()) {
@@ -492,9 +562,12 @@ std::uint32_t CemuClient::execute(const ExecuteOptions &options,
         metadata_size == 0 ? nullptr : metadata_buffer.data(),
         static_cast<std::uint32_t>(metadata_size));
 
+    if (profile) profile->bytes = metadata_size;
+    timer.mark(&IoProfile::prepare_ns);
     const int status = use_io_uring()
         ? uring_execute(namespace_fd_, command)
         : ioctl(namespace_fd_, NVME_IOCTL_IO_CMD, &command);
+    timer.mark(&IoProfile::wait_ns);
     if (status < 0) {
         throw_system_error("execute CEMU program " + program_name_);
     }

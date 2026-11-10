@@ -272,8 +272,302 @@ class FdmCsdPipelineTest(unittest.TestCase):
     memory = NativeCsdPipelineTest.memory
     test_opt_prefill_decode_through_fdm_storage_and_attention = NativeCsdPipelineTest.test_opt_prefill_decode_through_native_storage_and_attention
 
+    def test_fdm_async_attention_boundaries(self):
+        with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1"):
+            self.test_fdm_attention_boundaries_gqa_dedup_and_identity()
+
+    def test_fdm_async_unrelated_memory_bypasses_aggregation_lock(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-lock-") as directory, ExitStack() as stack:
+            entered = Path(directory) / "entered"
+            release = Path(directory) / "release"
+            with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1", CEMU_FDM_AGGREGATE_PROFILE="0"):
+                device, offsets = self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
+            source = Path(directory) / "blocked.c"
+            source.write_text(
+                '#include <stdio.h>\n#include <unistd.h>\n'
+                '#define fdm_kv_aggregate original_aggregate\n'
+                f'#include "{ROOT / "tests/cemu/kernel/fdm_kv_aggregate.c"}"\n'
+                '#undef fdm_kv_aggregate\n'
+                'long long fdm_kv_aggregate(struct cemu_args *args) {\n'
+                f'    FILE *marker = fopen({json.dumps(str(entered))}, "w");\n'
+                '    if (!marker) return -1;\n'
+                '    fclose(marker);\n'
+                f'    for (unsigned attempt = 0; access({json.dumps(str(release))}, F_OK); attempt++) {{\n'
+                '        if (attempt == 15000) return -1;\n'
+                '        usleep(1000);\n'
+                '    }\n'
+                '    return original_aggregate(args);\n}\n')
+            subprocess.run(["cc", "-shared", "-fPIC", "-O2", str(source),
+                            str(ROOT / "hw/femu/fdm_kv_layout.c"),
+                            "-o", str(Path(directory) / "aggregate.so")], check=True)
+            store.open()
+            keys = np.ones((1, 1, 128), dtype=np.float16)
+            try:
+                store.append_batch(0, 0, keys, keys)
+                deadline = time.monotonic() + 5
+                while not entered.exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.001)
+                payload = bytes(range(256)) * 2
+                self.memory(5, offsets[0], payload)
+                self.assertEqual(self.memory(2, offsets[0], len(payload)), payload)
+                self.call(1, 0, (offsets[0], 0, len(payload), 0, 0, 0), 2)
+                self.assertEqual(self.memory(2, offsets[0], len(payload)), bytes(len(payload)))
+                self.assertFalse(release.exists())
+                device.submit(1, 2, (4 * 1024**2, 0, 512, 0, 0, 0), namespace=2)
+                time.sleep(0.02)
+                self.assertIsNone(device.completion(1))
+            finally:
+                release.touch()
+            self.assertEqual(device.wait(1)[0], 0)
+            store.drain()
+            self.assertEqual(store.statistics()["accepted_stream0"], 1)
+            self.assertEqual(store.statistics()["failed"], 0)
+            store.close()
+            self.memory(5, 4 * 1024**2, payload)
+            self.assertEqual(self.memory(2, 4 * 1024**2, len(payload)), payload)
+
+    def test_fdm_async_ack_read_dependency_and_input_backpressure(self):
+        self.run_async_dependency_case(cancel=False)
+
+    def test_fdm_async_reset_cancels_waiting_reader_and_aggregation(self):
+        self.run_async_dependency_case(cancel=True)
+
+    def test_fdm_async_ack_requires_all_fragments_and_model_time(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-async-fragments-") as directory, ExitStack() as stack:
+            trace_path = Path(directory) / "io.jsonl"
+            with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1", CEMU_FDM_IO_TRACE=str(trace_path),
+                            CEMU_FDM_AGGREGATE_PROFILE="1"):
+                device, _ = self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16).open()
+            keys = np.ones((15, 1, 128), dtype=np.float16)
+            with patch.object(store._client, "write_range") as packed:
+                store.append_batch(0, 0, keys, keys)
+            packet = packed.call_args.args[1]
+            input_offset = 4 * 1024**2 + 65536
+            self.memory(5, input_offset, packet[:512])
+            self.assertEqual(store.statistics()["accepted_stream0"], 0)
+            self.assertFalse(any(record["source"] == "background_aggregate"
+                                 for record in map(json.loads, trace_path.read_text().splitlines())))
+            device.write(DATA, packet[512:])
+            device.submit(1, 5, (input_offset + 512, 0, len(packet) - 512, 0, 0, 0),
+                          namespace=2, prp2=DATA + 4096)
+            time.sleep(0.02)
+            self.assertIsNone(device.completion(1))
+            self.assertEqual(device.wait(1)[0], 0)
+            store.drain()
+            self.assertEqual(store.statistics()["accepted_stream0"], 15)
+            records = list(map(json.loads, trace_path.read_text().splitlines()))
+            background = [record for record in records if record["source"] == "background_aggregate"]
+            self.assertEqual(len(background), 1)
+            self.assertEqual(background[0]["packet_bytes"], len(packet))
+            fragments = [record for record in records if record["input"] and record["packet_id"] == background[0]["packet_id"]]
+            self.assertEqual(len(fragments), 2)
+            self.assertGreaterEqual(background[0]["accepted_ns"], max(record["virtual"]["model_ready"] for record in fragments))
+            self.assertGreater(background[0]["aggregate_profile"]["successful_calls"], 0)
+            store.close()
+
+    def run_async_dependency_case(self, cancel):
+        from test_instattention_native_qtest import IOCQ
+
+        with tempfile.TemporaryDirectory(prefix="fdm-async-") as directory, ExitStack() as stack:
+            trace_path = Path(directory) / "io.jsonl"
+            with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1", CEMU_FDM_IO_TRACE=str(trace_path)):
+                device, offsets = self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16).open()
+            keys = np.ones((15, 1, 128), dtype=np.float16)
+            store.append_batch(0, 0, keys, keys)
+            layout = SparfKvCacheLayout(KvLayoutConfig(1, 32, 1, 1, 128, np.float16))
+            self.memory(5, offsets[0], keys[0].tobytes())
+            self.memory(5, offsets[4], keys[0].tobytes())
+            fields = (SPARF_WORKFLOW_COMMAND & 0xffffffff, SPARF_WORKFLOW_COMMAND >> 32, 0, 0, 0, 0)
+            lengths = [4096, 1048576, 1048576, 1048576, 4096, 4096, 4096, 4096, 16384, 4096, 4096]
+            descriptor = b"".join(struct.pack("<IIQQQ", 2, length, offset, 0, 0)
+                                  for length, offset in zip(lengths, offsets))
+            extra_rsid = self.call(0, 0x21, (0, 11, 0, 0, 0, 0), 3, descriptor)
+            metadata = store.pack_workflow(layout, 0, 15, 1, 16, 2, 0,
+                                           approximate_runtime_ns=1000000000)
+            device.write(DATA, metadata)
+            device.submit(1, 1, fields, namespace=3, command2=1 | (1 << 16), command4=len(metadata))
+            first_execute = device.cid
+            deadline = time.monotonic() + 5
+            while store.statistics()["accepted_stream0"] != 15:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            store.append_batch(0, 15, keys[:1], keys[:1])
+            self.assertEqual(store.statistics()["accepted_stream0"], 15)
+            self.assertIsNone(device.completion(1))
+            metadata = store.pack_workflow(layout, 0, 16, 1, 16, 2, 0)
+            device.write(DATA, metadata)
+            device.submit(1, 1, fields, namespace=3, command2=1 | (extra_rsid << 16), command4=len(metadata))
+            second_execute = device.cid
+            with patch.object(store._client, "write_range") as packed:
+                store.append_batch(0, 16, keys[:1], keys[:1])
+            packet = packed.call_args.args[1]
+            device.write(DATA, packet)
+            device.submit(1, 5, (4 * 1024**2 + 65536, 0, len(packet), 0, 0, 0), namespace=2)
+            next_append = device.cid
+            time.sleep(0.02)
+            self.assertIsNone(device.completion(1))
+            if cancel:
+                device.initialize()
+                self.assertIsNone(device.completion(1))
+                self.assertEqual(struct.unpack_from("<I", self.memory(2, 4 * 1024**2, 512), 176)[0], 0)
+                self.call(0, 0x21, (1 | (store._rsid << 16), 0, 0, 0, 0, 0), 3)
+                store._client.rsid = None
+                store._client.close()
+                store._client = None
+                store.registered = False
+                store.close()
+                return
+            completed = {}
+            deadline = time.monotonic() + 5
+            while len(completed) < 3:
+                self.assertLess(time.monotonic(), deadline)
+                device.command("clock_step 100000000")
+                time.sleep(0.001)
+                while device.completion(1) is not None:
+                    entry = device.read(IOCQ + device.heads[1] * 16, 16)
+                    command_id = struct.unpack_from("<H", entry, 12)[0]
+                    self.assertNotIn(command_id, completed)
+                    completed[command_id] = device.wait(1)[0]
+            self.assertEqual(completed, {first_execute: 0, second_execute: 0, next_append: 0})
+            store.drain()
+            stats = store.statistics()
+            self.assertEqual(stats["accepted_stream0"], 17)
+            self.assertEqual(stats["failed"], 0)
+            self.assertEqual(stats["sealed"], 1)
+            self.assertEqual(stats["staged_pages"], 0)
+            records = list(map(json.loads, trace_path.read_text().splitlines()))
+            background = [record for record in records if record["source"] == "background_aggregate"]
+            self.assertEqual(len(background), 3)
+            for record in background:
+                self.assertEqual(record["status"], 0)
+                self.assertLessEqual(record["accepted_ns"], record["started_ns"])
+                self.assertLessEqual(record["started_ns"], record["finished_ns"])
+            delayed = next(record for record in background if record["token_first"] == 15)
+            acknowledged = next(record for record in records if record["input"] and record["token_first"] == 15)
+            self.assertEqual(acknowledged["aggregate_calls"], 0)
+            self.assertLess(acknowledged["virtual"]["cq_begin"], delayed["finished_ns"])
+            deferred = next(record for record in records if record["source"] == "device" and record["cid"] == next_append)
+            self.assertGreater(deferred["input_slot_wait_ns"], 0)
+            store.close()
+
+    def test_fdm_async_failure_after_ack_is_sticky(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-async-error-") as directory, ExitStack() as stack:
+            with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1"):
+                self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
+            source = Path(directory) / "fail.c"
+            source.write_text('long long fdm_kv_aggregate(void *args) { return -1; }\n')
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(Path(directory) / "aggregate.so")], check=True)
+            store.open()
+            keys = np.ones((1, 1, 128), dtype=np.float16)
+            store.append_batch(0, 0, keys, keys)
+            deadline = time.monotonic() + 5
+            while not store.statistics()["failed"]:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            self.assertEqual(store.statistics()["accepted_stream0"], 0)
+            with self.assertRaises((AssertionError, RuntimeError)):
+                store.drain()
+            store.close()
+
+    def test_fdm_io_trace_aggregate_cpu_probe(self):
+        with patch.dict(os.environ, CEMU_FDM_AGGREGATE_PROFILE="1"):
+            self.test_fdm_io_trace_packet_identity_and_completion()
+
+    def test_fdm_io_trace_packet_identity_and_completion(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-io-trace-") as directory, ExitStack() as stack:
+            trace_path = Path(directory) / "fdm-io.jsonl"
+            packet_path = Path(directory) / "packets.jsonl"
+            with patch.dict(os.environ, CEMU_FDM_IO_TRACE=str(trace_path)):
+                self.start_device(directory, stack)
+            with patch.dict(os.environ, CEMU_PWRITE_PACKET_TRACE=str(packet_path)):
+                store = stack.enter_context(self.make_store(directory, 1, 1, 1, 64, 1, np.float16))
+            keys = np.arange(17 * 128, dtype=np.float16).reshape(17, 1, 128)
+            store.append_batch(0, 0, keys, -keys)
+            store.append_batch(0, 17, keys[:1], -keys[:1])
+            store.drain()
+            stats = store.statistics()
+            self.assertEqual(stats["accepted_stream0"], 18)
+            self.assertEqual(stats["failed"], 0)
+            self.assertEqual(stats["staged_pages"], 0)
+            store.close()
+            packets = [json.loads(line) for line in packet_path.read_text().splitlines()]
+            records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            records = [record for record in records if record["input"]]
+            if os.environ.get("CEMU_FDM_AGGREGATE_PROFILE") == "1":
+                profiled = [record for record in records if record.get("aggregate_profile")]
+                self.assertTrue(profiled)
+                for record in profiled:
+                    self.assertEqual(record['aggregate_probe_calls'], record['aggregate_calls'])
+                    self.assertGreater(record['aggregate_thread_cpu_ns'], 0)
+                    location = record['aggregate_location']
+                    self.assertGreater(location['tid'], 0)
+                    self.assertGreaterEqual(location['cpu_begin'], 0)
+                    self.assertGreaterEqual(location['cpu_end'], 0)
+                    self.assertGreaterEqual(location['host_end_ns'], location['host_begin_ns'])
+                    self.assertEqual(location['batch'], 0)
+                    self.assertEqual(location['layer'], 0)
+                    self.assertEqual(location['head_count'], 1)
+                    for key in ('minor_faults', 'major_faults', 'voluntary_switches', 'involuntary_switches'):
+                        self.assertGreaterEqual(record['aggregate_' + key], 0)
+                from experiments.aggregate_decode_trace import analyze
+                split = analyze(trace_path, 17, require_probe=True)
+                self.assertEqual(split['paths']['existing']['requests'], 1)
+                self.assertGreater(split['paths']['existing']['execution_probe']['thread_cpu_ns'], 0)
+            self.assertEqual([packet["phase"] for packet in packets], ["prefill", "decode", "drain"])
+            self.assertGreater(len(records), len(packets))
+            for packet in packets:
+                matched = [record for record in records if
+                           (packet["session"], packet["packet_id"]) ==
+                           (record["session"], record["packet_id"])]
+                self.assertEqual(sum(record["bytes"] for record in matched), packet["bytes"])
+                self.assertEqual(sum(record["checks"] > 0 for record in matched), 1)
+            for record in records:
+                self.assertEqual(record["status"], 0)
+                times = record["virtual"]
+                ordered = [times[name] for name in ("sq_seen", "memory_enter", "locked",
+                    "dma_begin", "dma_end", "memory_done")]
+                if record["checks"]:
+                    ordered.extend(times[name] for name in ("first_check", "last_check"))
+                    retry_ns = sum(record[field] for field in ("space_retry_ns", "busy_retry_ns",
+                                                               "drain_retry_ns", "model_retry_ns", "aggregate_yield_ns"))
+                    self.assertEqual(times["last_check"] - times["first_check"],
+                                     record["check_ns"] + retry_ns)
+                ordered.extend(times[name] for name in ("cq_begin", "cq_end"))
+                self.assertEqual(ordered, sorted(ordered))
+                self.assertLessEqual(record["aggregate_ns"], record["check_ns"])
+
+    def test_fdm_read_write_execute_trace_boundaries(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-execute-trace-") as directory:
+            trace_path = Path(directory) / "device.jsonl"
+            with patch.dict(os.environ, CEMU_FDM_IO_TRACE=str(trace_path)):
+                self.test_fdm_attention_boundaries_gqa_dedup_and_identity()
+            records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            successful = [record for record in records if record["status"] == 0]
+            self.assertTrue({2, 5, 1}.issubset({record["opcode"] for record in successful}))
+            for record in successful:
+                self.assertEqual(record["version"], 2)
+                stamps = record["virtual"]
+                fields = (("sq_seen", "exec_enter", "exec_admitted", "exec_started", "exec_ready", "cq_begin", "cq_end")
+                          if record["opcode"] == 1 else
+                          ("sq_seen", "memory_enter", "locked", "dma_begin", "dma_end", "memory_done", "cq_begin", "cq_end"))
+                times = [stamps[field] for field in fields]
+                self.assertTrue(all(times))
+                self.assertEqual(times, sorted(times))
+                if record["opcode"] != 1:
+                    self.assertLessEqual(stamps["model_ready"], stamps["cq_begin"])
+
     def test_balanced_fdm_attention_boundaries_gqa_dedup_and_identity(self):
         with patch.object(self, "placement", "balanced", create=True):
+            self.test_fdm_attention_boundaries_gqa_dedup_and_identity()
+
+    def test_segmented_fdm_attention_and_writeback(self):
+        with patch.object(self, "segmented_data", True, create=True), \
+                patch.object(self, "placement", "balanced", create=True):
             self.test_fdm_attention_boundaries_gqa_dedup_and_identity()
 
     def test_balanced_opt_prefill_decode(self):
@@ -420,7 +714,7 @@ class FdmCsdPipelineTest(unittest.TestCase):
             str(ROOT / "tests/cemu/kernel/fdm_kv_aggregate.c"),
             str(ROOT / "hw/femu/fdm_kv_layout.c"), "-o", str(aggregate)], check=True)
         test = self
-        offsets = (4 * 1024**2, 4 * 1024**2 + 65536)
+        offsets = []
 
         class Client:
             def __init__(self, *args):
@@ -428,9 +722,14 @@ class FdmCsdPipelineTest(unittest.TestCase):
                 self.rsid = None
 
             def create_memory_ranges(self, ranges):
+                offsets.clear()
+                cursor = 4 * 1024**2
+                for spec in ranges:
+                    offsets.append(cursor)
+                    cursor += spec[2] + (4096 if getattr(test, "segmented_data", False) else 0)
                 descriptor = b"".join(struct.pack("<IIQQQ", 2, spec[2], offset, 0, 0)
                                       for spec, offset in zip(ranges, offsets))
-                self.rsid = test.call(0, 0x21, (0, 2, 0, 0, 0, 0), 3, descriptor)
+                self.rsid = test.call(0, 0x21, (0, len(ranges), 0, 0, 0, 0), 3, descriptor)
                 return self.rsid
 
             def load_program(self, name, path, entry):
@@ -463,6 +762,8 @@ class FdmCsdPipelineTest(unittest.TestCase):
                     self.active = False
 
         module = store_module(Client)
+        if getattr(self, "segmented_data", False):
+            module.DATA_MR_BYTES = 1024 * 1024
         return module.FDM_KVbuffer(SparfGroupLayout(128, 8, dtype=dtype), batches,
             layers, heads, max_tokens, microbatch_size, directory, 65536, 3 * 1024**2,
             aggregate_program=str(aggregate), batch_pages=32)

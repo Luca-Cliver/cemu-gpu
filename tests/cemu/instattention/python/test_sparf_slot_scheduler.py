@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import threading
+import os
 import tempfile
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -12,6 +13,7 @@ import numpy as np
 from cemu_flexgen import KvLayoutConfig, SparfKvCacheLayout
 from cemu_flexgen.cemu_sparf_slot_scheduler import CemuSparfSlotScheduler
 from flexgen_adapter import SparfAttentionBackend
+from phase_profiler import PhaseProfiler, profile_request
 
 
 class Slot:
@@ -94,13 +96,29 @@ class SlotSchedulerTest(unittest.TestCase):
                 request.completed_stages = 4
 
         slots = (AutonomousSlot(), AutonomousSlot())
+        with patch.dict(os.environ, {"CEMU_PROFILE_INTERVALS": "/tmp/unused-slot-intervals"}):
+            profiler = PhaseProfiler(stack=True)
+        for slot in slots:
+            slot.profiler = profiler
         with CemuSparfSlotScheduler(slots) as scheduler:
-            first = scheduler.submit_decode(0)
-            second = scheduler.submit_decode(1)
+            with profile_request(profiler, dict(id="first")):
+                first = scheduler.submit_decode(0)
+            with profile_request(profiler, dict(id="second")):
+                second = scheduler.submit_decode(1)
             self.assertEqual(first.result(timeout=5), 0)
             self.assertEqual(second.result(timeout=5), 1)
             self.assertEqual(scheduler.modeled_runtime_summary(), (20, 2))
         self.assertTrue(all(slot.closed for slot in slots))
+        metrics = {metric.name: metric for metric in profiler.snapshot()}
+        for phase in ("prepare", "execute", "collect"):
+            self.assertEqual(metrics[f"decode.slot_{phase}.queue_wait_wall"].count, 2)
+            self.assertEqual(metrics[f"decode.slot_{phase}.worker_wall"].count, 2)
+        self.assertEqual(metrics["decode.slot_wait_wall"].count, 2)
+        for phase in ("prepare", "execute", "collect"):
+            for boundary in ("queue_wait_wall", "worker_wall"):
+                entries = [entry for entry in profiler._intervals
+                           if entry["name"] == f"decode.slot_{phase}.{boundary}"]
+                self.assertEqual({entry["request"]["id"] for entry in entries}, {"first", "second"})
 
     def test_autonomous_failure_releases_lease(self):
         class AutonomousSlot(Slot):

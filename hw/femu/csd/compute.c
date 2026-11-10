@@ -370,6 +370,8 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
     bool grouped = header.flags & CEMU_SPARF_WORKFLOW_GROUPED;
     bool native = header.flags & CEMU_SPARF_WORKFLOW_NATIVE;
     bool fdm = header.flags & CEMU_SPARF_WORKFLOW_FDM;
+    bool ragged = header.flags & CEMU_SPARF_WORKFLOW_RAGGED;
+    if (ragged && !fdm) return false;
     if ((native && fdm) || (native || fdm) != controller->native_kv ||
         ((native || fdm) && (!grouped || !autonomous))) return false;
     if (grouped && (!autonomous || buffered || extents || header.token_head_stride ||
@@ -382,13 +384,14 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         (staged && (header.reserved[0] < CEMU_SPARF_STAGE_SELECT ||
                     header.reserved[0] > CEMU_SPARF_STAGE_PV || !header.reserved[1])) ||
         numr != (staged ? CEMU_SPARF_STAGED_RANGES : CEMU_SPARF_WORKFLOW_RANGES) ||
-        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED | CEMU_SPARF_WORKFLOW_NATIVE | CEMU_SPARF_WORKFLOW_FDM)) ||
+        (header.flags & ~(CEMU_SPARF_WORKFLOW_TRACE | CEMU_SPARF_WORKFLOW_BUFFERED | CEMU_SPARF_WORKFLOW_GROUPED | CEMU_SPARF_WORKFLOW_NATIVE | CEMU_SPARF_WORKFLOW_FDM | CEMU_SPARF_WORKFLOW_RAGGED)) ||
         (!grouped && (!header.token_k_extents || !header.channel_k_extents || !header.token_v_extents)) ||
         header.token_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.channel_k_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         header.token_v_extents > CEMU_SPARF_WORKFLOW_MAX_EXTENTS ||
         length != sizeof(header) + extents * sizeof(struct cemu_sparf_workflow_extent) +
                   (buffered ? sizeof(struct cemu_sparf_buffer_tail) : 0) +
+                  (ragged ? (uint64_t)header.batch_size * sizeof(struct cemu_sparf_batch_row) : 0) +
                   (fdm ? sizeof(struct cemu_sparf_fdm_binding) :
                    grouped ? sizeof(struct cemu_sparf_group_binding) : 0) ||
         (header.dtype != CEMU_SPARF_FLOAT16 && header.dtype != CEMU_SPARF_FLOAT32) ||
@@ -404,6 +407,24 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         !header.channel_layer_stride)) || !isfinite(header.scale) ||
         header.scale <= 0.0f) {
         return false;
+    }
+    const struct cemu_sparf_batch_row *rows = ragged ?
+        (const void *)((const uint8_t *)data + sizeof(header) + sizeof(struct cemu_sparf_fdm_binding)) : NULL;
+    if (rows) {
+        uint64_t history = 0, selected = 0;
+        uint32_t max_tokens = 0, max_k = 0;
+        for (uint32_t b = 0; b < header.batch_size; ++b) {
+            if (!rows[b].valid_tokens || rows[b].valid_tokens > header.valid_tokens ||
+                !rows[b].top_k || rows[b].top_k > rows[b].valid_tokens ||
+                rows[b].top_k > header.top_k || rows[b].history_offset != history ||
+                rows[b].selected_offset != selected) return false;
+            history += rows[b].valid_tokens;
+            selected += rows[b].top_k;
+            max_tokens = MAX(max_tokens, rows[b].valid_tokens);
+            max_k = MAX(max_k, rows[b].top_k);
+        }
+        if (max_tokens != header.valid_tokens || max_k != header.top_k ||
+            history > UINT32_MAX || selected * header.num_query_heads > UINT32_MAX) return false;
     }
     uint64_t vectors = (uint64_t)header.batch_size * header.num_query_heads;
     uint64_t element = header.dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
@@ -424,14 +445,14 @@ static bool validate_sparf_workflow(Program *program, uint64_t command,
         !multiply_u64(&buffered_bytes, element)) return false;
     uint64_t required[] = {
         vectors * header.head_dim * element,
-        vectors * header.top_r * header.valid_tokens * element,
-        vectors * header.top_k * header.head_dim * element,
-        vectors * (header.top_k + 1) * header.head_dim * element,
+        cemu_sparf_history_count(&header, rows) * header.top_r * element,
+        cemu_sparf_selected_count(&header, rows) * header.head_dim * element,
+        (cemu_sparf_selected_count(&header, rows) + vectors) * header.head_dim * element,
         vectors * header.head_dim * element,
         buffered_bytes,
         buffered_bytes,
-        vectors * sizeof(float),
-        vectors * (header.top_k + 1) * sizeof(float),
+        vectors * sizeof(float) + (ragged ? header.batch_size * sizeof(*rows) : 0),
+        (cemu_sparf_selected_count(&header, rows) + vectors) * sizeof(float),
         vectors * header.head_dim * element,
         sizeof(struct cemu_sparf_workflow_trace),
     };
@@ -1163,6 +1184,7 @@ static uint16_t program_activation(NvmeNamespace *ns, NvmeCmd *cmd, NvmeCqe *cqe
 // execution is done in run_on_host()
 static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
 {
+    FDM_IO_STAMP(req, exec_enter);
     FemuCtrl *n = ns->ctrl;
     NvmeProgramExecuteCmd *exec = (NvmeProgramExecuteCmd *)cmd;
     uint16_t pind = le16_to_cpu(exec->pind);
@@ -1176,8 +1198,9 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     uint32_t chunk_nlb = le32_to_cpu(exec->chunk_nlb) + 1;
     uint32_t runtime = le32_to_cpu(exec->runtime);
     if (n->native_kv && (numr ||
-        (dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) &&
-         dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_fdm_binding)) ||
+        (dlen < sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) ||
+         dlen > sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_fdm_binding) +
+                65536ULL * sizeof(struct cemu_sparf_batch_row)) ||
         cparam1 != CEMU_SPARF_WORKFLOW_COMMAND)) return NVME_INVALID_FIELD;
     SparfDispatchTrace dispatch = {0};
     if (cparam1 == CEMU_SPARF_WORKFLOW_COMMAND && sparf_timeline_fd() >= 0) {
@@ -1238,8 +1261,9 @@ static uint16_t program_execute(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *re
     req->data_buffer = data_buffer;
     if (n->native_kv && (program->is_indirect || numr ||
         cparam1 != CEMU_SPARF_WORKFLOW_COMMAND ||
-        (dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) &&
-         dlen != sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_fdm_binding)) ||
+        (dlen < sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_native_binding) ||
+         dlen > sizeof(struct cemu_sparf_workflow_header) + sizeof(struct cemu_sparf_fdm_binding) +
+                65536ULL * sizeof(struct cemu_sparf_batch_row)) ||
         ((struct cemu_sparf_workflow_header *)data_buffer)->version != CEMU_SPARF_AUTONOMOUS_VERSION)) {
         g_free(req->data_buffer);
         req->data_buffer = NULL;
@@ -2394,10 +2418,13 @@ static void *sparf_autonomous_main(void *opaque)
     ComputeNamespace *namespace = compute_ns(parent->ns);
     SparfAutonomous *state = job->sparf_autonomous;
     SparfAutonomousTrace *trace = state->timeline;
+    FDM_IO_STAMP(parent, exec_started);
     if (trace) sparf_trace_stamp(&trace->started);
     struct rte_ring *completion = femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
     uint64_t result = (uint64_t)-1;
     if (!completion) goto finish;
+    if (state->storage_read == fdm_kv_attention_read &&
+        !fdm_kv_attention_wait(state->storage_opaque)) goto finish;
     while (state->resume != SPARF_RESUME_DONE) {
         if (parent->ns->ctrl->native_kv && qatomic_read(&parent->ns->ctrl->native_stop)) break;
         if (state->resume == SPARF_RESUME_VALUE || state->wait == SPARF_WAIT_IO) {
@@ -2486,6 +2513,9 @@ finish:
     g_free(state);
     parent->cqe.res64 = result;
     parent->stat.expire_time = clock_ns();
+    if (parent->fdm_io_trace.enabled) {
+        parent->fdm_io_trace.exec_ready = parent->stat.expire_time;
+    }
     parent->stat.reqlat = parent->stat.expire_time - parent->stat.stime;
     parent->cqe.n.rsvd = parent->stat.exec.queueing_time;
     parent->status = result == (uint64_t)-1 ? NVME_INTERNAL_DEV_ERROR | NVME_DNR : NVME_SUCCESS;
@@ -2682,7 +2712,9 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
         struct cemu_sparf_fdm_binding binding;
         memcpy(&binding, (uint8_t *)header + sizeof(*header), sizeof(binding));
         fdm_attention = g_new0(FDMKV_Attention_t, 1);
-        if (!fdm_kv_attention_open(request->ns->ctrl, &binding, header, fdm_attention)) goto reject;
+        if (!fdm_kv_attention_open(request->ns->ctrl, &binding, header,
+                (header->flags & CEMU_SPARF_WORKFLOW_RAGGED) ?
+                (const void *)((uint8_t *)header + sizeof(*header) + sizeof(binding)) : NULL, fdm_attention)) goto reject;
     } else if (header->flags & CEMU_SPARF_WORKFLOW_NATIVE) {
         struct cemu_sparf_native_binding binding;
         NvmeNamespace *nvm = nvme_find_namespace(request->ns->ctrl, 1);
@@ -2763,6 +2795,7 @@ static uint16_t sparf_submit_autonomous(NvmeRequest *request, Program *program, 
         sparf_auto_log(trace, job->args.data_buffer, request->ns->ctrl->drive_id,
                         program->pind, true, 0);
     }
+    FDM_IO_STAMP(request, exec_admitted);
     while (femu_ring_enqueue(namespace->sparf_autonomous_queue, (void *)&job, 1) != 1) usleep(10);
     qemu_sem_post(&namespace->sparf_autonomous_wakeup);
     return NVME_SUCCESS;

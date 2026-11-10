@@ -16,10 +16,31 @@
 namespace py = pybind11;
 using cemu::instattention::CemuClient;
 using cemu::instattention::ExecuteOptions;
+using cemu::instattention::IoProfile;
 using cemu::instattention::MemoryRange;
 using cemu::instattention::ProgramTarget;
 
 namespace {
+
+std::uint64_t profile_clock_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+py::dict profile_result(const IoProfile &timing, std::uint64_t start,
+                        std::uint64_t prepared)
+{
+    const auto finished = profile_clock_ns();
+    py::dict result;
+    result["binding_prepare_wall"] = prepared - start;
+    result["buffer_prepare_wall"] = timing.prepare_ns;
+    result["io_wait_wall"] = timing.wait_ns;
+    result["buffer_finish_wall"] = timing.finish_ns;
+    result["binding_finish_wall"] = finished - prepared - timing.prepare_ns - timing.wait_ns - timing.finish_ns;
+    result["io_bytes"] = timing.bytes;
+    return result;
+}
 
 std::size_t contiguous_buffer_size(const py::buffer_info &info)
 {
@@ -74,6 +95,7 @@ std::vector<std::uint8_t> copy_python_buffer(const py::buffer &buffer)
 PYBIND11_MODULE(_cemu_client, module)
 {
     module.doc() = "Guest-side Python bindings for CEMU computational-storage commands";
+    module.attr("IO_PROFILE_VERSION") = 1;
     module.def("guest_clock_snapshot", []() {
         const auto steady = std::chrono::steady_clock::now();
         const auto high_resolution = std::chrono::high_resolution_clock::now();
@@ -213,30 +235,61 @@ PYBIND11_MODULE(_cemu_client, module)
              }, py::arg("metadata"))
         .def("write_range",
              [](CemuClient &client, std::size_t range_index,
-                const py::buffer &buffer, std::uint64_t range_offset) {
+                const py::buffer &buffer, std::uint64_t range_offset, bool profile) -> py::object {
+                 const auto started = profile ? profile_clock_ns() : 0;
                  const py::buffer_info info = buffer.request();
                  const std::size_t size = contiguous_buffer_size(info);
-                 py::gil_scoped_release release;
-                 client.write_range(range_index, info.ptr, size, range_offset);
-             },
-             py::arg("range_index"), py::arg("data"),
-             py::arg("range_offset") = 0)
-        .def("read_range",
-             [](const CemuClient &client, std::size_t range_index,
-                std::size_t size, std::uint64_t range_offset) {
-                 std::vector<std::uint8_t> data;
+                 const auto prepared = profile ? profile_clock_ns() : 0;
+                 IoProfile timing;
                  {
                      py::gil_scoped_release release;
-                     data = client.read_range(range_index, size, range_offset);
+                     client.write_range(range_index, info.ptr, size, range_offset, profile ? &timing : nullptr);
+                 }
+                 if (profile) return py::make_tuple(py::none(), profile_result(timing, started, prepared));
+                 return py::none();
+             },
+             py::arg("range_index"), py::arg("data"),
+             py::arg("range_offset") = 0, py::kw_only(), py::arg("profile") = false)
+        .def("read_range",
+             [](const CemuClient &client, std::size_t range_index,
+                std::size_t size, std::uint64_t range_offset, bool profile) -> py::object {
+                 const auto started = profile ? profile_clock_ns() : 0;
+                 std::vector<std::uint8_t> data;
+                 IoProfile timing;
+                 const auto prepared = profile ? profile_clock_ns() : 0;
+                 {
+                     py::gil_scoped_release release;
+                     data = client.read_range(range_index, size, range_offset, profile ? &timing : nullptr);
                  }
                  py::array_t<std::uint8_t> result(data.size());
                  if (!data.empty()) {
                      std::memcpy(result.mutable_data(), data.data(), data.size());
                  }
+                 if (profile) return py::make_tuple(result, profile_result(timing, started, prepared));
                  return result;
              },
              py::arg("range_index"), py::arg("size"),
-             py::arg("range_offset") = 0)
+             py::arg("range_offset") = 0, py::kw_only(), py::arg("profile") = false)
+        .def("read_range_into",
+             [](const CemuClient &client, std::size_t range_index,
+                const py::buffer &buffer, std::uint64_t range_offset, bool profile) -> py::object {
+                 const auto started = profile ? profile_clock_ns() : 0;
+                 const py::buffer_info info = buffer.request(true);
+                 if (info.format.find('O') != std::string::npos) {
+                     throw py::value_error("object buffers cannot receive raw I/O");
+                 }
+                 const std::size_t size = contiguous_buffer_size(info);
+                 const auto prepared = profile ? profile_clock_ns() : 0;
+                 IoProfile timing;
+                 {
+                     py::gil_scoped_release release;
+                     client.read_range_into(range_index, info.ptr, size, range_offset,
+                                            profile ? &timing : nullptr);
+                 }
+                 if (profile) return py::make_tuple(py::none(), profile_result(timing, started, prepared));
+                 return py::none();
+             }, py::arg("range_index"), py::arg("output"),
+             py::arg("range_offset") = 0, py::kw_only(), py::arg("profile") = false)
         .def("read_range_bytes",
              [](const CemuClient &client, std::size_t range_index,
                 std::size_t size, std::uint64_t range_offset) {
@@ -259,7 +312,8 @@ PYBIND11_MODULE(_cemu_client, module)
                 std::uint32_t group,
                 std::uint32_t chunk_nlb,
                 std::uint32_t runtime,
-                const py::object &metadata) {
+                const py::object &metadata, bool profile) -> py::object {
+                 const auto started = profile ? profile_clock_ns() : 0;
                  ExecuteOptions options;
                  options.cparam1 = cparam1;
                  options.cparam2 = cparam2;
@@ -273,18 +327,25 @@ PYBIND11_MODULE(_cemu_client, module)
                          py::reinterpret_borrow<py::buffer>(metadata));
                  }
 
-                 py::gil_scoped_release release;
-                 return client.execute(
-                     options,
-                     metadata_bytes.empty() ? nullptr : metadata_bytes.data(),
-                     metadata_bytes.size());
+                 IoProfile timing;
+                 std::uint32_t result;
+                 const auto prepared = profile ? profile_clock_ns() : 0;
+                 {
+                     py::gil_scoped_release release;
+                     result = client.execute(
+                         options,
+                         metadata_bytes.empty() ? nullptr : metadata_bytes.data(),
+                         metadata_bytes.size(), profile ? &timing : nullptr);
+                 }
+                 if (profile) return py::make_tuple(result, profile_result(timing, started, prepared));
+                 return py::int_(result);
              },
              py::arg("cparam1") = 0,
              py::arg("cparam2") = 0,
              py::arg("group") = 0,
              py::arg("chunk_nlb") = 0,
              py::arg("runtime") = 0,
-             py::arg("metadata") = py::none())
+             py::arg("metadata") = py::none(), py::kw_only(), py::arg("profile") = false)
         .def("close", &CemuClient::close)
         .def_property_readonly("program_id", &CemuClient::program_id)
         .def_property_readonly("memory_range_set_id",

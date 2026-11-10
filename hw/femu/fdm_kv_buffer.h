@@ -14,6 +14,8 @@ typedef struct FDMKV_InitParams
 
     void *data_addr;
     uint64_t data_bytes;
+    const FDMKV_DataSegment_t *data_segments;
+    uint32_t segment_count;
 
     uint64_t input_bytes;
 

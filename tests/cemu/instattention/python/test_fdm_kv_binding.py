@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -38,6 +39,7 @@ def new_store(module, **kwargs):
                                dtype=SimpleNamespace(itemsize=2)),
         batches=1, layers=1, heads=2, max_tokens=32, microbatch_size=1,
         fdm_directory="/unused/fdm", meta_bytes=65536, data_bytes=2 * 1024 * 1024,
+        input_bytes=128 * 1024,
     )
     store = module.FDM_KVbuffer(**(parameters | kwargs))
     store.session_id = 0x46444D01
@@ -45,19 +47,171 @@ def new_store(module, **kwargs):
 
 
 class FdmBindingClientTest(unittest.TestCase):
-    def test_packet_split_coordinates_layout_and_terminal_drain(self):
+    def test_payload_contiguous_buffers_preserve_wire_bits_and_ownership(self):
+        from phase_profiler import PhaseProfiler
+
+        store = new_store(store_module(Mock()))
+        for dtype in (np.float16, np.float32):
+            word_type = np.uint16 if dtype == np.float16 else np.uint32
+            words = np.array([0, 1, 0x8000, 0x7c00, 0x7e01, 0xffff,
+                              0x7f800001, 0x80000000], dtype=np.uint32).astype(word_type)
+            base = np.resize(words, 7 * 8 * 128).view(dtype).reshape(7, 8, 128)
+            for keys in (base, base[:1], base[:, :1], base[:, ::2],
+                         base[::-1, :, ::-1], np.asfortranarray(base)):
+                values = keys.copy()
+                expected = b"".join(array.transpose(1, 0, 2).tobytes()
+                                    for array in (keys, values))
+                for profiler in (None, PhaseProfiler(stack=True)):
+                    with self.subTest(dtype=dtype, shape=keys.shape, strides=keys.strides,
+                                      profiled=profiler is not None):
+                        payload = store._pack_payload(keys, values, "prefill", profiler)
+                        self.assertIsInstance(payload, bytes)
+                        self.assertEqual(payload, expected)
+                        values.fill(0)
+                        self.assertEqual(payload, expected)
+                        values[...] = keys
+
+    def test_large_data_splits_files_without_changing_input_packets(self):
+        from cemu_flexgen.sparf_group_layout import SparfGroupLayout
+
+        packets = []
+        for data_bytes in (3840 * 1024**2, 8 * 1024**3):
+            client = Mock()
+            module = store_module(Mock(return_value=client))
+            store = new_store(module, data_bytes=data_bytes, max_tokens=64,
+                              layout=SparfGroupLayout(128, 8, dtype=np.float16)).open()
+            ranges = client.create_memory_ranges.call_args.args[0]
+            self.assertEqual(sum(region[2] for region in ranges[1:]), data_bytes)
+            self.assertTrue(all(region[1] == 0 and 0 < region[2] < 2**32 for region in ranges))
+            self.assertEqual(len({region[0] for region in ranges}), len(ranges))
+            self.assertEqual(len(ranges), 2 if data_bytes < 2**32 else 4)
+            self.assertEqual(store.input_bytes, 128 * 1024)
+            keys = np.ones((35, 2, 128), dtype=np.float16)
+            store.append_batch(0, 0, keys, -keys)
+            store.drain()
+            packets.append([call.args for call in client.write_range.call_args_list])
+            store.close()
+        self.assertEqual(packets[0], packets[1])
+
+    def test_packet_trace_preserves_wire_and_records_failure(self):
+        from cemu_flexgen.sparf_group_layout import SparfGroupLayout
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "packets.jsonl"
+            captured = []
+            for destination in ("", str(path)):
+                client = Mock()
+                with patch.dict(os.environ, CEMU_PWRITE_PACKET_TRACE=destination):
+                    store = new_store(store_module(Mock(return_value=client)),
+                        layout=SparfGroupLayout(128, 8, dtype=np.float16)).open()
+                keys = np.ones((2, 2, 128), dtype=np.float16)
+                store.append_batch(0, 0, keys, -keys)
+                store.drain()
+                captured.append([call.args for call in client.write_range.call_args_list])
+                store.close()
+            self.assertEqual(captured[0], captured[1])
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([record["phase"] for record in records], ["prefill", "drain"])
+            self.assertTrue(all(record["success"] for record in records))
+            self.assertTrue(all(record["end_ns"] >= record["start_ns"] for record in records))
+            with patch.dict(os.environ, CEMU_PWRITE_PACKET_TRACE=str(path)):
+                store = new_store(store_module(Mock(return_value=client)),
+                    layout=SparfGroupLayout(128, 8, dtype=np.float16)).open()
+            client.write_range.side_effect = OSError("injected write failure")
+            with self.assertRaisesRegex(OSError, "injected write failure"):
+                store.append_batch(0, 0, keys, -keys)
+            store.close()
+            self.assertFalse(json.loads(path.read_text().splitlines()[-1])["success"])
+
+    def test_profiled_packets_match_unprofiled_and_split_prefill_decode_drain(self):
+        from phase_profiler import PhaseProfiler
+        from cemu_flexgen.sparf_group_layout import SparfGroupLayout
+
+        captured = []
+        profiler = PhaseProfiler(stack=True)
+        basic = PhaseProfiler()
+        for active in (None, basic, profiler):
+            client = Mock()
+            client.write_range.side_effect = lambda *args, **kwargs: (None, dict(
+                binding_prepare_wall=1, buffer_prepare_wall=2, io_wait_wall=3,
+                buffer_finish_wall=0, binding_finish_wall=4, io_bytes=len(args[1]))) if kwargs else None
+            store = new_store(store_module(Mock(return_value=client)),
+                layout=SparfGroupLayout(128, 8, dtype=np.float16), max_tokens=64,
+                profiler=active).open()
+            keys = np.arange(35 * 4 * 128, dtype=np.float32).reshape(35, 4, 128).astype(np.float16)[:, ::2]
+            store.append_batch(0, 0, keys, -keys)
+            store.append_batch(0, 35, keys[:1], -keys[:1])
+            store.drain()
+            captured.append([call.args for call in client.write_range.call_args_list])
+            store.close()
+        self.assertEqual(captured[0], captured[1])
+        self.assertEqual(captured[0], captured[2])
+        self.assertEqual(basic.metadata_snapshot(), {})
+        self.assertFalse(any("kv_payload_pack" in metric.name for metric in basic.snapshot()))
+        metrics = {metric.name: metric for metric in profiler.snapshot()}
+        header = store_module(Mock()).APPEND_HEADER
+        phases = ["drain" if header.unpack_from(packet)[3] == 2 else
+                  "decode" if header.unpack_from(packet)[13] == 35 else "prefill"
+                  for _, packet, _ in captured[1]]
+        for phase in ("prefill", "decode", "drain"):
+            self.assertEqual(metrics[phase + ".fdm_write.io_wait_wall"].count, phases.count(phase))
+        self.assertEqual(sum(metric.byte_count for name, metric in metrics.items()
+                             if name.endswith(".io_wait_wall")), sum(len(packet) for _, packet, _ in captured[1]))
+        for phase, tokens in (("prefill", 35), ("decode", 1)):
+            children = [metrics[phase + ".kv_payload_pack." + name]
+                        for name in ("k_copy_wall", "v_copy_wall", "join_wall")]
+            self.assertEqual([metric.count for metric in children], [1, 1, 1])
+            self.assertEqual([metric.byte_count for metric in children],
+                             [tokens * 2 * 128 * 2, tokens * 2 * 128 * 2, tokens * 2 * 128 * 4])
+            self.assertLessEqual(sum(metric.total_ns for metric in children),
+                                 metrics[phase + ".kv_payload_pack_wall"].total_ns)
+            layout = profiler.metadata_snapshot()[phase + ".kv_payload_layout"]["arrays"]["keys"]
+            self.assertEqual(layout["shape"], [tokens, 2, 128])
+            self.assertTrue(layout["c_contiguous"])
+            self.assertEqual(layout["transposed_c_contiguous"], tokens == 1)
+
+    def test_payload_breakdown_uses_four_clock_reads_and_keeps_first_layout(self):
+        from phase_profiler import PhaseProfiler
+
+        with patch.dict(os.environ, CEMU_PROFILE_INTERVALS="/tmp/unused-packing-intervals"):
+            profiler = PhaseProfiler(stack=True)
+        module = store_module(Mock())
+        store = new_store(module)
+        keys = np.arange(3 * 2 * 128, dtype=np.float16).reshape(3, 2, 128)
+        values = -keys
+        expected = b"".join(array.transpose(1, 0, 2).tobytes() for array in (keys, values))
+        with patch.object(module.time, "perf_counter_ns", side_effect=[100, 120, 150, 190]) as clock:
+            self.assertEqual(store._pack_payload(keys, values, "prefill", profiler), expected)
+        self.assertEqual(clock.call_count, 4)
+        metrics = {metric.name: metric.total_ns for metric in profiler.snapshot()}
+        self.assertEqual(metrics, {"prefill.kv_payload_pack.k_copy_wall": 20,
+                                  "prefill.kv_payload_pack.v_copy_wall": 30,
+                                  "prefill.kv_payload_pack.join_wall": 40})
+        self.assertEqual([(entry["start_ns"], entry["end_ns"]) for entry in profiler._intervals],
+                         [(100, 120), (120, 150), (150, 190)])
+        store._pack_payload(keys[:1], values[:1], "prefill", profiler)
+        metadata = profiler.metadata_snapshot()["prefill.kv_payload_layout"]
+        self.assertEqual(metadata["numpy_version"], np.__version__)
+        self.assertEqual(metadata["arrays"]["keys"]["shape"], [3, 2, 128])
+        self.assertEqual(metadata["arrays"]["keys"]["strides"], [512, 256, 2])
+        self.assertEqual(metadata["arrays"]["keys"]["transposed_strides"], [256, 512, 2])
+        with patch.object(module.time, "perf_counter_ns", side_effect=AssertionError("disabled clock")):
+            self.assertEqual(store._pack_payload(keys, values, "prefill", None), expected)
+
+    def test_layer_packet_coordinates_layout_and_terminal_drain(self):
         from cemu_flexgen.sparf_group_layout import SparfGroupLayout
 
         client = Mock()
         module = store_module(Mock(return_value=client))
         store = new_store(module, layout=SparfGroupLayout(128, 8, dtype=np.float16),
                           batches=4, layers=2, heads=3, max_tokens=96, microbatch_size=2,
-                          input_bytes=4608)
+                          input_bytes=None)
         store.open()
         keys = np.arange(35 * 6 * 128, dtype=np.float32).reshape(35, 6, 128).astype(np.float16)
         values = -keys
         first_stream = 12 + 6
         store.append_batch(first_stream, 0, keys, values)
+        self.assertEqual(client.write_range.call_count, 1)
         reconstructed_k = np.zeros_like(keys)
         reconstructed_v = np.zeros_like(values)
         for sequence, call in enumerate(client.write_range.call_args_list, 1):
@@ -66,10 +220,13 @@ class FdmBindingClientTest(unittest.TestCase):
             self.assertEqual((index, offset, fields[3], fields[6]), (1, 0, 1, sequence))
             self.assertEqual(fields[7], len(packet))
             self.assertEqual(len(packet) % 512, 0)
-            self.assertLessEqual(len(packet), 4608)
+            self.assertLessEqual(len(packet), store.input_bytes)
+            self.assertEqual(fields[1], 2)
+            self.assertEqual(fields[15], 2)
             self.assertEqual(fields[10], 1)
             count, head_count = fields[14], fields[12]
-            self.assertLessEqual(count, 32)
+            self.assertEqual(count, 35)
+            head_count *= fields[15]
             column = (fields[9] - 2) * 3 + fields[11]
             payload = np.frombuffer(packet, np.float16, fields[8] // 2, 512).reshape(2, head_count, count, 128)
             start = fields[13]
@@ -79,6 +236,11 @@ class FdmBindingClientTest(unittest.TestCase):
             self.assertFalse(any(packet[512 + fields[8]:]))
         np.testing.assert_array_equal(reconstructed_k, keys)
         np.testing.assert_array_equal(reconstructed_v, values)
+        store.append_batch(first_stream, 35, keys[:1], values[:1])
+        self.assertEqual(client.write_range.call_count, 2)
+        decoded = module.APPEND_HEADER.unpack_from(client.write_range.call_args.args[1])
+        self.assertEqual((decoded[9], decoded[10], decoded[12], decoded[13], decoded[14], decoded[15]),
+                         (2, 1, 3, 35, 1, 2))
         with self.assertRaises(ValueError):
             store.append_batch(first_stream, 0, keys, values)
         store.drain()
@@ -94,6 +256,35 @@ class FdmBindingClientTest(unittest.TestCase):
         store.close()
         client.release_memory_ranges.assert_called_once()
         client.execute.assert_not_called()
+
+    def test_whole_layer_input_capacity_and_no_silent_split(self):
+        from cemu_flexgen.sparf_group_layout import SparfGroupLayout
+
+        client = Mock()
+        module = store_module(Mock(return_value=client))
+        store = new_store(module, layout=SparfGroupLayout(128, 8, dtype=np.float16),
+                          batches=4, heads=40, max_tokens=1040, microbatch_size=4,
+                          input_bytes=None, data_bytes=3840 * 1024**2)
+        self.assertEqual(store.input_bytes, 512 + 2 * 4 * 40 * 1040 * 128 * 2)
+        small = new_store(module, layout=SparfGroupLayout(128, 8, dtype=np.float16),
+                          input_bytes=4608).open()
+        with self.assertRaisesRegex(ValueError, "input capacity"):
+            small.append_batch(0, 0, np.ones((16, 2, 128)), np.zeros((16, 2, 128)))
+        client.write_range.assert_not_called()
+        self.assertFalse(small._accepted)
+        small.close()
+
+    def test_layer_packet_rejects_cross_layer_range(self):
+        from cemu_flexgen.sparf_group_layout import SparfGroupLayout
+
+        client = Mock()
+        store = new_store(store_module(Mock(return_value=client)),
+            layout=SparfGroupLayout(128, 8, dtype=np.float16),
+            batches=4, layers=2, microbatch_size=2).open()
+        with self.assertRaisesRegex(ValueError, "layer/microbatch"):
+            store.append_batch(2, 0, np.ones((1, 4, 128)), np.zeros((1, 4, 128)))
+        client.write_range.assert_not_called()
+        store.close()
 
     def test_failed_append_is_not_retried_or_accepted_and_delete_failure_is_visible(self):
         from cemu_flexgen.sparf_group_layout import SparfGroupLayout
@@ -158,7 +349,7 @@ class FdmBindingClientTest(unittest.TestCase):
             {"input_bytes": 513}, {"input_bytes": 512},
             {"input_bytes": 4 * 1024 * 1024}, {"data_bytes": 1025},
             {"nvm_namespace_id": 0}, {"batch_pages": False},
-            {"meta_bytes": 2**32}, {"data_bytes": 2**32},
+            {"meta_bytes": 2**32}, {"data_bytes": 2**40},
         ):
             with self.subTest(parameters=parameters), self.assertRaises(ValueError):
                 new_store(module, **parameters)
@@ -254,7 +445,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                 self.call(1, 5, (65536, 0, 512, 0, 0, 0), namespace=2, payload=sentinel)
                 self.bind(rsid)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (1, 360))
+                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
                 self.assertEqual(struct.unpack_from("<I", header, 12)[0], 1)
                 self.assertEqual(struct.unpack_from("<2Q", header, 16), (store.session_id, 1))
                 self.assertEqual(struct.unpack_from("<4I", header, 32), (1, 1, 2, 128))
@@ -335,7 +526,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                          namespace=2, payload=payload, expected_status=expected_status)
 
     def receive_state(self):
-        return struct.unpack_from("<2I2Q", self.read_memory(360, 128))
+        return struct.unpack_from("<2I2Q", self.read_memory(376, 128))
 
     def test_input_fragments_protection_dma_failure_and_reset(self):
         config = ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json"
@@ -413,7 +604,12 @@ class FdmBindingDeviceTest(unittest.TestCase):
                     {"batch": 1}, {"layer": 1}, {"head_first": 2}, {"head_count": 0},
                     {"head_first": 1}, {"head_count": 0xFFFFFFFF}, {"token_first": 32},
                     {"token_first": 2**64 - 1}, {"token_count": 0}, {"token_count": 33},
-                    {"reserved": 1},
+                    {"reserved": 1}, {"version": 3},
+                    {"version": 2, "reserved": 2},
+                    {"version": 2, "reserved": 0xFFFFFFFF},
+                    {"version": 2, "reserved": 1, "batch": 1},
+                    {"version": 2, "reserved": 1, "token_count": 33},
+                    {"version": 2, "reserved": 1, "payload_bytes": 512},
                 ):
                     with self.subTest(overrides=overrides):
                         rsid = self.create()
@@ -487,7 +683,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                 self.load_aggregate(directory)
                 store = new_store(store_module(Mock()), batches=1, layers=40, heads=40,
                                   max_tokens=36, meta_bytes=4 * 1024**2,
-                                  data_bytes=160 * 1024**2, batch_pages=32)
+                                  data_bytes=160 * 1024**2, batch_pages=32, input_bytes=None)
                 self.wire = store._binding_descriptor()
                 small = self.create(((2, store.meta_bytes, 0),
                                      (2, 64 * 1024**2, store.meta_bytes)))
@@ -497,15 +693,16 @@ class FdmBindingDeviceTest(unittest.TestCase):
                                     (2, store.data_bytes, store.meta_bytes)))
                 self.bind(rsid, program=1)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (1, 360))
+                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
                 self.assertEqual(struct.unpack_from("<Q", header, 88)[0], 1600)
                 self.assertEqual(struct.unpack_from("<Q", header, 104)[0], 35200)
                 self.assertEqual(struct.unpack_from("<I", header, 148)[0], 32600)
                 self.assertEqual(struct.unpack_from("<4I", header, 176), (1, 0, 0, 0))
-                base = struct.unpack_from("<Q", header, 352)[0] - 360
+                base = struct.unpack_from("<Q", header, 352)[0] - 376
                 writebacks = struct.unpack_from("<I", header, 140)[0]
                 meta_used = struct.unpack_from("<Q", header, 232)[0] - base + (writebacks + 1) * 24
-                self.assertEqual(meta_used, 2214920)
+                self.assertEqual(meta_used, 2214960 +
+                                 ((store.input_bytes // 4 + 7) // 8 + 7) // 8 * 8 - 4096)
                 self.assertLess(meta_used, store.meta_bytes)
                 data_used = store.input_bytes + 32600 * 4096
                 self.assertLess(data_used, store.data_bytes)
@@ -531,7 +728,8 @@ class FdmBindingDeviceTest(unittest.TestCase):
                 self.load_aggregate(directory)
                 store = new_store(store_module(Mock()), batches=4, layers=40, heads=40,
                                   max_tokens=1040, microbatch_size=4,
-                                  meta_bytes=64 * 1024**2, data_bytes=3840 * 1024**2)
+                                  meta_bytes=64 * 1024**2, data_bytes=3968 * 1024**2,
+                                  input_bytes=None)
                 self.wire = store._binding_descriptor()
                 small = self.create(((2, store.meta_bytes, 0),
                                      (2, 2 * 1024**3, store.meta_bytes)))
@@ -541,19 +739,20 @@ class FdmBindingDeviceTest(unittest.TestCase):
                                     (2, store.data_bytes, store.meta_bytes)))
                 self.bind(rsid, program=1)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (1, 360))
+                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
                 self.assertEqual(struct.unpack_from("<Q", header, 88)[0], 6400)
                 self.assertEqual(struct.unpack_from("<Q", header, 104)[0], 1344000)
                 self.assertEqual(struct.unpack_from("<I", header, 148)[0], 972800)
                 self.assertEqual(struct.unpack_from("<3I", header, 164), (3840, 8, 256))
                 self.assertEqual(struct.unpack_from("<4I", header, 176), (1, 0, 0, 0))
-                base = struct.unpack_from("<Q", header, 352)[0] - 360
+                base = struct.unpack_from("<Q", header, 352)[0] - 376
                 writebacks = struct.unpack_from("<I", header, 140)[0]
                 meta_used = struct.unpack_from("<Q", header, 232)[0] - base + (writebacks + 1) * 24
-                self.assertEqual(meta_used, 63370896)
+                self.assertEqual(meta_used, 63370936 +
+                                 ((store.input_bytes // 4 + 7) // 8 + 7) // 8 * 8 - 4096)
                 self.assertLess(meta_used, store.meta_bytes)
                 data_used = store.input_bytes + 972800 * 4096
-                self.assertEqual(data_used, 3984719872)
+                self.assertEqual(data_used, 512 + 4 * 40 * 1040 * 128 * 4 + 972800 * 4096)
                 self.assertLess(data_used, store.data_bytes)
                 self.assertLess(store.data_bytes, 2**32)
                 slots = grouped_attention_reserve_bytes(
@@ -583,6 +782,53 @@ class FdmBindingDeviceTest(unittest.TestCase):
                 self.assertEqual(struct.unpack_from("<4Q", header, 264), (1, 2, 0, 36 * 4096))
                 self.assertEqual(struct.unpack_from("<Q", header, 328)[0], 0)
                 self.assertEqual(struct.unpack_from("<Q", header, 344)[0], 0)
+                self.delete(rsid)
+            finally:
+                self.device.close()
+
+    def test_opt13b_b8_segmented_capacity_and_binding(self):
+        config = ROOT / "tests/cemu/instattention/experiments/configs/fdm_opt13b_b8_p1024_d16.json"
+        with tempfile.TemporaryDirectory(prefix="fdm-b8-capacity-") as directory:
+            self.device = NativeQtest(directory, config, page_limit=4194304, placement="balanced")
+            try:
+                self.load_aggregate(directory)
+                store = new_store(store_module(Mock()), batches=8, layers=40, heads=40,
+                                  max_tokens=1040, microbatch_size=8,
+                                  meta_bytes=128 * 1024**2, data_bytes=8 * 1024**3,
+                                  input_bytes=None)
+                self.wire = store._binding_descriptor()
+                descriptors = []
+                offset = 0
+                for _, _, size in store.ranges:
+                    descriptors.append((2, size, offset))
+                    offset += size + 4096
+                rsid = self.create(descriptors)
+                self.bind(rsid, program=1)
+                header = self.read_memory(0)
+                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
+                self.assertEqual(struct.unpack_from("<Q", header, 88)[0], 12800)
+                self.assertEqual(struct.unpack_from("<Q", header, 104)[0], 2688000)
+                self.assertEqual(struct.unpack_from("<Q", header, 120)[0], 8 * 1024**3)
+                self.assertEqual(struct.unpack_from("<I", header, 148)[0], 1944800)
+                self.assertEqual(struct.unpack_from("<I", header, 360)[0], 3)
+                base = struct.unpack_from("<Q", header, 352)[0] - 376
+                segments_offset = struct.unpack_from("<Q", header, 368)[0] - base
+                segments = self.read_memory(segments_offset, 72)
+                counts = [struct.unpack_from("<2Q2I", segments, index * 24)[3] for index in range(3)]
+                self.assertEqual(sum(counts), 1944800)
+                self.assertGreater(counts[1], 0)
+                self.assertLess(segments_offset + 72, store.meta_bytes)
+                for _, _, destination in descriptors[2:]:
+                    self.call(1, 5, (destination & 0xffffffff, destination >> 32, 512, 0, 0, 0),
+                              namespace=2, payload=bytes(512), expected_status=0x4002)
+                destination = descriptors[1][2]
+                packet = self.packet(store, batch=7, layer=39, head_first=38)
+                self.call(1, 5, (destination, 0, len(packet), 0, 0, 0), namespace=2, payload=packet)
+                self.call(1, 5, (destination, 0, 512, 0, 0, 0), namespace=2,
+                          payload=self.drain_packet(store, 2))
+                header = self.read_memory(0)
+                self.assertEqual(struct.unpack_from("<2I", header, 184), (1, 0))
+                self.assertEqual(struct.unpack_from("<4Q", header, 264), (1, 2, 0, 36 * 4096))
                 self.delete(rsid)
             finally:
                 self.device.close()
@@ -647,8 +893,8 @@ class FdmBindingDeviceTest(unittest.TestCase):
         else:
             self.assertEqual(self.wait_completion(command_id), (0, length))
         memory = self.device.read(address, length)
-        self.assertEqual(struct.unpack_from("<2I", memory), (1, 360))
-        base = struct.unpack_from("<Q", memory, 352)[0] - 360
+        self.assertEqual(struct.unpack_from("<2I", memory), (3, 376))
+        base = struct.unpack_from("<Q", memory, 352)[0] - 376
         head_offset, page_offset, block_offset, hash_offset, writeback_offset = (
             pointer - base for pointer in struct.unpack_from("<5Q", memory, 200))
         pool_pages, free_page, free_pages, hash_size, domains, channels, block_pages = \
@@ -665,7 +911,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
             memory=memory, pool_pages=pool_pages, free_page=free_page, free_pages=free_pages,
             channels=channels, block_pages=block_pages, stats=stats,
             initialized=initialized, draining=draining, sealed=sealed, failed=failed,
-            receive=struct.unpack_from("<2I2Q", memory, 360),
+            receive=struct.unpack_from("<2I2Q", memory, 376),
             heads=[struct.unpack_from("<4Q2I", memory, head_offset + index * 40)
                    for index in range(head_count)],
             pages=[struct.unpack_from("<Q4IQ6I", memory, page_offset + index * 56)
@@ -763,7 +1009,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
 
     def verify_staged(self, tokens, heads):
         header = self.read_memory(0)
-        meta_base = struct.unpack_from("<Q", header, 352)[0] - 360
+        meta_base = struct.unpack_from("<Q", header, 352)[0] - 376
         head_offset, staged_offset, blocks_offset = (
             pointer - meta_base for pointer in struct.unpack_from("<3Q", header, 200))
         input_address = struct.unpack_from("<Q", header, 240)[0]
@@ -890,7 +1136,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                     self.assertEqual(self.device.completion(1), (0, 512))
                     self.assertEqual(self.device.wait(1), (0, 512))
                     header = self.device.read(DATA + 256 * 1024, 512)
-                    self.assertEqual(struct.unpack_from("<I", header, 360)[0], 4)
+                    self.assertEqual(struct.unpack_from("<I", header, 376)[0], 4)
                     self.assertEqual(struct.unpack_from("<Q", header, 264)[0], 0)
                     self.call(0, 0x21, (1 | (rsid << 16), 0, 0, 0, 0, 0), expected_status=0x95)
                     if reset:

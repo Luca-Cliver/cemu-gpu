@@ -12,6 +12,7 @@
 #define CEMU_SPARF_WORKFLOW_GROUPED 4U
 #define CEMU_SPARF_WORKFLOW_NATIVE 8U
 #define CEMU_SPARF_WORKFLOW_FDM 16U
+#define CEMU_SPARF_WORKFLOW_RAGGED 32U
 
 struct cemu_sparf_fdm_binding {
     uint64_t session_id;
@@ -76,6 +77,35 @@ struct cemu_sparf_workflow_header {
     float scale;
     uint32_t reserved[2];
 };
+
+/* Call only after validating the command length and row prefixes. */
+static inline struct cemu_sparf_batch_row cemu_sparf_row(
+    const struct cemu_sparf_workflow_header *h,
+    const struct cemu_sparf_batch_row *rows, uint32_t batch)
+{
+    if (rows) return rows[batch];
+    struct cemu_sparf_batch_row row = {
+        batch, h->valid_tokens, h->top_k,
+        batch * h->valid_tokens, batch * h->top_k
+    };
+    return row;
+}
+
+static inline uint64_t cemu_sparf_history_count(
+    const struct cemu_sparf_workflow_header *h,
+    const struct cemu_sparf_batch_row *rows)
+{
+    struct cemu_sparf_batch_row last = cemu_sparf_row(h, rows, h->batch_size - 1);
+    return ((uint64_t)last.history_offset + last.valid_tokens) * h->num_query_heads;
+}
+
+static inline uint64_t cemu_sparf_selected_count(
+    const struct cemu_sparf_workflow_header *h,
+    const struct cemu_sparf_batch_row *rows)
+{
+    struct cemu_sparf_batch_row last = cemu_sparf_row(h, rows, h->batch_size - 1);
+    return ((uint64_t)last.selected_offset + last.top_k) * h->num_query_heads;
+}
 
 struct cemu_sparf_workflow_extent {
     uint64_t slba;

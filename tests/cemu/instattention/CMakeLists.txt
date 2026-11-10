@@ -73,6 +73,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_io_transport PRIVATE cemu_io_transport)
     add_test(NAME io_transport COMMAND test_io_transport)
     set_tests_properties(io_transport PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(test_client_profile guest/test_client_profile.cpp guest/cemu_client.cpp ../util.c)
+    target_link_libraries(test_client_profile PRIVATE cemu_io_transport)
+    target_link_options(test_client_profile PRIVATE "-Wl,--wrap=ioctl" "-Wl,--wrap=pread")
+    add_test(NAME client_profile COMMAND test_client_profile)
 endif()
 
 target_include_directories(_cemu_client PRIVATE

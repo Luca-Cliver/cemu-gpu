@@ -1,5 +1,6 @@
 import sys
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from cemu_flexgen import KvLayoutConfig, SparfKvCacheLayout, align_up
 from cemu_flexgen.sparf_group_capacity import grouped_attention_reserve_bytes
 from cemu_flexgen.sparf_workflow_abi import SPARF_WORKFLOW_COMMAND
 import test_opt_cemu_pipeline as pipeline
+from opt_inputs import comparison_case, load_reference, prepare_prompt, write_json
 
 
 class OptSparfIntegrationTest(unittest.TestCase):
@@ -26,6 +28,36 @@ class OptSparfIntegrationTest(unittest.TestCase):
         self.assertFalse(args.sparf_autonomous)
         self.assertFalse(args.sparf_device_writeback)
         self.assertFalse(args.sparf_native)
+
+    def test_fixed_prompt_matches_legacy_generator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            write_json(model / "config.json", dict(vocab_size=32, bos_token_id=7, pad_token_id=1,
+                                                   max_position_embeddings=64))
+            prompt, _ = prepare_prompt(model, 4, 11, 16)
+            old = pipeline.make_token_ids(SimpleNamespace(vocab_size=32, bos_token_id=7), 4, 11)
+            np.testing.assert_array_equal(prompt, old.numpy())
+
+    def test_functional_result_can_be_used_as_framework_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            write_json(model / "config.json", dict(vocab_size=32, bos_token_id=2, pad_token_id=1,
+                                                   max_position_embeddings=64))
+            args = self.arguments("--attention-mode", "sparf", "--functional", "--decode-steps", "2",
+                                  "--result-output", str(model / "result.json"))
+            args.model_dir = model
+            prompt, _ = prepare_prompt(model, 1, 8, 2)
+            prefill = Mock()
+            prefill.run.return_value.next_token_ids = pipeline.torch.tensor([[5]])
+            generated = pipeline.torch.tensor([[5, 6, 7]])
+            with patch.object(pipeline, "OptGenerationRunner") as runner, \
+                    patch.object(pipeline, "open_attention_schedulers"), \
+                    patch.object(pipeline, "synchronize"), patch.object(pipeline, "log"):
+                runner.return_value.run.return_value.token_ids = generated
+                pipeline.run_functional_pipeline(args, pipeline.torch.from_numpy(prompt), 8,
+                    prefill, Mock(), [], Mock(), [], 2, 1, None, "cpu")
+            case = comparison_case(model, prompt, 2, 16, 8)
+            np.testing.assert_array_equal(load_reference(args.result_output, case), generated.numpy())
 
     def test_invalid_modes_fail_before_device_or_checkpoint_access(self):
         cases = (

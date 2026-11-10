@@ -34,6 +34,13 @@ instattention:
 instattention-device-test: instattention
 	python3 $(INSTATTENTION_DIR)/python/test_cemu_device.py
 
+.PHONY: instattention-flexgen-framework-test instattention-flexgen-cemu-qtest
+instattention-flexgen-framework-test: instattention
+	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_flexgen_framework
+
+instattention-flexgen-cemu-qtest: instattention
+	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_flexgen_cemu_qtest
+
 .PHONY: instattention-io-transport-test
 instattention-io-transport-test: instattention
 	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest test_io_transport test_native_kv_client
@@ -50,6 +57,10 @@ instattention-fdm-buffer-aggregate-test:
 
 instattention-fdm-buffer-init-qtest:
 	PYTHONPATH="$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_fdm_kv_binding
+
+.PHONY: instattention-pwrite-stack-test
+instattention-pwrite-stack-test:
+	PYTHONPATH="$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) -m unittest -v test_pwrite_stack_trace test_decode_stack_accounting test_fdm_kv_binding.FdmBindingClientTest
 
 instattention-freeze-clock-test: instattention
 	PYTHONPATH="$(INSTATTENTION_BUILD_DIR):$(INSTATTENTION_DIR)/python:$${PYTHONPATH}" $(PYTHON) \

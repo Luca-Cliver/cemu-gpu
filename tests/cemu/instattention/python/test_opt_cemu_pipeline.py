@@ -66,6 +66,7 @@ from phase_profiler import PhaseProfiler, profile_scope
 from runtime_common import partition_kv_cache_by_batch
 from _cemu_client import CemuClient, MemoryRange
 from cemu_flexgen.fdm_kvbuffer_store import FDM_KVbuffer
+from opt_inputs import comparison_case, prepare_prompt, write_json
 
 
 _LOG_START_NS = time.perf_counter_ns()
@@ -128,7 +129,9 @@ def parse_args():
         help="sequences handled by each independent GPU microbatch",
     )
     parser.add_argument("--prompt-length", type=positive_integer, default=8)
-    parser.add_argument(
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--prompt-ids", type=Path, help="fixed rectangular token IDs shared with the FlexGen entry")
+    inputs.add_argument(
         "--prompt-text",
         help=(
             "optional real text prompt encoded with the tokenizer in --model-dir; "
@@ -136,6 +139,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--decode-steps", type=positive_integer, default=1)
+    parser.add_argument("--result-output", type=Path, help="functional SparF token result for same-input framework comparison")
     parser.add_argument("--staging-tokens", type=nonnegative_integer, default=0)
     parser.add_argument("--attention-slots", type=positive_integer, default=2)
     parser.add_argument("--attention-mode", choices=("dense", "sparf"), default="dense")
@@ -539,6 +543,12 @@ def run_functional_pipeline(
         log(f"[opt-functional] grouped writeback statistics: {store.statistics()}")
     if tokenizer is not None:
         log_generated_text(tokenizer, token_ids, generation.token_ids)
+    if args.result_output is not None:
+        case = comparison_case(args.model_dir, token_ids.detach().cpu().numpy(), args.decode_steps,
+                               args.sparf_top_r, args.sparf_compression_ratio)
+        write_json(args.result_output, dict(case=case, tokens=generation.token_ids.detach().cpu().tolist(),
+                                           framework="opt_runtime", token_comparison="not_requested"))
+        log(f"[opt-functional] token result={args.result_output}; full-model logits not checked")
     log(
         "[opt-functional] PASS: real OPT checkpoint -> Guest GPU Prefill -> "
         "CEMU NVM/FDM/MRS/CSD Attention -> Guest GPU Wo/MLP/LM head; "
@@ -1026,6 +1036,10 @@ def diagnose_generations(
 def main():
     print(f"[opt-cemu] Guest I/O backend={io_backend()} (management commands remain ioctl)", flush=True)
     args = parse_args()
+    if args.result_output is not None and (not args.functional or args.attention_mode != "sparf"):
+        raise ValueError("--result-output requires functional SparF")
+    if args.result_output is not None and args.prompt_ids is not None and args.result_output.resolve() == args.prompt_ids.resolve():
+        raise ValueError("result output must not overwrite prompt IDs")
     if args.fdm_internalbuf:
         if (args.attention_mode != "sparf" or not args.sparf_autonomous or not args.functional or
                 args.sparf_kv_buffer_tokens or args.sparf_device_writeback):
@@ -1103,7 +1117,12 @@ def main():
         )
     device = torch.device("cuda:0")
     tokenizer = None
-    if args.prompt_text is None:
+    if args.prompt_ids is not None:
+        prompt, _ = prepare_prompt(model_directory, args.batch_size, args.prompt_length,
+                                   args.decode_steps, prompt_ids=args.prompt_ids)
+        token_ids = torch.from_numpy(prompt)
+        prompt_length = token_ids.shape[1]
+    elif args.prompt_text is None:
         token_ids = make_token_ids(config, args.batch_size, args.prompt_length)
         prompt_length = args.prompt_length
     else:

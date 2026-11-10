@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define CEMU_FDM_KV_BUFFER_VERSION 1U
+#define CEMU_FDM_KV_BUFFER_VERSION 3U
+#define CEMU_FDM_KV_MAX_DATA_MRS 126U
 #define CEMU_FDM_KV_KIND_COUNT 3U
 #define CEMU_FDM_KV_INVALID_INDEX 0U
 
@@ -17,6 +18,7 @@
 
 #define CEMU_FDM_KV_PACKET_MAGIC 0x31564B46U
 #define CEMU_FDM_KV_PACKET_VERSION 1U
+#define CEMU_FDM_KV_LAYER_PACKET_VERSION 2U
 #define CEMU_FDM_KV_PACKET_HEADER_BYTES 512U
 #define CEMU_FDM_KV_RECEIVE_UNIT_BYTES 4U
 
@@ -178,7 +180,10 @@ typedef struct FDMKV_AppendHeader
 
     uint64_t token_first;
     uint32_t token_count;
-    uint32_t reserved;
+    union {
+        uint32_t reserved;
+        uint32_t batch_count;
+    };
 }FDMKV_AppendHeader_t;
 
 typedef struct FDMKV_ReceiveState
@@ -193,7 +198,18 @@ typedef struct FDMKV_ReceiveState
     uint8_t *received_bitmap;
 
     FDMKV_AppendHeader_t header;
+    uint64_t received_units;
+    uint64_t received_end;
+    uint32_t aggregate_batch;
+    uint32_t aggregate_tokens;
 } FDMKV_ReceiveState_t;
+
+typedef struct FDMKV_DataSegment {
+    uint8_t *address;
+    uint64_t bytes;
+    uint32_t first_page;
+    uint32_t page_count;
+} FDMKV_DataSegment_t;
 
 typedef struct FDMKVBuffer
 {
@@ -241,8 +257,28 @@ typedef struct FDMKVBuffer
     FDMKV_BufferStats_t stats;
 
     FDMKV_ReceiveState_t *receive;
+    uint32_t segment_count;
+    uint32_t segment_reserved;
+    FDMKV_DataSegment_t *segments;
 }FDMKV_Buffer_t;
 
+static inline uint8_t *fdm_kv_page_data(const FDMKV_Buffer_t *buffer, uint32_t index)
+{
+    if (!index || index > buffer->pool_pages) {
+        return NULL;
+    }
+    for (uint32_t segment = 0; segment < buffer->segment_count; segment++) {
+        const FDMKV_DataSegment_t *range = &buffer->segments[segment];
+        if (index >= range->first_page && index - range->first_page < range->page_count) {
+            uint64_t offset = segment ? 0 :
+                (buffer->input_bytes + buffer->layout.geometry.page_bytes - 1) /
+                buffer->layout.geometry.page_bytes * buffer->layout.geometry.page_bytes;
+            return range->address + offset +
+                (uint64_t)(index - range->first_page) * buffer->layout.geometry.page_bytes;
+        }
+    }
+    return NULL;
+}
 
 
 
@@ -277,7 +313,9 @@ FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Writeback_t) == 24,
                      "FDMKVWriteback ABI");
 FDM_KV_STATIC_ASSERT(sizeof(FDMKV_BufferStats_t) == 88,
                      "FDMKVBufferStats ABI");
-FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Buffer_t) == 360,
+FDM_KV_STATIC_ASSERT(sizeof(FDMKV_DataSegment_t) == 24,
+                     "FDMKVDataSegment ABI");
+FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Buffer_t) == 376,
                      "FDMKVBuffer ABI");
 
 FDM_KV_STATIC_ASSERT(sizeof(FDMKV_AppendHeader_t) == 88,
@@ -286,7 +324,7 @@ FDM_KV_STATIC_ASSERT(sizeof(FDMKV_AppendHeader_t) == 88,
 FDM_KV_STATIC_ASSERT(offsetof(FDMKV_AppendHeader_t, token_first) == 72,
                      "FDMKVAppendHeader token_first offset");
 
-FDM_KV_STATIC_ASSERT(sizeof(FDMKV_ReceiveState_t) == 128,
+FDM_KV_STATIC_ASSERT(sizeof(FDMKV_ReceiveState_t) == 152,
                      "FDMKVReceiveState ABI");
 
 FDM_KV_STATIC_ASSERT(offsetof(FDMKV_ReceiveState_t, header) == 40,

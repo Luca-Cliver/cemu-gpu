@@ -82,12 +82,29 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
     uint32_t hash_size = 1;
     uintptr_t meta_start;
     uintptr_t data_start;
+    FDMKV_DataSegment_t segments[CEMU_FDM_KV_MAX_DATA_MRS] = {0};
+    uint64_t available_pages = 0;
+    uint64_t total_bytes = 0;
 
     if (!params || !result) {
         return false;
     }
 
     FDMKV_InitParams_t config = *params;
+
+    if (config.segment_count > CEMU_FDM_KV_MAX_DATA_MRS ||
+        (config.segment_count && !config.data_segments)) {
+        return false;
+    }
+    if (config.segment_count) {
+        memcpy(segments, config.data_segments, config.segment_count * sizeof(*segments));
+        config.data_addr = segments[0].address;
+        config.data_bytes = segments[0].bytes;
+    } else {
+        config.segment_count = 1;
+        segments[0].address = config.data_addr;
+        segments[0].bytes = config.data_bytes;
+    }
 
     if (!config.meta_addr || !config.data_addr ||
         !config.meta_bytes || !config.data_bytes ||
@@ -132,6 +149,24 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
 
     data_offset = config.input_bytes + data_padding;
 
+    for (uint32_t index = 0; index < config.segment_count; index++) {
+        uintptr_t address = (uintptr_t)segments[index].address;
+        uint64_t bytes = segments[index].bytes;
+        if (!address || address % 8 || !bytes || bytes > UINT32_MAX ||
+            bytes > UINTPTR_MAX - address || bytes > UINT64_MAX - total_bytes ||
+            (meta_start < address + bytes && address < meta_start + config.meta_bytes)) {
+            return false;
+        }
+        for (uint32_t previous = 0; previous < index; previous++) {
+            uintptr_t other = (uintptr_t)segments[previous].address;
+            if (address < other + segments[previous].bytes && other < address + bytes) {
+                return false;
+            }
+        }
+        total_bytes += bytes;
+        available_pages += (bytes - (index ? 0 : data_offset)) / config.geometry.page_bytes;
+    }
+
     pool_pages = fdm_kv_pool_pages(&candidate.layout,
                                    config.nand_channels,
                                    config.block_pages);
@@ -141,8 +176,7 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
 
     if (!pool_pages || pool_pages > UINT32_MAX / 4 ||
         domains > UINT32_MAX ||
-        pool_pages > (config.data_bytes - data_offset) /
-                     config.geometry.page_bytes) {
+        pool_pages > available_pages) {
         return false;
     }
 
@@ -184,10 +218,12 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
 
     candidate.writebacks = fdm_kv_take(
         &arena, writebacks + 1, sizeof(*candidate.writebacks));
+    candidate.segment_count = config.segment_count;
+    candidate.segments = fdm_kv_take(&arena, config.segment_count, sizeof(*candidate.segments));
 
     if (!buffer || !candidate.receive || !receive.received_bitmap ||
         !candidate.head_states || !candidate.staged || !candidate.blocks ||
-        !candidate.page_hash || !candidate.writebacks) {
+        !candidate.page_hash || !candidate.writebacks || !candidate.segments) {
         return false;
     }
 
@@ -196,7 +232,7 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
     candidate.identity = config.identity;
 
     candidate.meta_bytes = config.meta_bytes;
-    candidate.data_bytes = config.data_bytes;
+    candidate.data_bytes = total_bytes;
 
     candidate.append_max_tokens = 2 * candidate.layout.token_group_tokens;
     candidate.row_bytes = row_bytes;
@@ -218,10 +254,20 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
     candidate.input_bytes = config.input_bytes;
     candidate.staged_data = (uint8_t *)config.data_addr + data_offset;
 
+    uint64_t assigned = 0;
+    for (uint32_t index = 0; index < config.segment_count; index++) {
+        uint64_t capacity = (segments[index].bytes - (index ? 0 : data_offset)) /
+                            config.geometry.page_bytes;
+        segments[index].first_page = assigned + 1;
+        segments[index].page_count = MIN(capacity, pool_pages - assigned);
+        assigned += segments[index].page_count;
+    }
+
     memset(config.meta_addr, 0, arena.used);
 
     *buffer = candidate;
     *buffer->receive = receive;
+    memcpy(buffer->segments, segments, config.segment_count * sizeof(*segments));
 
     for (uint32_t index = 1; index <= buffer->pool_pages; index++) {
         buffer->staged[index].next =

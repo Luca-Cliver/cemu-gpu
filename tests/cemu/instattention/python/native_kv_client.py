@@ -124,6 +124,19 @@ def inspect(transport):
     return controller, namespace, struct.unpack_from("<4Q", data, 40)
 
 
+def require_fresh_namespace(transport):
+    controller, namespace, counters = inspect(transport)
+    if any(counters):
+        names = ("reserved_pages", "written_pages", "failed_pages", "claimed_blocks")
+        details = ", ".join(f"{name}={value}" for name, value in zip(names, counters))
+        raise RuntimeError(
+            f"Native KV namespace is not fresh: controller={controller}, ns={namespace}, {details}. "
+            "Shut down the Guest and relaunch Host QEMU for each comparison run; "
+            "deleting FDM files or restarting the Python worker does not reclaim NVM mappings."
+        )
+    return controller, namespace
+
+
 def run_contract(transport):
     controller, namespace, before = inspect(transport)
     task = secrets.randbits(32)

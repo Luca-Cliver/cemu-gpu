@@ -73,11 +73,13 @@ static bool receive_header(FDMKV_Buffer_t *buffer)
         .reserved = le32_to_cpu(wire.reserved),
     };
     const FDMKV_Geometry_t *geometry = &buffer->layout.geometry;
+    bool layer_packet = header.version == CEMU_FDM_KV_LAYER_PACKET_VERSION;
+    uint32_t batches = layer_packet ? header.batch_count : 1;
     if (header.magic != CEMU_FDM_KV_PACKET_MAGIC ||
-        header.version != CEMU_FDM_KV_PACKET_VERSION ||
+        (!layer_packet && header.version != CEMU_FDM_KV_PACKET_VERSION) ||
         header.header_bytes != CEMU_FDM_KV_PACKET_HEADER_BYTES ||
         (header.operation != FDM_KV_OP_APPEND && header.operation != FDM_KV_OP_DRAIN) ||
-        header.reserved ||
+        (!layer_packet && header.reserved) ||
         header.session_id != buffer->identity.session_id ||
         header.generation != buffer->identity.generation ||
         header.request_id != buffer->receive->next_request_id ||
@@ -89,24 +91,28 @@ static bool receive_header(FDMKV_Buffer_t *buffer)
     if (header.operation == FDM_KV_OP_DRAIN) {
         if (header.wire_bytes != CEMU_FDM_KV_PACKET_HEADER_BYTES || header.payload_bytes ||
             header.batch || header.layer || header.head_first || header.head_count ||
-            header.token_first || header.token_count ||
-            !bitmap_matches(buffer->receive, header.wire_bytes,
-                            buffer->input_bytes - header.wire_bytes, false)) {
+            header.token_first || header.token_count || header.batch_count ||
+            buffer->receive->received_end > header.wire_bytes) {
             return false;
         }
         buffer->receive->header = header;
         buffer->receive->header_valid = 1;
         return true;
     }
-    if (header.batch >= geometry->batches || header.layer >= geometry->layers ||
+    if (header.batch >= geometry->batches || !batches ||
+        batches > geometry->batches - header.batch || header.layer >= geometry->layers ||
         header.head_first >= geometry->heads || !header.head_count ||
         header.head_count > geometry->heads - header.head_first ||
-        !header.token_count || header.token_count > buffer->append_max_tokens ||
+        !header.token_count || (!layer_packet && header.token_count > buffer->append_max_tokens) ||
         header.token_first > geometry->max_tokens ||
         header.token_count > geometry->max_tokens - header.token_first) {
         return false;
     }
     uint64_t rows = (uint64_t)header.head_count * header.token_count;
+    if (rows > UINT64_MAX / batches) {
+        return false;
+    }
+    rows *= batches;
     uint64_t row_pair_bytes = 2ULL * buffer->row_bytes;
     if (!row_pair_bytes || rows > UINT64_MAX / row_pair_bytes ||
         header.payload_bytes != rows * row_pair_bytes ||
@@ -117,8 +123,7 @@ static bool receive_header(FDMKV_Buffer_t *buffer)
     uint64_t padding = (512 - packet_bytes % 512) % 512;
     if (padding > buffer->input_bytes - packet_bytes ||
         header.wire_bytes != packet_bytes + padding ||
-        !bitmap_matches(buffer->receive, header.wire_bytes,
-                        buffer->input_bytes - header.wire_bytes, false)) {
+        buffer->receive->received_end > header.wire_bytes) {
         return false;
     }
     buffer->receive->header = header;
@@ -144,6 +149,10 @@ bool fdm_kv_receive_release(FDMKV_Buffer_t *buffer)
     memset(&receive->header, 0, sizeof(receive->header));
     receive->header_valid = 0;
     receive->max_write_ready_ns = 0;
+    receive->received_units = 0;
+    receive->received_end = 0;
+    receive->aggregate_batch = 0;
+    receive->aggregate_tokens = 0;
     receive->next_request_id++;
     receive->state = FDM_KV_RX_EMPTY;
     return true;
@@ -164,6 +173,8 @@ FDMKV_ReceiveResult fdm_kv_receive_record(FDMKV_Buffer_t *buffer,
         receive->received_bitmap[unit / 8] |= 1U << (unit % 8);
     }
     receive->state = FDM_KV_RX_RECEIVING;
+    receive->received_units += count;
+    receive->received_end = MAX(receive->received_end, offset + bytes);
     receive->max_write_ready_ns = MAX(receive->max_write_ready_ns, ready_ns);
     if (!receive->header_valid &&
         bitmap_matches(receive, 0, CEMU_FDM_KV_PACKET_HEADER_BYTES, true) &&
@@ -171,7 +182,8 @@ FDMKV_ReceiveResult fdm_kv_receive_record(FDMKV_Buffer_t *buffer,
         fdm_kv_receive_fail(buffer);
         return FDM_KV_RECEIVE_INVALID;
     }
-    if (receive->header_valid && bitmap_matches(receive, 0, receive->header.wire_bytes, true)) {
+    if (receive->header_valid &&
+        receive->received_units == receive->header.wire_bytes / CEMU_FDM_KV_RECEIVE_UNIT_BYTES) {
         uint64_t payload_end = CEMU_FDM_KV_PACKET_HEADER_BYTES + receive->header.payload_bytes;
         if (!bytes_zero(buffer->input + payload_end, receive->header.wire_bytes - payload_end)) {
             fdm_kv_receive_fail(buffer);

@@ -20,7 +20,7 @@ KV 导出后，`_append_heads()` 在循环内**打一个包、调用一次 ioctl
 
 ## 图 03 数值来源
 
-- 原日志：`/home/lihan/cemu/native-batch-device-timeline.jsonl`，文件日期 2026-09-26。
+- 原日志：`/home/lihan/cemu/cemu-logs/archives/workspace-root-20261102/native-batch-device-timeline.jsonl`，文件日期 2026-09-26。
 - schema：`sparf-autonomous-v1`；session：`906725105082679`；pid：`3063245`；request：`1`。
 - layer：`0`；tokens：`1025`；engine：`0`；success：`true`。
 - [所选完整请求原文](execute-request-1.json)，[按 Host 时间排序的事件](execute-events.csv)，[各区间数值](execute-timings.csv)。

@@ -81,6 +81,12 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             nvme_addr_read(n, addr, (void *)&cmd, sizeof(cmd));
         }
 
+        if (n->native_kv && fdm_kv_input_busy(n, &cmd)) {
+            if (!sq->fdm_input_wait_started) {
+                sq->fdm_input_wait_started = clock_ns();
+            }
+            break;
+        }
         pthread_spin_lock(&sq->lock);
         if (n->native_kv && QTAILQ_EMPTY(&sq->req_list)) {
             pthread_spin_unlock(&sq->lock);
@@ -102,6 +108,14 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->sparf_cancelled = NULL;
         req->read_observation = NULL;
         req->fdm_kv_pending = false;
+        fdm_io_trace_begin(req);
+        if (sq->fdm_input_wait_started) {
+            if (req->fdm_io_trace.enabled) {
+                req->fdm_io_trace.input_slot_wait_ns = req->fdm_io_trace.sq_seen - sq->fdm_input_wait_started;
+                req->fdm_io_trace.sq_seen = sq->fdm_input_wait_started;
+            }
+            sq->fdm_input_wait_started = 0;
+        }
         if (n->native_kv) {
             n->native_inflight++;
         }
@@ -313,6 +327,9 @@ static void nvme_process_cq_cpl(FemuCtrl *n, int index_poller)
         sq = req->sq;
         cq = n->cq[n->native_kv ? sq->cqid : sq->sqid];
         if (n->native_kv && (!cq || !cq->is_active || nvme_cq_full(cq))) {
+            if (req->fdm_io_trace.enabled) {
+                req->fdm_io_trace.cq_full++;
+            }
             pqueue_pop(pq);
             QTAILQ_INSERT_TAIL(&deferred, req, entry);
             continue;
@@ -327,7 +344,10 @@ static void nvme_process_cq_cpl(FemuCtrl *n, int index_poller)
             }
             now = clock_ns();
         }
+        FDM_IO_STAMP(req, cq_begin);
         nvme_post_cqe(cq, req);
+        FDM_IO_STAMP(req, cq_end);
+        fdm_io_trace_end(req);
         pthread_spin_lock(&sq->lock);
         QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
         pthread_spin_unlock(&sq->lock);
@@ -441,11 +461,13 @@ void *nvme_poller(void *arg)
 void nvme_native_stop(FemuCtrl *n)
 {
     if (!n->poller_on) {
+        fdm_kv_aggregators_stop(n);
         fdm_kv_writers_stop(n);
         return;
     }
     qatomic_set(&n->native_stop, true);
     qemu_thread_join(&n->poller[1]);
+    fdm_kv_aggregators_stop(n);
     if (n->num_namespaces == 3) compute_native_quiesce(&n->namespaces[2]);
     bb_native_stop(&n->namespaces[0]);
     fdm_kv_writers_stop(n);

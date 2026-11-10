@@ -2,6 +2,11 @@
 
 当前目标是复现论文行为再评估模拟精度，不以吞吐吻合或一次functional PASS代替行为验收。
 
+vLLM / Llama-3.1-8B 的接入设计见
+[vLLM 接入设计与实施边界](../../../docs/cemu/VLLM_INSTATTENTION_INTEGRATION.md)
+和 [首版适配器安装与测试](python/vllm_adapter/README.md)
+（2026-11-02，插件已实现、CPU QEMU 回归已通过，真实模型/CUDA 端到端待验证；保留现有 SparF、FDM 聚合/缓冲/写回及设备 CUDA 动态库路径）。
+
 当前 native 串行路径的函数入口、Prefill/Decode 数据流、完成条件和计时边界见
 [串行执行与数据流](NATIVE_SERIAL_DATAFLOW.md)，用于后续分阶段埋点和论文行为对照。
 调用、系统调用、冻结区间及等待边界的图示见
@@ -9,9 +14,708 @@
 物理硬件阶段、作者 NVMeVirt 模拟的已知边界、当前 CEMU 实现的逐项对应见
 [物理阶段对应表](PHYSICAL_STAGE_MAPPING.md)。
 
+2026-11-04 下午关于 KV `pwrite` 提交后返回、设备多块 input、包级 SQ/CQ、
+共享完成环与源缓冲区延迟释放的初步方案见
+[FDM 异步写入设计讨论记录](FDM_ASYNC_PWRITE_DESIGN_2026-11-04.md)；该方案尚未实现。
+
+## InstAttention FlexGen 接入（2026-10-26）
+
+### FDM 整层追加（2026-10-29）
+
+FDM 客户端不再按 token/head 拆小包。Prefill 和 Decode 每次
+`append_batch()` 将当前 layer/microbatch 的 K/V 打成一个包，调用一次 `write_range()`；
+ioctl 后端正常完整写入时是一回 `pwrite`，uring 后端是一回 write 提交。
+短写/EINTR 仍由现有客户端处理，底层 NVMe 命令仍可能拆分，不等于一条 NVMe 命令。
+多个 microbatch 各自提交，不能为了整层合包而打破 FlexGen 的 microbatch 调度。
+
+包头版本 2 保持 88 字节结构和 512 字节包头区；`batch` 是全局起始样本号，
+原末尾 reserved 字段改作 `batch_count`。K、V 分别按
+`[batch_count, head_count, token_count, head_dim]` 连续排列。设备仍接受版本 1 的单样本小包。
+默认输入槽自动取 `max(128 KiB, align512(512 + 2 * microbatch_size * heads * max_tokens * row_bytes))`；
+显式给小输入槽会报错，不自动退回分包。输入槽必须完整位于 MR1，且不超过 Linux 单次 write 上限。
+OPT-13B B4/P1024 的 Prefill 包是 80 MiB + 512 字节，Decode 包是 80 KiB + 512 字节。
+同一微批覆盖 B4、40 层、16 次 Decode 时，追加包为 Prefill 40 次、Decode 640 次，不含 DRAIN。
+
+设备仍直接 DMA 到 MR1，按位图防止重叠，按接收单元计数判断整包完整；不逐分片反复扫描整个大包。
+默认同步模式下，收齐的最后到达分片保留原请求，不提前 CQE。聚合每轮处理一个样本的一小段 token，直接索引原输入，
+不创建子包/额外 Guest IO，也不复制到新的输入区。进度保存在 MR0，成功部分不重复追加；
+轮间释放锁、唤醒 writer，让已满块下放和完成回收继续进行，避免要求页池一次容纳整层。
+下一轮使用当前虚拟时刻重新参与完成队列调度，不新增固定聚合 runtime；资源不足仍按原规则重试。
+全部聚合成功才释放输入槽并完成最后分片，聚合错误令 buffer 失败，不能重试整个已部分接受的包。
+
+### FDM 后台聚合（可选）
+
+Host 启动时设置 `CEMU_FDM_ASYNC_AGGREGATE=1`，可提前完成 APPEND：整包已进入 MR1、
+包头/坐标/接收位图及 token 前缀验证通过，并到达输入写入模型完成时间后，返回最后分片 CQE。
+这个返回值表示设备拥有输入数据，**不表示已完成聚合，更不表示 NAND 已持久化**。
+默认 `0` 保留原同步基线；native APPEND 路径不受该开关影响。需要重启 QEMU 切换。
+
+每个绑定创建一个聚合线程和一个可复用任务，直接读取原 MR1 输入槽，没有第二份整包复制。
+后台仍调用原聚合模块、复用原暂存布局和 NAND writer，不新增每包 EXEC/ioctl，也不新增聚合冻结或虚构 runtime。
+无工作或资源不足时用条件变量等待；每个有限大小的聚合片段之后释放锁，给写回和其他设备请求让出执行机会。
+
+FDM 的 READ/WRITE/FILL 先按地址范围判断是否与绑定的 KV metadata/input/暂存数据 MR 相交。
+相交时仍取得 KV 互斥锁，原有输入槽接收检查及保护区写入限制不变；不相交的 Q、mean、output 等区域
+不再取得聚合线程使用的互斥锁。范围判断和访问期间持有独立的绑定生命周期读锁，绑定/解除使用写锁，
+避免访问过程中绑定或 MR 描述被释放、重新分类；后台聚合不持有这把生命周期读写锁。
+锁顺序为生命周期锁在前、KV 互斥锁在后。此次缩小锁范围不改变 NAND 建模、聚合布局或 APPEND 返回语义，
+也不消除同 SQ 队头阻塞、CUDA mirror 同步等其他等待。重编并重启 QEMU 生效，不需要重编 Guest 内核。
+
+第一版仍是**单输入槽**：后台释放输入槽前，后续命中该槽的 MEMORY_WRITE 暂留 SQ，禁止 DMA 覆盖；
+其他 SQ 和 CQ 仍可推进，同一 SQ 的后续命令可能发生队头阻塞。这不是无限缓冲或多包并行聚合。
+Attention 若需要已经收齐但尚未聚合的 KV，会在执行线程等待；就绪后在同一锁下取得读租约，
+避免提前占用 reader 阻止聚合，也避免未读完被下一次追加改变。未接收的数据仍拒绝访问。
+DRAIN 仍等聚合及 NAND 写回全部完成。后台失败为粘性错误，后续读取/DRAIN 报错；
+已返回的 APPEND 不会被追溯改成失败。重置会唤醒并终止后台任务及依赖等待。
+
+保持 B8/MB4、双 slot、32 LUN 等效带宽配置的启动方式：
+
+```bash
+cd /home/lihan/cemu/CEMU
+make -C build -j4
+sudo env CEMU_FDM_ASYNC_AGGREGATE=1 bash femu-scripts/run-flexgen-b8-microbatch-test.sh
+```
+
+Guest 仍运行 `bash /root/CEMU/femu-scripts/flexgen-b8-microbatch-guest-test.sh`。
+启动前关掉使用同一系统盘/GPU 的 VM。此修改不要求重编 Guest 内核或聚合模块。
+`launch-settings.txt` 记录 `fdm_async_aggregate=1`，便于确认实际模式。
+
+开启原有 FDM I/O trace 后，前台记录保留 `source=device`；后台单独记录
+`source=background_aggregate`、`session/packet_id`、整包 `packet_bytes`、
+`accepted_ns/started_ns/finished_ns` 和原聚合阶段统计。这些时间戳使用 CEMU virtual，
+`aggregate_host_ns` 仍是 Host 时间，不能混减。后台记录不是另一条 NVMe 完成。
+命中繁忙输入槽的 SQ 首次观察时间纳入前台设备区间，并单列 `input_slot_wait_ns`；
+不要将输入槽背压算成纯软件开销。分析器单列 `background_aggregation`，要求记录到最终 DRAIN；
+后台跨度包含等待，不能与前台 syscall 或阶段耗时相加。
+原“未被前台设备区间覆盖”统计也不能直接解释成纯软件耗时：后台聚合可以与它重叠，
+同 SQ 未被观察的命令还可能包含队头等待。同步/异步比较应保留这些口径差别。
+这次**没有**实现“整包收齐立即返回、后台异步聚合”。NAND 布局、放置策略、冻结机制不变。
+
+管理区 ABI 升为 3，接收状态为 152 字节，buffer 头仍为 376 字节。
+需重编 QEMU 和 `fdm_kv_aggregate.so` 并重启 VM，不可对运行中的旧设备热换客户端/模块。
+FlexGen 默认数据区从 3840 MiB 调到 3968 MiB，容纳 B4 大输入槽及原页池；
+旧命令若显式设置 3840 MiB，需要同步调整。B6/B8 的 8 GiB 数据区仍可用。
+下文历史实验中的 128 KiB 输入槽、包数和耗时描述的是改动前的小包配置，不再代表当前默认行为。
+计时新增 `aggregate_yield_ns`，单独记录大包分段聚合间的调度等待，不算成 NAND 或空间不足等待。
+
+Host 回归（不需要启动完整 Guest 或直通 GPU）：
+
+```bash
+make -C build -j4
+make -C tests/cemu/kernel ../build/fdm_kv_aggregate.so
+PYTHONPATH=tests/cemu/instattention/python:tests/cemu/instattention \
+  python3 -m unittest -v \
+  test_instattention_qemu_io.InstattentionQemuIoTest.test_fdm_kv_layout \
+  test_fdm_kv_binding test_native_csd_pipeline.FdmCsdPipelineTest \
+  test_flexgen_cemu_qtest test_pwrite_stack_trace
+```
+
+### 框架来源与接入
+
+框架副本位于 [`third_party/instattention/flexgen`](third_party/instattention/flexgen)，
+从 InstAttention 提交 `3b2d4b27fbba2bf700dfffc672db6609f2efb91b` 导入全部 14 个
+受版本控制的 Python 文件，不包含源工作区的未提交修改、`__pycache__` 或生成文件。
+来源、原始 Git blob 和导入规范化记录见 [`SOURCE.json`](third_party/instattention/SOURCE.json)。
+源快照的仓库根目录及 `flexgen` 下没有许可证文件；未将独立的 `ssd-gpu-dma/LICENSE`
+套用到框架副本，也未新增许可证声明。
+
+新入口 [`python/flexgen_cemu.py`](python/flexgen_cemu.py) 实际调用此副本的
+`OptLM.generate()`，不调用旧 `OptPrefillRunner`/`OptDecodeRunner`。外部 `InstAttention`
+克隆保持只读；`framework_import.py` 强制校验导入路径，拒绝已载入的外部同名包。
+原 `test_opt_cemu_pipeline.py` 和 runner 保留作对照，不自动切换到新框架。
+
+### 接入边界和数据流
+
+```text
+FlexGen OptLM.generate：原 normal / overlap single / overlap multi 循环
+  InputEmbed → CemuSelfAttention → 原 MLP → OutputEmbed
+    Prefill：GPU dense Attention → GPU Wo/MLP
+             K/V → 有界写线程 → 现有 FDM 或 Native store
+    Decode：GPU QKV → 等待本 microbatch 的 Prefill 接收完毕
+             → append 当前 K/V 并等待 accepted（不是 NAND drain）
+             → CemuSparfSlotScheduler → 设备自治 SparF
+             → PendingAttention → 消费时等待 → GPU Wo/MLP
+  生成结束 → store.drain() → 检查完整 KV 前缀和 sealed/failed
+```
+
+- `framework_attention.py` 替换 Attention 的 KV 存取及执行点。FlexGen 的 cache holder
+  保存设备 KV 句柄；`load_cache()` 不把历史 KV 搬回 GPU。Decode 的 `store_cache()`
+  只清理标记，不能再次追加当前 token。最后一个 Decode 的 KV 也会保存。
+- `framework_cache.py` 管理 Future、GPU producer event 和生命周期。Attention 的完成结果
+  在 MLP 消费激活时兑现；双 microbatch 可以先提交两份 CSD 工作，再消费结果。共享后端
+  不允许 Prefill 追加与本 microbatch 的 Attention 同时在途，所以首轮 Decode 等待其所有
+  Prefill 写任务 accepted；不等待 NAND 写回。Prefill 未完成写任务限额为 `2 × microbatch数`。
+- FDM 的 `pwrite → 收齐 → 聚合 → accepted`、Native APPEND、三种 KV 布局、后台块写回、
+  KV FTL、balanced 放置、SparF 选择/分阶段执行和现有时间预算全部复用。
+  本次不改 `hw/femu`、设备算子、Guest 内核或冻结机制；不新增 P2P。
+- 公开快照的 `pytorch_backend.py` 内 OPT 调用名对应了不同的 Llama 参数。
+  新增独立 `opt_backend.py` 恢复 OPT 所需的 pre-LN、ReLU、Q 缩放和 Wo/LM head 接口，
+  不覆盖 Llama 实现。框架中的模型层、microbatch 和三种生成循环保持原样。
+- 第一版入口限定 OPT、FP16/FP32、未压缩且常驻 GPU 的权重/激活、单 CSD、等长无 padding
+  的 prompt、greedy 固定步数；每次 `generate()` 创建新 session。尚未接 Llama、权重卸载、
+  多 CSD 切分、动态 batching、采样/提前停止。保留框架结构不代表这些模式已验收。
+- `--decode-steps 16` 对应 FlexGen `max_new_tokens=17`：Prefill 生成 1 个，随后执行 16 次
+  Decode。设备接受的 KV 长度是 `prompt_length + 16`，不是再多 1 个。
+
+### 当前验证
+
+CPU 数值测试实际运行 `OptLM.generate()` 的单/双 microbatch、overlap 开/关，逐步 logits
+及 token 与旧 OPT runner 的参考结果比较，并验证失败传播、无重复追加和外部导入隔离。
+QEMU qtest 用真实 FDM/Native、MRS 和 SparF 设备路径跑两层小 OPT；覆盖单/双 microbatch、
+compression=1/8、top-r=128/16、127→130 token 的 FP32 组页边界、最终 drain。
+另覆盖 FP16、双 microbatch、compression=8 的 255→258 token 边界。新增 12 项测试通过；
+新增测试与既有 FDM/Native/OPT/I/O 回归累计 73 项通过（CPU/qtest，不使用真实 GPU）。
+这些不是 Guest Linux/FDMFS 系统调用或真实 OPT-13B GPU 性能验证，后者需另跑。
+
+```bash
+cd /home/lihan/cemu/CEMU
+make -C build -j4
+make -C tests/cemu instattention-flexgen-framework-test instattention-flexgen-cemu-qtest \
+  PYTHON=/usr/bin/python3 INSTATTENTION_BUILD_DIR=instattention/build-host
+```
+
+除现有 PyTorch/NumPy/CEMU client 外，框架导入需要 `attrs`、`tqdm`。
+固定 token ID 测试不需要 transformers；转换 safetensors 时才需要 safetensors。
+
+### 权重准备与 Guest 全流程
+
+FlexGen 使用逐 tensor 的 NumPy 文件，不读取旧 runner 的 checkpoint loader。
+先离线转换**同一份本地 HF checkpoint**，不会下载模型或生成假权重：
+
+```bash
+cd /root/CEMU/tests/cemu
+export PYTHONPATH="/root/native-opt-client:$PWD/instattention/python${PYTHONPATH:+:$PYTHONPATH}"
+python3 -m flexgen_adapter.framework_weights \
+  --model-dir /root/models/OPT-13B \
+  --output-dir /mnt/flexgen-weights
+```
+
+`/mnt/flexgen-weights` 必须事先配置成**容量足够且可写的普通磁盘/共享目录**，不是 FDM，
+也不是 native KV NVM；不要直接在 20 GiB Guest 根分区生成约 26 GB 的 OPT-13B 副本。
+可在 Host 转换再只读共享给 Guest。转换按 shard 处理，保留源目录和文件清单；拒绝覆盖
+已有输出目录。失败的半成品没有完整清单，确认后换新目标目录重试。
+
+启动仍使用原 `run-native-opt-test.sh OPT-13B`，profile=`b4-p1024-d16`，
+`CEMU_NATIVE_KV_PLACEMENT=balanced`，保持本机已验证的 GPU/镜像/初始化顺序。
+Guest 按已有 native-aware mount 流程挂载 FDM，**不要格式化 native NVM**。
+新入口不再调用 `native-opt-guest-test.sh` 的旧 runner；完成环境准备后执行：
+
+```bash
+(
+  set -euo pipefail
+  cd /root/CEMU/tests/cemu
+  source /root/cemu-gpu-env/bin/activate
+  make instattention INSTATTENTION_BUILD_DIR=/root/native-opt-client
+  export PYTHONPATH="/root/native-opt-client:$PWD/instattention/python${PYTHONPATH:+:$PYTHONPATH}"
+  export CEMU_IO_BACKEND=ioctl
+  echo hpet > /sys/devices/system/clocksource/clocksource0/current_clocksource
+  test "$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)" = hpet
+  mkdir -p /root/cemu-logs
+  output=/root/cemu-logs/flexgen-fdm-$(date +%Y%m%d-%H%M%S)
+  ratio=/root/opt13b-b4-p1024-d16.json
+  test -s "$ratio"
+  python3 instattention/python/flexgen_cemu.py \
+    --model-dir /root/models/OPT-13B --weights-dir /mnt/flexgen-weights \
+    --storage fdm --batch-size 4 --gpu-batch-size 4 \
+    --prompt-length 1024 --decode-steps 16 \
+    --csd-target cuda --program /home/lihan/cemu/CEMU/tests/cemu/build/sparf_attention_devptr.so \
+    --aggregate-program /home/lihan/cemu/CEMU/tests/cemu/build/fdm_kv_aggregate.so \
+    --runtime-config instattention/experiments/configs/opt13b_sparf_1csd.json \
+    --softmax-ratio-file "$ratio" \
+    --profile-output "$output-profile.csv" --result-output "$output-result.json" \
+    2>&1 | tee "$output.log"
+)
+```
+
+`.so` 是 **Host QEMU 可见路径**；Host 须先编译现有两个算子。FDM 默认 MR0=64 MiB、
+MR1=3840 MiB，另需 Attention slots 空间。Native 对照改为 `--storage native`，默认预算
+6 GiB 与当前大 profile 对应；smoke 配置须相应减小参数。两条路径不能同时绑定同一 NVM，
+先完成 drain/close；严格物理放置对比建议重新启动干净 session。
+双 microbatch 用 `--gpu-batch-size 2`，必须另测 vectors=`2×40=80` 的 Softmax ratio；
+入口会检查形状覆盖，不能直接沿用只测了 batch=4 的文件。
+
+新入口会立即打印权重文件检查、后端初始化、逐模块权重加载 begin/done、GPU 权重就绪、
+生成开始/结束及 final drain 边界。OPT-13B 的 `module=.../82` 包含输入嵌入、40 层各自的
+Attention/MLP 和输出头；`layer=1..40` 是便于阅读的 Transformer 层号，不是 82 层模型。
+模块 done 表示该模块初始化函数已返回；整体 GPU 就绪消息在原有 `model.sync()` 之后。
+进度使用专用 `flexgen.weights` logger，不增加 CUDA 同步，不修改生成循环；加载进度不在
+推理计时区间内，阶段边界打印有少量日志开销。已运行的 Python 进程不会获得新日志。
+
+`pipeline.generate_wall` 是生成调用区间，`pipeline.e2e_including_drain_wall` 额外含终止写回。
+`framework.prefill_iteration_wall`/`decode_iterations_wall` 来自原 FlexGen 每轮计时；前者
+不保证全部异步 Prefill 写入已 accepted，余下等待归入首轮 Decode。
+`decode.execute_wait_wall` 保留设备 EXEC 调用边界；主线程等待另记
+`framework.attention_result_wait_wall`，不能把两者、写线程累计时间或模型预算相加当端到端时间。
+HPET/Guest wall、CUDA event 和设备模型预算仍是不同口径；本次不声称新增校准。
+
+### 软件栈分阶段计时
+
+在 `flexgen_cemu.py` 原命令上增加 `--profile-stack`。默认关闭细分计时，已有粗粒度
+profile 不变；开启后仍写入同一个 `--profile-output` CSV，并打印 count、累计、平均、
+最大时间及部分阶段的字节数。没有逐包打印、额外设备查询或逐阶段 CUDA synchronize。
+新计时属于 Guest Python/C++ 客户端，不改设备、FTL、Linux 内核和 freezing，无需重启 VM。
+先在 Guest 重编译绑定；旧绑定会在加载权重前明确报错：
+
+```bash
+cd /root/CEMU/tests/cemu
+source /root/cemu-gpu-env/bin/activate
+make instattention INSTATTENTION_BUILD_DIR=/root/native-opt-client
+ctest --test-dir /root/native-opt-client -R '^client_profile$' --output-on-failure
+export PYTHONPATH="/root/native-opt-client:$PWD/instattention/python${PYTHONPATH:+:$PYTHONPATH}"
+python3 -c 'import _cemu_client; assert _cemu_client.IO_PROFILE_VERSION == 1'
+```
+
+`client_profile` 使用普通临时文件和模拟管理/EXEC ioctl，验证数据、对齐、命令、返回值及
+错误传播，不代替 Guest 的完整推理回归。正式测试仍用同一模型、prompt、ratio、HPET 和
+设备配置，只加 `--profile-stack`，更换输出文件名；可用 `--reference-result` 对照上次 token。
+
+| 范围 | 新指标 | 含义 |
+|---|---|---|
+| Prefill 写线程 | `prefill.writer.queue_wait_wall` / `worker_wall` | submit 前到任务开始，以及写线程任务执行区间 |
+| GPU 数据就绪 | `prefill.producer_wait_wall`、`decode.producer_wait_wall` | 原有 producer event 等待，不增加同步 |
+| KV 导出 | `prefill.kv_export_wall`、`decode.kv_export_wall` | 连续化、GPU→CPU、NumPy 转换，含可能的同步等待 |
+| KV 存储调用 | `prefill.store_append_wall`、`decode.store_append_wall` | 导出后到 store 返回；FDM/native 都覆盖 |
+| FDM 打包 | `prefill/decode.kv_payload_pack_wall`、`fdm_packet_pack_wall` | 切片后的转置/字节化，以及包头和填充构造 |
+| KV payload 内部分解 | `prefill/decode.kv_payload_pack.k_copy_wall`、`v_copy_wall`、`join_wall` | K 重排/字节化、V 重排/字节化、K/V 字节串拼接；各自记录处理字节数 |
+| V 均值 | `prefill/decode.value_mean_update_wall` | Host 上的均值累计；不归入 I/O |
+| Decode 依赖 | `decode.layer_prefill_wait_wall` | 当前层 Prefill Future 等待；全部层等待仍见原 `framework.prefill_accept_wait_wall` |
+| Decode 调度 | `decode.attention.queue_wait_wall`、`decode.slot_wait_wall` | Attention executor 排队，以及可用 FDM slot 等待 |
+| slot 各线程 | `decode.slot_prepare/slot_execute/slot_collect.queue_wait_wall` 和 `worker_wall` | 准备、EXEC、输出收集各自的排队与处理 |
+| Query 准备 | `decode.query_export_wall`、`decode.value_mean_prepare_wall` | Q 导出与当前 value_mean 的生成/拷贝 |
+| GPU 工作 | `prefill.gpu_attention`、`decode.qkv/output_to_gpu/wo_residual` | 各有 `.host_wall` / `.cuda_stream`；Prefill Attention 含原 forward 整体 |
+| GPU MLP/输出头 | `framework.mlp`、`framework.lm_head` | 同样有两种计时；累计包含 Prefill 和 Decode |
+
+KV payload 三个子区间只在细分计时开启时采集，FlexGen 与 vLLM 共用实现；
+vLLM 使用 `--profile detailed`。它们嵌套于原来的 `kv_payload_pack_wall`，不能再与父项
+相加，也不改变软件栈占比的统计口径。三段使用四次连续 Guest 时钟读取，记录在操作后
+集中写入内存，不逐包输出或增加 GPU 同步；父项还包含临时对象释放和计时记录等开销。
+这些仍是 elapsed wall 区间，不是纯 CPU 执行时间；Decode 小包更容易受计时本身扰动。
+
+每个阶段仅保存首个打包输入的 shape、字节 strides、dtype、连续性、转置视图布局及
+NumPy 版本，不保存 KV 内容。查看 `CEMU_PROFILE_INTERVALS` 输出中的 `metadata`；
+FlexGen 的 CSV 同时生成 `<profile.csv>.metadata.json`，vLLM 的结果文件
+`timing.metadata` 也包含该信息。输入布局记录点在 `ascontiguousarray` 之后，
+不表示原始 GPU 张量布局或 pinned/NUMA 属性；变长场景中首包不代表所有包。
+更新共享 Python 源码后重新启动测试进程即可，本次打包细分无需重编译或重启 VM。
+
+对 FDM 写包、Q/mean 写入、输出/trace 读取，以及 EXEC，再分 C++ 客户端边界。
+前缀分别为 `prefill.fdm_write`、`decode.fdm_write`、`drain.fdm_write`、
+`attention.query.write`、`attention.value_mean.write`、`attention.output.read`、
+`attention.trace.read`、`attention.execute`：
+
+| 后缀 | 统计边界 |
+|---|---|
+| `.call_wall` | Python 调用客户端到返回；包含以下子项和绑定层返回计时结果的开销 |
+| `.binding_prepare_wall` | pybind 内的参数处理；EXEC 包含 Python metadata 拷贝 |
+| `.buffer_prepare_wall` | C++ 参数检查、对齐缓冲区分配/清零、写入拷贝或 EXEC 命令构造 |
+| `.io_wait_wall` | `pwrite_all` / `pread_all` / ioctl 或 uring 提交并等待；包含内核和设备服务，不是纯软件耗时 |
+| `.buffer_finish_wall` | 读完成后 C++ 输出 vector 分配/拷贝；写入/EXEC 当前为零 |
+| `.binding_finish_wall` | 绑定层剩余区间，含 GIL 交接、C++ 清理及输出数组转换，不是纯 CPU 执行时间 |
+| `.unpack_wall` | 仅 read_tensor：返回 NumPy 数据的 view/reshape/copy |
+
+`.io_wait_wall` 的 bytes 是对齐后的 FDM 传输长度，EXEC 则仅是 metadata 长度；count 是
+客户端调用次数，不是内核拆出的 NVMe 命令数。失败的调用保留外层 `.call_wall`，不输出
+不完整的 C++ 子阶段；因此失败运行不能当完整性能报告。Native APPEND 本轮只覆盖
+`store_append_wall`，未细分 passthrough 内部，不能与 FDM 子阶段直接做相减归因。
+
+Python `perf_counter_ns` 和 C++ `steady_clock` 都读取 Guest 时间；仍需验证/保持 HPET。
+排队区间也可能包含线程创建、GIL 和调度，不是独占 CPU 时间。父子指标互相包含，多个
+worker 可重叠；不要把所有 CSV 行相加，或用端到端减模型累计量称为“纯软件栈时间”。
+CUDA event 会受真实 GPU 推进影响，不能和 Guest 时间互减；设备 timeline 的 Host 时间也单独看。
+细分计时本身有开销，应保留关闭开关的基线，尤其短句、小包和 HPET 下不要忽略测量扰动。
+
+单独开启 `--profile-stack` 不会细分 Guest 内核或设备接收/聚合。进一步拆分
+`.io_wait_wall` 使用下节可选跟踪；已有设备聚合 Host 累计时间仍不能直接从 Guest 时间扣除。
+
+### FDM pwrite 内核与设备细分
+
+针对 Prefill 的 `prefill.fdm_write.io_wait_wall`，新增
+`experiments/pwrite_stack_trace.py`。它不是把同步等待全部算作设备工作：**SQ/CQ、完成通知、
+线程唤醒同样属于待核查的 I/O 通路延迟**，但 SQ/CQ 并非文件系统独有，native 命令也会经过。
+当前只采集 `--storage fdm` + `CEMU_IO_BACKEND=ioctl` 的同步 `pwrite`，不声称覆盖 uring。
+
+**本功能需要重编译 QEMU 和 linux-cemu，并重启 Guest**，不同于仅开启上一节客户端计时。
+内核只增加可关闭的 tracepoint、为 FDMFS 开始事件补文件名/范围；设备只增加时间戳和计数，
+不改 FTL、聚合、冻结、背压及完成语义，也没有新增逐包状态查询。所有新跟踪默认关闭。
+
+| 口径 | 报告指标（以 `prefill.` 为前缀） | 边界/用途 |
+|---|---|---|
+| Guest | `syscall_wall` | `sys_enter_pwrite64` → `sys_exit_pwrite64` |
+| Guest | `single.vfs_entry` / `fdm_entry` | 系统调用入口 → FDMFS → iomap DIO 入口 |
+| Guest | `single.dio_block_driver` | iomap → NVMe 请求准备完成，含用户页映射、bio/块层、PRP 准备 |
+| Guest | `single.sq_submission` | NVMe 准备完成 → 开始拷贝 SQ 命令 |
+| Guest | `single.sq_cq_roundtrip` | SQ 拷贝前 → Guest 看见 CQE，含 doorbell、设备、通知和 CQ 路径，**不是纯设备时间** |
+| Guest | `single.nvme_completion` | 看见 CQE → NVMe 完成事件，含中间完成处理/可能的延后调度 |
+| Guest | `single.bio_wakeup_dio` | NVMe 完成 → iomap 完成，含 bio 完成、唤醒及被调度回来 |
+| Guest | `single.fdm_return` / `vfs_return` | iomap 完成 → FDMFS 返回 → 系统调用退出 |
+| 设备虚拟时钟 | `device.dispatch` / `memory_lock` / `receive_check` | 取出命令后分派、内存锁等待、输入范围/接收状态检查 |
+| 设备虚拟时钟 | `device.dma_copy` / `receive_finish` | PRP 数据搬运，以及 dirty 标记/位图/包头收齐检查 |
+| 设备虚拟时钟 | `device.remaining_model_gate` | 接收处理结束后尚未到期的原有 FDM 模型 deadline；不是软件执行耗时 |
+| 设备虚拟时钟 | `device.ready_to_check` / `check_to_cq` / `cq_publish` | deadline 后首次聚合检查的调度延迟、检查结束到写 CQ、写 CQ 本身 |
+| 设备虚拟时钟 | `device.aggregate_ns` / `check_other_ns` | 聚合函数执行，以及完成检查函数里其余锁、准备、释放等工作 |
+| 设备虚拟时钟 | `device.space_retry_ns` / `busy_retry_ns` / `drain_retry_ns` / `model_retry_ns` | 因空间、读 lease、drain、接收 deadline 未满足而重试，直到下次检查的间隔；含队列/poller 延迟 |
+| Host | `host.aggregate_ns` | 单独记录聚合实际执行区间，仅用于定位实现成本 |
+
+每项输出次数、累计、平均、最大、P95/P99；`counters` 还统计包数/字节、聚合次数、空间和
+lease 重试次数、CQ 满次数。`device.check_span = check_ns + retry_gap`，
+`check_ns = aggregate_ns + check_other_ns`，四类重试间隔之和等于 `retry_gap`；这些父子项不能重复相加。
+这里不把 Prefill 完成误解为 NAND 全部写回；drain 单列，空间背压仍可能等待后台写回推进。
+
+一条 `pwrite` 只对应一条 NVMe 命令时，九个 `single.*` 区间互不重叠，之和应等于
+该调用的 `syscall_wall`。内核拆成多条命令时，只报告 syscall 总时间和 `request.*` 各请求时间，
+**不把并行请求的累计时间相加冒充 syscall 的独占分解**。客户端 `.io_wait_wall` 还含
+`pwrite_all` 循环/系统调用包装边界，不要求与内核时间精确相等。
+
+跨线程完成通过 `(controller, SQID, CID)` 关联；Guest 包标签记录 session/request ID，
+再与设备的 namespace、命令 ID、偏移、长度核对。缺事件、短写、请求失败、关联不唯一、
+丢 trace、时钟切换都报 `FAIL/INCOMPLETE`，不输出看似完整的归因。当前 NVMe 请求准备需在
+发起同步写的线程内；若块层异步转交导致无法关联，会明确失败而不是按最近时间猜测。
+
+Guest 使用 `trace_clock=mono`，保持已经验证的 HPET；文本 trace 时间戳为微秒精度。
+设备用 QEMU virtual，Host 聚合用 Host monotonic；**不将两域时间戳相减，不把等待等同 CPU cycles**。
+设备子区间帮助解释 Guest SQ/CQ 往返，尚不能给出严格扣除设备时间后的单一“纯软件时间”。
+trace 本身有扰动：内核事件、Guest reader、逐包标签、设备 JSON 写日志都会增加工作；设备
+JSON 在 CQ 写入后、该轮通知前输出，也会影响完成通知延迟。应与关闭跟踪的相同配置对照。
+
+Host 构建（只编内核 `.o` 不会更新启动用的 `vmlinux`）：
+
+```bash
+make -C /home/lihan/cemu/linux-cemu -j4 vmlinux
+make -C /home/lihan/cemu/CEMU/build -j4
+```
+
+在已验证的 Host `sudo env ... bash femu-scripts/run-native-opt-test.sh OPT-13B` 命令中增加
+`CEMU_NATIVE_IO_TRACE=1`，其余镜像、GPU、初始化顺序、profile、placement 都不变。
+默认内核路径为 `/home/lihan/cemu/linux-cemu/vmlinux`；若覆盖了 `CEMU_NATIVE_KERNEL`，须指向新内核。
+设备文件写入本次 session 的 `guest-logs/fdm-io-device.jsonl`，通过既有 guestlogs 挂载后
+可见于 `/root/cemu-logs/fdm-io-device.jsonl`。该文件不是 `device-timeline.jsonl`。
+
+Guest 完成原有 FDM 挂载、虚拟环境和客户端构建后，保持同一权重、ratio、输入，执行：
+
+```bash
+(
+  set -euo pipefail
+  cd /root/CEMU/tests/cemu
+  source /root/cemu-gpu-env/bin/activate
+  export PYTHONPATH="/root/native-opt-client:$PWD/instattention/python${PYTHONPATH:+:$PYTHONPATH}"
+  export CEMU_IO_BACKEND=ioctl
+  echo hpet > /sys/devices/system/clocksource/clocksource0/current_clocksource
+  mountpoint -q /sys/kernel/tracing || mount -t tracefs tracefs /sys/kernel/tracing
+  test -f /sys/kernel/tracing/events/nvme/nvme_cemu_io/enable
+  mkdir -p /root/cemu-logs
+  run=$(mktemp -d /root/cemu-logs/pwrite-stack.XXXXXX)
+  ratio=/root/opt13b-b4-p1024-d16.json
+  test -s "$ratio"
+  python3 instattention/experiments/pwrite_stack_trace.py record --output "$run/trace" -- \
+    python3 -u instattention/python/flexgen_cemu.py \
+      --model-dir /root/models/OPT-13B --weights-dir /mnt/flexgen-weights \
+      --storage fdm --batch-size 4 --gpu-batch-size 4 \
+      --prompt-length 1024 --decode-steps 16 \
+      --csd-target cuda --program /home/lihan/cemu/CEMU/tests/cemu/build/sparf_attention_devptr.so \
+      --aggregate-program /home/lihan/cemu/CEMU/tests/cemu/build/fdm_kv_aggregate.so \
+      --runtime-config instattention/experiments/configs/opt13b_sparf_1csd.json \
+      --softmax-ratio-file "$ratio" --profile-stack \
+      --profile-output "$run/profile.csv" --result-output "$run/result.json" \
+    2>&1 | tee "$run/run.log"
+  python3 instattention/experiments/pwrite_stack_trace.py analyze "$run/trace" \
+    --device /root/cemu-logs/fdm-io-device.jsonl \
+    2>&1 | tee "$run/analysis.txt"
+)
+```
+
+录制器创建独立 tracefs instance，不清空其它 trace，子进程退出后停止并删除自己的 instance；
+采集期间请勿改时钟或并行跑其它 KV 测试。`trace/capture.json` 保留内核版本、命令、退出状态、
+时钟和丢事件统计；`guest.trace`/`packets.jsonl` 是原始记录，`summary.json` 是分析结果。
+新 trace 目录必须不存在；如果记录器缺 tracepoint 会在加载权重前停止，先核查 Guest 内核。
+
+本地验证入口：
+
+```bash
+make -C tests/cemu instattention-pwrite-stack-test PYTHON=/usr/bin/python3
+PYTHONPATH=tests/cemu/instattention/python CEMU_NATIVE_QTEST_CUDA=0 \
+  /usr/bin/python3 -m unittest -v \
+  test_native_csd_pipeline.FdmCsdPipelineTest.test_fdm_io_trace_packet_identity_and_completion
+```
+
+解析器测试覆盖拆命令、跨线程完成、CID 复用、缺事件/失败检测；CPU qtest 覆盖真实设备的
+输入分片、聚合、drain 和跟踪包身份。它们不替代带新内核的 Guest OPT-13B 实测。
+
+#### pwrite 设备外区间与阶段覆盖统计
+
+`pwrite_stack_trace.py analyze --account-device` 在原始记录上离线计算，不增加设备探针。
+每次 pwrite 先关联它的全部 NVMe 命令，然后对设备区间求并集，不能直接减去逐命令耗时之和。
+报告 `rows[].device_accounting` 保留每次写入的结果，
+`device_accounting.syscall_by_phase` 分 Prefill/Decode/drain 汇总；比例以总 syscall 时间加权。
+
+提供两种设备边界，不能混为“纯设备计算时间”：
+
+- `request_envelope`：设备看到 SQ 到开始发布 CQE，排除 CQ 发布本身。不能使用 `cq_end`
+  作为必然早于 Guest 看到 CQE 的事件，因为 Guest 可能在设备打结束时间戳前已发现完成。
+- `service_and_wait`：`memory_enter..max(memory_done,model_ready)` 加
+  `first_check..last_check`。包含接收、DMA、模型等待、聚合及重试；第二段也包含 poller
+  再检查/聚合让出的间隙，目前无法从累计计数恢复每次间隙的位置，因此不是严格的算子活动区间。
+- `guest_outside_pending_nvme`：仅使用 Guest 时钟，syscall 减去 SQ 提交到 CQ 观察区间的并集。
+  表示没有这些命令在途的时间，不等于全部驱动/文件系统执行时间。
+
+跨时钟分析要求录制前后都为 HPET，假设 Guest 单调时钟与 QEMU virtual 等速，通过
+每条命令的 `Guest SQ <= device SQ`、`device CQ begin <= Guest CQ observed` 约束共同偏移范围。
+Guest 文本 trace 预留 2us 量化容差；假设不成立、时钟漂移导致无共同偏移或混入多个 session
+时直接报错，不静默扣减。此检查不是硬件时钟校准。输出设备外时间/比例的上下界；
+当全部相关设备区间始终落在单次 syscall 内时，区间长度与时钟原点无关，上下界可相同。
+
+录制器同时设置 `CEMU_PROFILE_INTERVALS=.../trace/phase-intervals.json`。
+`PhaseProfiler` 复用原有 scope 的起止读钟，区间暂存内存，`write_csv()` 时才输出 JSON；
+FlexGen 的阶段边界复用其已有 generate timer 的真实 start/stop，不重建近似边界、不增加同步。
+未启用环境变量时不保存区间。默认最多保存 500000 条，可用 `CEMU_PROFILE_INTERVAL_LIMIT`
+调整；超限记录 dropped 数，阶段分析拒绝不完整结果，而不是输出偏小占比。
+
+新运行可同时关联同一次 QEMU 的 Attention 时间线：
+
+```bash
+python3 /root/CEMU/tests/cemu/instattention/experiments/pwrite_stack_trace.py analyze "$run/trace" \
+  --device "$run/fdm-io-device.jsonl" --account-device \
+  --attention-device "$run/device-timeline.jsonl" \
+  --output "$run/pwrite-stack-summary.json" \
+  2>&1 | tee "$run/pwrite-stack-analysis.txt"
+```
+
+`flexgen-b8-guest-test.sh` 的 `CEMU_FLEXGEN_STACK_TRACE=1` 模式已自动执行上述分析，B4/B6/B8
+共用该入口。已有原始 Guest/device 日志可以只加 `--account-device` 重算 syscall 占比；
+旧运行没有 `phase-intervals.json` 时，不能从累计 CSV 恢复阶段交叠，报告明确标为不可用。
+
+阶段结果位于 `device_accounting.pipeline.phases`，按实际 Prefill/Decode/drain 窗口裁剪：
+
+| 字段 | 含义 |
+| --- | --- |
+| `categories.append_syscalls` | 阶段内 KV 写 syscall 的并集，以及不被设备区间覆盖的部分 |
+| `categories.client_preparation` | store append 排除 client I/O call，加追加绑定层在 syscall 外的区间、metadata/value-mean 准备；不是所有 CPU 工作 |
+| `categories.main_thread_blocking_wait` | 写队列背压及 Attention future 等待的并集，以及设备覆盖之外的等待 |
+| `scopes` | 每个已有计时 scope 在该阶段内的累计时间与去重时间 |
+| `foreground_device_complement` | 阶段窗口未被已跟踪前台设备区间覆盖的部分，**不是软件栈占比** |
+
+Prefill worker 若延续到 Decode，相关区间计入实际发生的 Decode 窗口，而不是全部算到 Prefill。
+Attention 时间线必须通过完整性、PID、请求数和运行时间范围检查；设备边界采用 started..ready，
+包含排队/阶段衔接，不表示 NAND 始终繁忙。Q/结果的普通 FDM 设备 I/O、后台 NAND 活动
+尚未完整覆盖，因此 `software_stack_fraction=null`；不能把阶段补集全部算成 CEMU 软件栈。
+各类别仍可能相互重叠，不可相加；主线程等待补集也不是已证明的因果关键路径或纯 CPU 时间。
+
+#### Decode 按请求拆分 Future 等待
+
+新增结果位于 `device_accounting.pipeline.decode_request_wait`，控制台输出 `[decode-wait]`。
+上述全局设备覆盖统计仍保留，但新的拆分只用**当前 Future 自己的**追加和 Attention
+设备区间，避免 slot B 的设备工作掩盖 slot A 的锁等待。两种口径的补集可能不同，
+不能要求新结果仍等于之前全局统计的 3.45～3.53 秒。
+
+每次 Decode 关联 layer、microbatch、有效 token 数；请求标识随线程池任务传递到准备、
+执行、结果读取线程，并写入对应追加包的诊断记录，不改变设备命令或包头。
+EXEC 另记录实际 program ID，离线按 program/layer/tokens 和因果时间边界匹配设备记录；
+缺失、重复、歧义、跨请求匹配以及记录丢失均拒绝分析，不按全局发生顺序猜测。
+
+`totals.wait_ns` 是 Decode 窗口内主线程 Future 等待的并集，`outside_min_ns/max_ns`
+是其中未被本请求已跟踪设备区间覆盖的上下界；二者之差才是对应的设备覆盖区间。
+`rows` 保留逐请求结果。`categories` 按以下优先级分配剩余区间，排除嵌套重复：
+
+| 类别 | 测量范围 |
+| --- | --- |
+| `lock_wait` | 共享 KV store、backend、设备 slot 锁的获取等待，不包含持锁期间工作 |
+| `worker_queue` | Attention/准备/执行/收集任务提交至 worker 开始执行 |
+| `producer_or_prefill_wait` | CUDA producer event 或 Prefill Future 等待 |
+| `slot_wait` | 获取空闲 Attention slot 的等待 |
+| `append_syscall_outside_device` | 本请求 pwrite 中设备已跟踪区间之外的部分 |
+| `exec_transport_or_device_queue` | EXEC 等待中设备 started..ready 之外的部分，仍含设备准入/完成通知等 |
+| `query_result_trace_io` | Q/mean 写入、结果/trace 读回，尚未扣除这类普通 FDM I/O 的设备工作 |
+| `kv_query_export` | K/V/Q 导出，包括可能的 GPU→CPU 拷贝和等待 |
+| `packet_packing` | KV payload 和包头/整包组装 |
+| `mean_and_metadata` | value mean 更新/准备与命令 metadata 构造 |
+| `append_binding_outside_syscall` | 追加绑定调用中已排除 syscall 和上述类别的部分 |
+| `return_to_waiter` | callable 主体退出至主线程 result() 返回，含 Future/线程调度及计时本身；不是精确 Future 状态转换时间 |
+| `unclassified` | 未分类的软件执行、调度空隙或其他未观测工作，不能直接视作纯软件栈开销 |
+
+各类别的最小值之和等于 `outside_min_ns`，最大值之和等于 `outside_max_ns`；
+这些是有时钟偏移不确定性的保守边界，不是总 CPU 时间，也不是整个 Decode 的软件栈占比。
+只统计落在主线程等待内的区间；等待之前已经完成的工作不会再加进去。
+
+需要用更新后的 Python 代码重新录制一次，旧日志没有请求标识，不能可靠补算。
+继续使用 `flexgen-b8-microbatch-guest-test.sh` 的精细计时流程即可，无需新增开关；
+此次只修改 Python 计时/离线分析，不改 QEMU、Guest 内核、NAND、冻结或 I/O 完成语义。
+如果当前 VM 已有前述设备/内核探针并共享更新后的源码，无需为加载这些 Python 改动重启。
+但这不代表可以无限复用同一个设备会话：FDM 解绑/删文件不回收已写入的 KV 映射页，
+新 session ID 也不会清零控制器的累计页数。B8 完整性能对照每轮应先 `poweroff`，
+再由 Host 重新运行 `run-flexgen-b8-microbatch-test.sh`，建立 fresh NVM 会话。
+仅 Guest `reboot`、清空 FDM 目录或重新挂载都不能替代新建 QEMU 会话。
+若出现 `FDM KV writer batch failed ... status=8`，这是 `CEMU_KV_LIMIT`；
+在逐页 reserve 路径表示映射页数达到 `max_pages`，不是计时分析失败或主机 DRAM 耗尽。
+
+建议同配置交替跑关闭/开启 trace 的实验：关闭时报告整体性能，开启时解释组成。
+内存记录和现有内核/设备 trace 都有扰动，离线求并集没有推理期负担；不能按总扰动比例
+机械地修正各阶段时间。本次统计改动无需重编 QEMU/内核，前提是运行的版本已有上述 tracepoint。
+
+#### 整个 Decode 的文件/NVMe 软件路径占比
+
+`--decode-stack` 补齐六类同步调用：KV append pwrite、Q pwrite、value mean pwrite、
+Attention EXEC ioctl、output pread、trace pread。精细计时 Guest 脚本已自动启用该分析。
+这次需要更新 QEMU **和 Guest 内核**，不是只更新上文的 Python 计时：
+
+```bash
+cd /home/lihan/cemu
+make -C linux-cemu -j4 vmlinux && make -C CEMU/build -j4
+```
+
+旧 VM 先在 Guest 内 `poweroff`，再在 Host 执行以下命令建立 fresh NVM 会话。
+脚本直接加载 `linux-cemu/vmlinux`；NVMe 驱动编入内核，不能仅更新模块。
+
+```bash
+cd /home/lihan/cemu/CEMU
+sudo bash femu-scripts/run-flexgen-b8-microbatch-test.sh
+```
+
+进入 Guest 后继续原配置 B8 / microbatch 4 / P1024 / D16 / 双 slot / ioctl / HPET：
+
+```bash
+bash /root/CEMU/femu-scripts/flexgen-b8-microbatch-guest-test.sh
+```
+
+输出 `[decode-stack]`，详细结果在 `pwrite-stack-summary.json` 的 `decode_stack`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `decode_window_ns` | 完整 Decode 窗口，不限于主线程 Future 等待 |
+| `software_union` | 各 syscall 扣除**自身**设备区间后，裁剪至 Decode 并求并集；给出秒数及占 Decode 的比例上下界 |
+| `software_not_overlapped_by_tracked_device` | 上一并集再扣除其他已关联前台设备工作区间；后台 NAND 活动未完整纳入，不能称为关键路径 |
+| `by_kind` | 六类调用各自的 syscall 并集、软件区间并集，以及占 syscall/Decode 的比例；类别之间可能重叠，不能相加 |
+| `rows` | 逐调用与命令边界，包括 prepared→SQ、CQ observed→complete；EXEC 另列设备准入排队、执行、ready→CQ |
+
+本口径将设备 SQ 取命令至 **CQ 发布开始** 作为设备归属区间，包括设备分发、内部排队、
+数据搬运、建模等待和 poller 延迟；CQ 发布、Guest 通知与唤醒留在外侧。
+因此统计的是**同步文件/NVMe 路径内、设备归属区间之外的经过时间**，不是纯 CPU 执行时间，
+不是所有 FlexGen/Python 软件时间，也不能直接解释为更换软件栈可节省的时间。
+双 slot 使用并集去重，而非相加调用耗时，也不是简单地用 Decode 总时间减 NAND 模型时间。
+
+内核额外记录 pread/ioctl 以及 EXEC（compute namespace opcode `0x01`）的 SQ/CQ 边界，
+设备 trace 使用 version 2。EXEC 记录中的 `offset`/`bytes` 是命令字的匹配签名，
+不是文件偏移或传输字节数。离线结合 controller/qid/cid/nsid/opcode/命令字、线程、
+文件名和因果时间关联，并校验 CID 复用、分拆 I/O 字节覆盖和每个 Decode 请求六类调用齐全。
+缺失、歧义、时钟不一致、失败 I/O 或 trace 丢失均拒绝给出完整占比。
+Guest 脚本在加载权重前检查内核 trace 的 `coverage=2` 标识；旧日志不能补算这项统计。
+
+Decode 分析使用 Guest `SQ copy → nvme_complete_rq` 包住设备 `sq_seen → cq_begin`，
+在已有 append 对齐范围内检查所有命令存在共同的时钟偏移，再计算并集。
+不再要求更早的 `cq_seen` trace 时间戳作为硬性上界：实测有一条 pread 的 SQ→CQ
+仅 4 µs，而设备区间为 26.198 µs；其后 `nvme_complete_rq` 记录完整，命令身份可唯一关联。
+该异常保留在 `decode_stack.cq_seen_alignment_anomalies`，控制台也报告数量，
+不会跳过请求、扩大固定容差或按日志顺序猜配。若完成边界也不能满足约束，仍拒绝分析。
+这只是采用更晚的因果边界，不会把 CQ→complete 变成设备时间，设备归属边界仍为 `cq_begin`。
+异常的具体时钟采样原因尚未确定；完成边界一致不等于证明所有时间戳精确，
+报告上下界只覆盖对齐偏移不确定性，并非任意时钟采样误差的保证。
+已有 version 2 原始日志可离线重算，不需为这个分析器修正重启或重跑推理。
+
+只新增可选探针和离线分析，不改变 pwrite 完成、聚合、EXEC、冻结或 NAND 调度语义。
+探针仍会产生扰动，性能结论需要同配置未开启 trace 的对照。
+
+### 固定输入与输出对照
+
+新入口的默认人工 token 序列已对齐旧 runner：`arange % (vocab_size - 3) + 3`，
+首 token 从模型 `config.json` 读取 `bos_token_id`，OPT-13B 第一行以 `[2, 4, 5, 6, ...]`
+开头。此前 FlexGen 入口使用 `+4`，输入不同，不能拿之前两份日志的 token 直接判错。
+这里固定的是**输入**，不会固定、替换或强制生成的输出。
+
+每次新入口运行都会保存 `<result 文件去掉 .json>.prompt.json`，结果 JSON 中另保存完整
+`case`（模型配置、prompt IDs、Decode 步数、top-r、compression）和输出 token。
+显式输入可以在不加载权重、不打开 CEMU 的情况下准备：
+
+```bash
+cd /root/CEMU/tests/cemu
+source /root/cemu-gpu-env/bin/activate
+export PYTHONPATH="/root/native-opt-client:$PWD/instattention/python${PYTHONPATH:+:$PYTHONPATH}"
+python3 -m opt_inputs \
+  --model-dir /root/models/OPT-13B --batch-size 4 --prompt-length 1024 --decode-steps 16 \
+  --output /root/cemu-logs/inputs/opt13b-b4-p1024-d16.json
+```
+
+在原有旧 runner 的 functional SparF 命令中添加：
+
+```bash
+--prompt-ids /root/cemu-logs/inputs/opt13b-b4-p1024-d16.json \
+--result-output /root/cemu-logs/old-runner-result.json
+```
+
+在前述 FlexGen 完整命令中添加以下选项，并给 `--result-output` 使用不同的输出文件：
+
+```bash
+--prompt-ids /root/cemu-logs/inputs/opt13b-b4-p1024-d16.json \
+--reference-result /root/cemu-logs/old-runner-result.json
+```
+
+读取参考文件时先检查输入、模型配置和 SparF 参数；不同或缺少 `case` 会在模型预加载前
+拒绝运行。生成结束逐 token 比较，失败时报告第一个不同的 batch/生成位置（0 表示 Prefill
+产生的 token），保存实际结果与 profile，并以非零退出；不会把实际输出改成参考输出。
+没有 `--reference-result` 时明确打印 `token comparison=not_requested`。
+
+这是**相同输入的 token 回归对照，不是逐步 logits 数值验收**，也不证明参考文件本身正确。
+参考和待测必须使用同一份 checkpoint；配置一致不等于权重内容已经做过哈希校验。
+旧历史 JSON/日志缺少输入记录时不会自动猜测输入，需要重新导出。严谨性能对照仍须一致的
+设备配置、ratio、HPET、预热条件及独立干净 session。
+
+### 真实短句推理
+
+`--prompt-text` 使用模型目录的本地 tokenizer，自动采用真实 token 长度，不补齐到 1024，
+不截断；batch>1 时重复同一句。它与 `--prompt-ids` 互斥。文本输入会自动打印续写和完整
+文本；重放 IDs 时加 `--decode-text` 即可解码。需要当前 Python 环境安装 `transformers`，
+且模型目录已有 tokenizer 文件；代码不联网下载、不执行自定义 tokenizer 代码。
+
+下面在已经启动、挂载 FDM 且已转换权重的 Guest 中执行。仍使用原 SparF/设备路径，
+但 B1 和真实短 prompt 的 Softmax 形状不同，**先单独测 ratio，不能复用 B4/P1024 文件**：
+
+```bash
+(
+  set -euo pipefail
+  cd /root/CEMU/tests/cemu
+  source /root/cemu-gpu-env/bin/activate
+  make instattention INSTATTENTION_BUILD_DIR=/root/native-opt-client
+  export PYTHONPATH="/root/native-opt-client:$PWD/instattention/python${PYTHONPATH:+:$PYTHONPATH}"
+  export CEMU_IO_BACKEND=ioctl
+  python3 -c 'import transformers'
+  clock=/sys/devices/system/clocksource/clocksource0/current_clocksource
+  echo hpet > "$clock"
+  test "$(cat "$clock")" = hpet
+  mkdir -p /root/cemu-logs
+  output=/root/cemu-logs/flexgen-text-$(date +%Y%m%d-%H%M%S)
+  input="$output-prompt.json"
+  config=instattention/experiments/configs/opt13b_sparf_1csd.json
+
+  python3 -m opt_inputs \
+    --model-dir /root/models/OPT-13B --batch-size 1 --decode-steps 16 \
+    --prompt-text 'The capital of France is' --output "$input"
+  prompt_length=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))[0]))' "$input")
+
+  python3 instattention/experiments/bench_softmax_ratio.py \
+    --config "$config" --device cuda:0 --batch-sizes 1 \
+    --prompt-length "$prompt_length" --decode-steps 16 --compression-ratio 8 \
+    --output "$output-softmax.json" \
+    2>&1 | tee "$output-softmax.log"
+
+  python3 instattention/python/flexgen_cemu.py \
+    --model-dir /root/models/OPT-13B --weights-dir /mnt/flexgen-weights \
+    --storage fdm --batch-size 1 --gpu-batch-size 1 \
+    --prompt-ids "$input" --decode-text --decode-steps 16 \
+    --csd-target cuda --program /home/lihan/cemu/CEMU/tests/cemu/build/sparf_attention_devptr.so \
+    --aggregate-program /home/lihan/cemu/CEMU/tests/cemu/build/fdm_kv_aggregate.so \
+    --runtime-config "$config" --softmax-ratio-file "$output-softmax.json" \
+    --profile-output "$output-profile.csv" --result-output "$output-result.json" \
+    2>&1 | tee "$output.log"
+  final_clock=$(cat "$clock")
+  printf '[flexgen-clock] final=%s\n' "$final_clock" | tee -a "$output.log"
+  test "$final_clock" = hpet
+)
+```
+
+仍执行固定的 Prefill + 16 次 Decode，不因 EOS 提前停止。文本解码隐藏特殊 token，但 JSON
+保留全部 17 个原始生成 IDs。自然语言续写仅用于可读性冒烟测试，不代替准确率/困惑度评估，
+也不与 B4/P1024 性能直接对照。文本编码、解码和结果比较均在推理计时区间外。
+
 ## FDM KV buffer 收包、聚合、写回与 Attention（2026-10-25）
 
-当前实现 **创建两个 FDM 文件/MRS → 加载并激活一次 Host 聚合模块 → INIT/BIND →
+当前实现 **创建 FDM 管理/数据文件及一个 MRS → 加载并激活一次 Host 聚合模块 → INIT/BIND →
 普通 FDM WRITE 分片接收 → 整包 READY → 输入目标时间到达 → 非冻结聚合 → WRITE 完成**，
 同时由后台 writer 将成块页提交 KV FTL，目标时间到达后回收页槽；终止包 DRAIN 等待全部写回。
 `FDM_KVbuffer.open()` 在 `create_memory_ranges()` 成功后加载 `fdm_kv_aggregate.so`，
@@ -26,16 +730,16 @@
 其 runtime/runtime_scale 必须为零，不能把 Attention 计算预算套到此软件处理阶段。
 80 字节小端描述符为 `FDMKV_BindParams_t`：magic/version、目标 NVM NSID、
 写回批量上限、session/generation、输入槽长度，以及模型几何参数。
-Python 的 `nvm_namespace_id` 默认 1、`input_bytes` 默认 128 KiB；后者是
+Python 的 `nvm_namespace_id` 默认 1、`input_bytes` 默认按整层/microbatch 自动计算；后者是
 MR1 输入槽容量，不是当前包的实际长度，也不等于 KV 追加已完成。
 控制器身份、MR 地址和 NAND channel/block 几何由设备查表获取，不接受 Guest 指针。
 
-- MR0：直接存 `FDMKV_Buffer_t`、收包 bitmap、head/page/domain/writeback 管理数组。
-- MR1：起始 `input_bytes` 为输入槽；按页对齐后为暂存页池。初始化不修改 MR1。
+- MR0：直接存 `FDMKV_Buffer_t`、收包 bitmap、head/page/domain/writeback 管理数组和数据段表。
+- MR1：起始 `input_bytes` 为输入槽；按页对齐后为暂存页池首段；MR2.. 可接续页池。初始化不修改数据段。
 - `NvmNamespace.fdm_kv_buffer` 指向 MR0 内的 buffer；
   `MemoryNamespace.fdm_kv_binding` 记录同控制器的目标 NVM、MRS、输入槽偏移和长度。
   `FDMKV_Binding_t` 保存设备侧绑定及 writer 运行态，没有另分配 KV 数据页池。
-- 当前要求两个 MR 在同一 FDM namespace；一个 NVM 和一个 FDM namespace 各至多绑定一个 buffer。
+- 当前要求全部 MR 在同一 FDM namespace；一个 NVM 和一个 FDM namespace 各至多绑定一个 buffer。
   MR 长度受现有 uint32 描述符限制，单 MR 必须小于 4 GiB。
   预算、页大小、重叠范围及 namespace 类型不合法时拒绝绑定，不修改初始化区域。
 - 绑定持有 MRS 和 program 的使用引用，普通 EXEC 不可复用该 MRS；绑定期间不能
@@ -66,7 +770,9 @@ DRAIN 已接入；小模型 CPU/QEMU qtest 推理已通过，但尚未在 Guest 
 
 包头区占 512 字节，其中 `FDMKV_AppendHeader_t` 为 88 字节小端结构，其余字节必须为零。
 包头携带 session/generation/request_id、batch/layer、head/token 范围及 wire/payload 长度；
-payload 长度必须等于 `2 * head_count * token_count * row_bytes`，后接补零至 512 字节的尾部。
+版本 2 用末尾字段表示 batch_count，payload 长度必须等于
+`2 * batch_count * head_count * token_count * row_bytes`，后接补零至 512 字节的尾部。
+版本 1 的 batch_count 隐含为 1，末尾字段必须为零。
 输入槽容量与实际 `wire_bytes` 分别校验；包头没有收齐前不解析坐标。这里只验证包格式和
 坐标范围，head 的连续追加前缀、页池容量等检查留给聚合步骤。
 
@@ -91,7 +797,7 @@ READY 表示数据功能上已收齐，不保证模拟时间已经走到该时�
 本阶段不修改 freezing、原有 FDM 传输计时或 NAND 模型。
 
 绑定期间普通 WRITE 不得修改 MR0/暂存页池，FILL 不得覆盖任一保留 MR；其他区域仍走
-普通路径。COPY/P2P、其他 MRS 别名或算子写入尚未纳入收包协议，不得用于改写这两个 MR，
+普通路径。COPY/P2P、其他 MRS 别名或算子写入尚未纳入收包协议，不得用于改写这些保留 MR，
 这里不是通用内存访问隔离。MR0 内指针仅供设备进程使用，不是 Guest 可解引用的地址。
 
 Host 上编译 QEMU 后运行（不启动 Guest OS、不访问 GPU/VFIO/已有镜像）：
@@ -241,6 +947,301 @@ CPU QEMU 容量回归覆盖实际大 MR 绑定、高偏移访问保护、末端 
 需将 `instattention/python` 加入 `PYTHONPATH`。它还验证 64 MiB 数据 MR 被拒绝，以及
 配置只改变 FDM 容量，不以修改 NAND 模型来让测试通过。
 
+### FDM OPT-13B B8/P1024/D16 带宽实验
+
+Host 启动脚本新增 `CEMU_NATIVE_PROFILE=b8-p1024-d16`，仅支持 OPT-13B，默认选择
+`experiments/configs/fdm_opt13b_b8_p1024_d16.json`，不需要再手动指定 `CEMU_NATIVE_CONFIG`。
+此 JSON 相对 B4 FDM 配置只把 FDM namespace 从 4 GiB 增至 16 GiB；96 GiB NVM、
+8 channel × 6 LUN × 1 plane、256 页/block、NAND 延迟和计算资源均不变。
+放置策略仍由 `CEMU_NATIVE_KV_PLACEMENT` 选择，对比实验显式设置 `balanced`。
+
+| 项目 | B8 容量 |
+|---|---|
+| Guest RAM / 默认 vCPU | 64 GiB / 4，与 B4 相同 |
+| KV 映射页数上限 | 4194304 页，B4 为 2097152 页 |
+| Native 独立 buffer 预算上限 | 12 GiB，B4 为 6 GiB；不是额外预分配的 FDM buffer |
+| NVM 三布局最终页数 | 2688000 页，11010048000 字节（约 10.25 GiB） |
+| 现有算法估算暂存页池 | 1944800 页，含输入槽的数据区至少 7966031872 字节（约 7.42 GiB） |
+| Guest FDM 分配 | 管理区 128 MiB、数据区合计 8 GiB，另留两个 Attention slots |
+
+单个 MR 的长度字段仍为 uint32。客户端将 8 GiB 数据区拆为三个独立 FDM 文件/MR，
+每段最多 `4 GiB - 64 KiB`，不要求物理相邻。MR0 保存管理数组与段表，MR1 开头仍是
+128 KiB 输入槽；其后的暂存页池由页索引解析到 MR1/MR2/MR3。聚合、后台写回和
+Attention 的暂存页读取共用该解析，不新增 KV 中转，也不改变分包、domain、FTL 或计时。
+设备保护所有绑定段，只有输入槽接受 Guest 写入。管理区 ABI 升为 2/header=376，
+需重启新 QEMU、重编聚合 `.so` 和 Guest 客户端；不要把新客户端用于旧的运行中 VM。
+单数据 MR 的 B4 路径也受回归覆盖，默认 64 MiB/3840 MiB 分配保持不变。
+
+FDM 容量取 16 GiB 而不是原先计划的 10 GiB：现有 CEMU 直接以 FDM 容量注册 BAR2，
+PCI BAR 大小必须是 2 的幂，10 GiB 会在 QEMU 初始化断言失败。这里只修正配置，
+不修改 BAR 或 Guest 内核。元数据实际需求约 120.83 MiB，数据页池仍只用 8 GiB 分配。
+旧 `native-opt-guest-test.sh` 不支持此 B8 profile，不要用它替代 FlexGen 入口。
+完整测试必须 `batch_size=gpu_batch_size=8`，不能用两个 B4 microbatch 代替。
+需要重新测量/验证 B8 Softmax ratio，不能直接使用只覆盖 B4 的文件。
+
+停止旧 Guest 后，Host 启动（同一系统盘/GPU 不可被另一 VM 占用）：
+
+```bash
+cd /home/lihan/cemu/CEMU
+make -C build -j4 &&
+make -C tests/cemu/kernel ../build/fdm_kv_aggregate.so ../build/sparf_attention_devptr.so &&
+sudo env \
+  CEMU_NATIVE_BOOT_MODE=normal \
+  CEMU_NATIVE_OS_IMAGE=/data/lihan/cemu-native-opt/standalone.PnutcI/guest.qcow2 \
+  CEMU_NATIVE_PROFILE=b8-p1024-d16 \
+  CEMU_NATIVE_CSD_TARGET=cuda CEMU_NATIVE_KV_PLACEMENT=balanced \
+  CEMU_DEVICE_INIT_ORDER=femu-first \
+  CUDA_VISIBLE_DEVICES=1 CEMU_CUDA_DEVICE=0 \
+  CEMU_CUDA_LIBRARY_PATH=/home/lihan/cemu/nvidia-575-libs \
+  CEMU_NATIVE_TIMELINE=1 CEMU_SPARF_READ_DIAGNOSTICS=1 CEMU_NATIVE_IO_TRACE=0 \
+  bash femu-scripts/run-native-opt-test.sh OPT-13B
+```
+
+Guest 登录后：
+
+```bash
+bash /root/CEMU/femu-scripts/flexgen-b8-guest-test.sh
+```
+
+脚本挂载现有 FDM/模型/logsrc，检查空闲容量，不格式化 NVM、不删除残留 FDM 文件。
+使用现有 `/root/models/flexgen-weights`，切换并核对 HPET，固定 ioctl/pwrite、128 KiB
+输入槽，先在 Guest GPU 测 B8 ratio，再运行完整 FlexGen 推理并分析时间线。
+已有合格 B8 ratio 可作为唯一参数传入；脚本复制并验证覆盖范围，不覆写原文件。
+
+同一 B8 容量配置也支持 B6 对照，但须关闭旧 QEMU 并用上述 Host 命令重新启动，
+在新的 native NVM 会话中执行（仅 Guest 内 reboot 或清空 FDM 不够）：
+
+```bash
+CEMU_FLEXGEN_BATCH_SIZE=6 bash /root/CEMU/femu-scripts/flexgen-b8-guest-test.sh
+```
+
+此选项同时设置 batch/microbatch 为 6，重新测量并校验 B6 ratio，按 B6 校验写入计数，
+输出到独立 `flexgen-b6-d16.*` 目录；NAND/FDM 容量、8 GiB 数据页池和 128 KiB 输入槽保持不变。
+默认仍为 B8，短实验支持 B4/B6/B8，不改变设备实现。比较逐请求 LUN 分布和阶段带宽，
+不能仅比较不同 batch 的总时长。
+
+#### B4 的 microbatch 短测试（32 LUN，2026-10-28）
+
+固定总 batch=4、P1024、D16（每条序列输出17个token）、两个Attention slot，
+比较 microbatch=4/2/1。默认先拆为两个B2。设备沿用长测的32 LUN、11703 ns页读参数，
+而不是旧D16的48 LUN配置。保留同步pwrite/ioctl、128 KiB输入槽、8 GiB暂存池和现有页布局。
+
+关闭上一轮Guest并等待QEMU退出后，在Host启动新的native NVM会话：
+
+```bash
+sudo bash /home/lihan/cemu/CEMU/femu-scripts/run-flexgen-b4-microbatch-test.sh
+```
+
+默认从 `/data/lihan/cemu-native-opt/standalone.PnutcI/guest.qcow2` 创建测试overlay；
+需要更换基础镜像时通过 `CEMU_NATIVE_OS_IMAGE` 指定。启动前可以用
+`CEMU_NATIVE_DRY_RUN=1 bash femu-scripts/run-flexgen-b4-microbatch-test.sh` 检查设备配置。
+本入口默认关闭额外设备pwrite跟踪，保留Attention时间线和读取诊断。
+
+Guest中执行下面三种之一，每种使用新启动的QEMU会话：
+
+```bash
+bash /root/CEMU/femu-scripts/flexgen-b4-microbatch-guest-test.sh 2  # 默认：两个B2
+# bash /root/CEMU/femu-scripts/flexgen-b4-microbatch-guest-test.sh 4  # 单个B4参考
+# bash /root/CEMU/femu-scripts/flexgen-b4-microbatch-guest-test.sh 1  # 四个B1
+```
+
+要复测此前的 syscall / SQ / CQ 细分，仍固定 B4、microbatch=2、D16，
+关闭旧 Guest 后使用以下 Host 命令，再在新 Guest 中执行第二条命令：
+
+```bash
+# Host
+sudo env CEMU_NATIVE_IO_TRACE=1 bash /home/lihan/cemu/CEMU/femu-scripts/run-flexgen-b4-microbatch-test.sh
+# Guest
+CEMU_FLEXGEN_STACK_TRACE=1 bash /root/CEMU/femu-scripts/flexgen-b4-microbatch-guest-test.sh 2
+```
+
+跟踪模式在加载权重前检查内核 tracepoint 和设备跟踪配置；完成后自动保存并分析
+`trace/guest.trace`、`trace/packets.jsonl`、`fdm-io-device.jsonl`，生成
+`pwrite-stack-summary.json` 和 `pwrite-stack-analysis.txt`，分别给出 Prefill/Decode
+的 KV pwrite 软件及设备边界。该分析不覆盖所有 Q/mean/输出 I/O 或 Execute ioctl。
+详细跟踪会带来额外开销，对照时注明开关。可通过第二个参数复用上一轮 MB2 的
+`softmax.json`，避免重新标定 ratio 引入变化；文件需要在新 Guest 中可访问。
+
+聚合算子内部细分（默认关闭）要求重新编译 QEMU 和 `fdm_kv_aggregate.so`：
+
+```bash
+make -C /home/lihan/cemu/CEMU/build -j4 qemu-system-x86_64
+make -C /home/lihan/cemu/CEMU/tests/cemu/kernel ../build/fdm_kv_aggregate.so
+sudo env CEMU_NATIVE_IO_TRACE=1 CEMU_FDM_AGGREGATE_PROFILE=1 \
+  bash /home/lihan/cemu/CEMU/femu-scripts/run-flexgen-b4-microbatch-test.sh
+# 新 Guest，仍使用上面的跟踪入口
+CEMU_FLEXGEN_STACK_TRACE=1 bash /root/CEMU/femu-scripts/flexgen-b4-microbatch-guest-test.sh 2
+```
+
+`pwrite-stack-analysis.txt` 增加 `{prefill,decode}.host.aggregate_detail.*`：
+`validate`（参数/布局/输入头校验）、`preflight`（三布局页查找和需求预检）、
+`free_list`（空闲页链检查）、`token_k/channel_k/token_v`（各布局实际写入）、
+`commit`（accepted和统计提交）、`wrapper`（外层Host计时减去内部阶段之和）。
+这些区间在同一 Host 单调时钟下可加，覆盖失败/重试调用；不是虚拟模型预算。
+三种布局的时间包含再次查找、分配/清零、复制/转置和ready入队，不能只解释为memcpy。
+另有成功调用数、新分配页数、三布局复制总字节数（不含清零）和channel-K元素数。
+不会在逐元素memcpy处打点；每个head/layout调用仍有计时开销，比较时注明开关。
+不改变FDM存储ABI和写入语义；旧模块缺少profile入口时BIND会拒绝，避免静默漏测。
+
+聚合算子独立 A/B 测试可用 `experiments/bench_kv_aggregate.py`。修改前先保存当前工作树
+的 `tests/cemu/kernel/fdm_kv_aggregate.c`，不要用不包含已有修改的旧提交作为基线：
+
+```bash
+cd /home/lihan/cemu/CEMU
+python3 tests/cemu/instattention/experiments/bench_kv_aggregate.py \
+  --baseline /path/to/fdm_kv_aggregate.before.c \
+  --output /path/to/new-result-directory --repeats 21
+```
+
+两份模块使用相同 `-O2 -march=native` 参数；测试固定一个可用CPU，交替运行A/B，
+丢弃首轮，报告各轮每包平均耗时的中位数。用生产初始化、收包及算子代码，
+仅算子调用计时，关闭内部profile；FP16/FP32均验证所有元数据/数据逐字节一致。
+输入沿用H40/d128/P1024/D16和128KiB分包规则，单独报告Prefill、首步新组、后续15步、
+全部16步Decode。测试在B1/L4暂存池中仅处理一个batch的一层，保留历史且无NAND writer；
+内存预触页，数据生成、收包、验证不计时。因此它用于比较算子实现，不能当作完整设备或
+GPU推理端到端加速比。输出保留源码快照、模块、CSV样本、校验日志和环境/汇总JSON。
+
+可加 `--decode-cache-mib 64`，在每次Decode算子计时之前扫描64MiB的其他内存，
+扫描本身不计入算子耗时。它用于观察缓存扰动下的收益，不保证完全冷缓存，也不能
+替代实际40层推理交错执行的测量；默认值0保持连续调用测试。
+
+聚合算子对单token、非token页组起点的追加使用已有页快速路径：整包预检时查页并
+保存index，复制阶段复用这些index，三种布局的组号、页内偏移和domain按包计算。
+临时计划最多2048个页索引（8KiB栈空间）；超出上限、新组和多token包走原通用路径。
+索引只在持有buffer锁的本次调用内有效，不跨请求缓存。所有head预检通过后才修改数据，
+accepted仍在三种布局全部完成后推进；页分配/清零和pwrite完成语义不变。
+
+已有页Decode路径在暂存页数据超过64MiB时，提前预取接下来4个channel-K页的写入位置；
+小缓冲区保持原路径。64MiB是Host实现的经验阈值，不是设备参数或模拟时间预算。
+`bench_kv_aggregate.py --interleaved-batches 8` 可交错访问40层、8个batch的Decode页，
+分别测首步新页和后续15步。这个测试只构造0..15的位置窗口（与1024..1039组内偏移相同），
+没有历史KV、GPU、NAND writer或线程竞争，不能代替完整推理。`--page-ab`改为两边使用
+同一baseline算子，仅比较小页/大页建议；必须检查输出的实际AnonHugePages，建议成功不等于
+大页实际分配成功。
+
+详细聚合profile开启时，设备原始trace还记录线程CPU时间、minor/major缺页与主动/被动
+上下文切换增量。探针位于算子Host计时外侧，但会增加请求外围开销；CPU时间区间略宽于
+Host计时区间，不能将两者差值当作精确的调度等待时间。它也不能测量cache/TLB miss。
+逐包还记录Host起止时间、线程号、起止CPU编号及batch/layer/head坐标；起止CPU相同
+不能证明中途未迁移。启动时保存 `host-execution-context.json`，包含NUMA节点CPU列表、
+自动NUMA平衡开关、请求及实际内存策略和启动亲和性。
+`run-native-opt-test.sh`（包括B4/B8包装脚本）默认设置
+`CEMU_NATIVE_NUMA_POLICY=bind-all`，用 `numactl --membind=all` 启动QEMU，
+允许使用所有可用NUMA节点，减少适用内存区域的自动NUMA采样干扰。
+该设置不修改Host全局sysctl或CPU亲和性，也不添加预触页、mlock。
+启动时验证策略；缺少numactl或策略未生效会报错，不静默回退。
+`launch-settings.txt`记录 `host_numa_policy`，上下文JSON记录同一启动前缀下的
+`numactl --show`。后续性能对照应使用相同策略，旧B4结果不能直接作为严格对照。
+需要恢复默认Linux策略做对照时，在默认内存策略的终端执行：
+
+```bash
+sudo env CEMU_NATIVE_NUMA_POLICY=default bash femu-scripts/run-flexgen-b4-microbatch-test.sh
+# B8对照入口仍支持 default / bind-all；普通B8入口现已默认bind-all。
+sudo bash femu-scripts/run-flexgen-b8-numa-test.sh default
+```
+
+Guest脚本自动生成 `aggregate-decode-split.json/txt`，按新页分配/已有页追加及各token位置
+拆分Host聚合耗时，并按CPU、已有页请求是否达到250us分组（250us只是诊断筛选阈值）。
+完整已有页慢请求保存在JSON中；新运行会检查探针覆盖，使用旧QEMU时明确报错。
+旧trace也可离线拆分，只是没有新增的CPU/缺页/调度计数：
+
+```bash
+python3 tests/cemu/instattention/experiments/aggregate_decode_trace.py \
+  /path/to/fdm-io-device.jsonl --output /path/to/aggregate-decode-split.json
+```
+
+脚本按microbatch形状生成并检查Softmax ratio；可用第二个参数传入已匹配的ratio文件。
+若已有同输入、同D16的B4参考结果，可设置 `CEMU_FLEXGEN_REFERENCE_RESULT=/path/to/result.json`
+比较输出token（不等于完整logits精度验证）。不要使用D1023结果作这个参考。
+
+每轮保存在 `flexgen-b4-mb{4,2,1}-d16.*`。父Execute预期分别为640、1280、2560次；
+KV包数、写入字节数仍按总B4校验。`concurrency.json`保存设备实际并发统计；
+拆分后若 `max_active_requests < 2`，脚本会报错，不能仅凭microbatch参数宣称已形成流水。
+`result.json`另存 `prefill_seconds` 和 `decode_step_seconds`，用于区分首步衔接等待。
+统计中的模型阶段累计时间可能重叠，不可当作整轮墙钟时间或直接与Guest耗时相减。
+
+B8与上述B4对照时，Host使用 `femu-scripts/run-flexgen-b8-microbatch-test.sh`，
+Guest使用 `femu-scripts/flexgen-b8-microbatch-guest-test.sh`。固定B8/MB4/P1024/D16，
+两组microbatch、双slot，父Execute仍为1280次；KV包为66560个。Host显式复用B4的
+32-LUN、11703ns页读配置，不能直接使用历史B8默认的48-LUN、62500ns配置比较。
+所有设备timeline、NAND读取诊断、pwrite栈和聚合内部profile默认开启，Guest检查
+实际设备配置及profile开关。未传ratio文件时重新测量MB4对应的ratio，不复用MB2表。
+每轮 `flexgen-b8-mb4-d16.*` 保存原始trace、分段报告、设备配置、算子源码和so及SHA256。
+单请求active-LUN数不能解释成整轮同时活跃的LUN数；结合请求级分布与并发统计分析。
+
+当前 drain/close 会释放 FDM buffer，但不回收 NVM 的任务映射和已分配物理页。
+B8 写入 2,688,000 页，B6 写入 2,016,000 页；同一会话连续运行会超过
+4,194,304 页的映射上限并返回 `CEMU_KV_LIMIT`。每轮容量/放置对照使用新 QEMU 会话。
+日志统一放在 `/root/cemu-logs/flexgen-b8-d16.XXXXXX/`，含 `profile.csv`、`result.json`、
+`read-summary.json`、`read-loss.json`、`boundaries.json` 与 `bandwidth.txt`。
+预期 640 次 Attention、13312000 个 head-token、66560 个 APPEND，最终写 11010048000
+字节、accepted/三布局进度均为1040、sealed=1且failed/在途/暂存/待完成均为0。
+这些是流程与计数检查，不代替完整模型 logits 正确性验证。
+
+重点对照 B4 的每阶段 `active_luns_mean`、`lun_max_to_mean`、Flash 字节数与 `model_ns`。
+`bandwidth.txt` 分别打印 `Flash字节/读阶段模型时间` 和 `Flash字节/Guest Decode时间`，
+两种分母不能混用，也不能相加重叠阶段耗时。它们不是实际物理 NAND 总线带宽；现有
+NAND 模型以 LUN 页服务排队为主。不要把 B8 原始总时长翻倍直接解释为带宽未改善。
+
+### B4 / 1024 输出 / 32 LUN 带宽等效实验
+
+独立配置 `experiments/configs/fdm_opt13b_b4_p1024_g1024_lun32.json` 使用
+8 channel × 4 LUN × 1 plane，4 KiB 页，读延迟 11703 ns：
+`32 * 4096 / 11703ns ≈ 11.1999 GB/s`（十进制），约 10.43 GiB/s。
+这只是现有 LUN 排队模型的理想吞吐匹配，不是测得的 NAND 页延迟，也没有启用
+共享 channel 总线传输建模；不能据此宣称已复现论文硬件。写延迟仍为 65000 ns。
+物理几何对应 64 GiB NVM，FDM 仍为 16 GiB，Guest 数据区仍为 8 GiB，输入槽仍为128 KiB。
+
+停止旧 QEMU 后，Host 执行：
+
+```bash
+cd /home/lihan/cemu/CEMU
+sudo env \
+  CEMU_NATIVE_BOOT_MODE=normal \
+  CEMU_NATIVE_OS_IMAGE=/data/lihan/cemu-native-opt/standalone.PnutcI/guest.qcow2 \
+  CEMU_NATIVE_PROFILE=b4-p1024-g1024-lun32 \
+  CEMU_NATIVE_CSD_TARGET=cuda CEMU_NATIVE_KV_PLACEMENT=balanced \
+  CEMU_DEVICE_INIT_ORDER=femu-first \
+  CUDA_VISIBLE_DEVICES=1 CEMU_CUDA_DEVICE=0 \
+  CEMU_CUDA_LIBRARY_PATH=/home/lihan/cemu/nvidia-575-libs \
+  CEMU_NATIVE_TIMELINE=1 CEMU_SPARF_READ_DIAGNOSTICS=1 CEMU_NATIVE_IO_TRACE=0 \
+  bash femu-scripts/run-native-opt-test.sh OPT-13B
+```
+
+在新 Guest 中执行（复用同一测试脚本，不复用旧 NVM 会话）：
+
+```bash
+CEMU_FLEXGEN_BATCH_SIZE=4 CEMU_FLEXGEN_DECODE_STEPS=1023 \
+  bash /root/CEMU/femu-scripts/flexgen-b8-guest-test.sh
+```
+
+Prefill 产生第一个输出，1023 次 Decode 产生剩余输出，总计每条1024个输出，最大KV长度2047。
+脚本重新测量/验证完整长度的 ratio（1151种目标形状，可能需要较长时间），统计分析范围为
+1025～2047，预期40920次Attention、194400个追加包、13100800个head-token，最终
+写2457600页（9.375 GiB）、sealed=1且无失败或未完成页。映射上限为4194304页。
+日志在 `/root/cemu-logs/flexgen-b4-d1023.*`；长实验的逐请求 JSON/时间线显著增大，
+请预留数 GiB 日志空间。输出分别包含 Decode、generate、包含 drain 的吞吐，不含权重加载。
+该配置仅做静态容量、语法和 ratio 形状检查；完整长输出结果须以实际 Guest 运行日志为准。
+
+### 容量回归与启动预检查
+
+本地回归覆盖 B8 真容量绑定、非连续数据 MR 聚合/写回/Attention 数值及既有 Native/FDM
+流程；不等同于已完成 Guest A100/OPT-13B B8 性能实测。
+
+可以先在 Host 检查选中的配置，不启动 QEMU、不创建镜像、不访问 GPU，无需 sudo：
+
+```bash
+cd /home/lihan/cemu/CEMU
+CEMU_NATIVE_PROFILE=b8-p1024-d16 CEMU_NATIVE_DRY_RUN=1 \
+  CEMU_NATIVE_CSD_TARGET=cpu CEMU_NATIVE_KV_PLACEMENT=balanced \
+  bash femu-scripts/run-native-opt-test.sh OPT-13B
+```
+
+dry-run 只打印容量选择并检查配置文件可读，不验证 JSON 内容、镜像、GPU、KVM、
+可用内存或磁盘空间。`cpu` 仅用于这次配置检查，不改变后续 CUDA 性能测试的目标。
+真实启动仍使用每轮独立的 file-backed `nvm.img`，不是预分配 96 GiB Host 匿名内存。
+不自动创建 swap，不停止已有 VM，也不改变 runtime、FTL 放置或冻结机制。
+
 ### FDM 原地聚合模块与非冻结调用
 
 这条路径是保留 CEMU 文件/MRS 软件栈的 **baseline**：KV 仍通过 FDM 写入接口进入输入槽，
@@ -250,7 +1251,7 @@ native 路径保留，后续用于行为与开销对照。
 新增 `tests/cemu/kernel/fdm_kv_aggregate.c`，编译为 `fdm_kv_aggregate.so`，导出
 `fdm_kv_aggregate(struct cemu_args *)`。它不依赖 native buffer，也不另申请 KV 页池。
 复用 FDM 自己的布局计算和共享 ABI，布局计算源码已去除 QEMU 专用头依赖。
-输入约定：`mr_addr[0]` 为初始化后的 MR0，`mr_addr[1]` 为 MR1，长度必须匹配绑定；
+输入约定：`mr_addr[0]` 为初始化后的 MR0，`mr_addr[1..]` 为数据段，长度必须匹配绑定；
 `cparam1=CEMU_FDM_KV_AGGREGATE_COMMAND`，`cparam2` 为设备调度入口取得的当前虚拟时间，
 不是 Guest 可任意指定的就绪时间。该时间参数只检查前置传输依赖，不是聚合 runtime。
 调用者必须独占该 buffer，保证 MRS/算子生命周期与 Host 数据一致性。
@@ -261,7 +1262,7 @@ native 路径保留，后续用于行为与开销对照。
 READY + 传输目标时刻已到
   → 校验所有 head 的连续追加前缀、reader、需要的新页和空闲页链
   → 整包资源足够才进入 AGGREGATING
-  → 读取 MR1.input 中的 K/V，直接填入 MR1.staged_data
+  → 读取 MR1.input 中的 K/V，通过段表直接填入 MR1.. 的暂存页池
   → 更新 MR0 的页目录、有效 token 数和 domain 队列
   → 发布所有 head 的 accepted，进入 AGGREGATED
   → fdm_kv_receive_release() 清收包状态、递增序号
@@ -276,7 +1277,7 @@ embedding channel 与 NAND channel。队列 `count >= block_pages` 表示已具�
 这一步只形成逻辑页键和候选队列，不分配真实 PPA、不提交 NAND、不推进 committed。
 
 返回值：`OK=0`、`INVALID=1`、`BUSY=2`、`NO_SPACE=3`、`WAIT_TIME=4`。
-前缀错误、reader 占用、空间不足或传输尚未到期均在修改前返回，MR0/MR1 保持不变。
+前缀错误、reader 占用、空间不足或传输尚未到期均在修改前返回，管理区/数据段保持不变。
 模块成功返回时保留输入包和 bitmap。`fdm_kv_complete_write()` 持锁调用模块并完成
 Host dirty 标记及输入槽释放，之后 poller 才返回原 WRITE 的 CQE。
 `fdm_kv_receive_release()` 只允许从 AGGREGATED 释放；它清空 bitmap/解析头、
@@ -1068,6 +2069,93 @@ Host 自检（不需要 Guest，不证明真实 KVM clock 行为）：
 ```bash
 python3 tests/cemu/instattention/python/test_freeze_clock_probe.py
 ```
+
+## KV 打包优化与旧环境恢复
+
+共享 FDM 打包路径使用 `np.ascontiguousarray(array.transpose(1, 0, 2))` 准备 K/V
+连续缓冲区，再由 `bytes.join` 直接读取缓冲区生成 payload，避免旧 NumPy 对非连续数组
+调用 `tobytes()` 的慢路径，也不再单独生成两份 K/V `bytes`。包头、坐标、K/V 字节顺序、
+请求次数及设备行为不变。Decode 转置结果已连续时，`ascontiguousarray` 不复制数据。
+
+详细计时仍使用 `k_copy_wall`、`v_copy_wall`、`join_wall`：前两项现在是连续布局准备，
+最后一项是两个缓冲区合并序列化。比较优化前后应看整个 `kv_payload_pack_wall`，不能
+将子项含义视为完全相同；布局元数据包含 `packing=contiguous_buffers_join`。
+
+不必为此迁移 Python/CUDA 或重新下载 PyTorch。若旧 vLLM Python 3.12 环境误升级了
+NumPy 2.4.6，先停止 vLLM 工作负载，再在 Guest 执行离线恢复：
+
+```bash
+bash /root/CEMU/femu-scripts/repair-vllm-numpy-guest.sh
+```
+
+脚本依赖 Host 已下载到 `tests/cemu/build/wheels/` 的 NumPy 2.3.5 cp312 x86_64 wheel，
+缺失时拒绝修改环境；该构建目录不纳入 Git。脚本保存依赖快照，仅替换旧 vLLM 环境的
+NumPy，再运行 `uv pip check` 和 NumPy/Numba/Torch 导入检查。不修改原 FlexGen 环境，
+也不使用未完成的 `/root/cemu-shared-cu129`。
+
+在原 vLLM 环境运行无需设备/模型的 CPU 打包 A/B：
+
+```bash
+(
+  set -euo pipefail
+  source /root/cemu-vllm-env.sh
+  cd /root/CEMU/tests/cemu
+  python instattention/experiments/bench_kv_payload.py --repeats 7 \
+    | tee /root/kv-payload-benchmark.jsonl
+)
+```
+
+测试对比旧实现与当前生产方法，检查逐字节一致性，覆盖 Prefill/Decode 的单 batch 和
+B8 包。只测普通 CPU ndarray，不包含 pinned 内存、D2H、文件 I/O、NAND 或完整推理，
+因此不能将这里的加速比直接当作端到端加速比。完整实验继续使用原 Guest 测试入口即可；
+无需重编译设备或客户端，正在运行的 Python 进程须退出后重新启动以加载代码。
+
+## FlexGen / vLLM 共用 Guest 环境（可选）
+
+两套完整实验可以通过 `CEMU_GUEST_ENV_FILE` 显式选择同一个环境，未设置时仍使用各自原来的环境。
+不要仅在终端激活虚拟环境：原测试脚本会选择自己的 Python。自定义环境文件必须导出
+`CEMU_CLIENT_BUILD_DIR`，设置相应 Python 的 `PATH` 和客户端/适配器的 `PYTHONPATH`。
+
+已有 vLLM Python 3.12 环境的 `mistral-common` 要求 NumPy `<2.4`，而 Numba 0.65.0 要求
+NumPy `<2.5`。独立共享环境使用已有的 Python 3.13 解释器与 NumPy 2.4.6，固定旧 vLLM
+修订版以及已安装的 Torch/torchvision/torchaudio、Transformers、tokenizers、Numba 和 pybind11
+版本。其他依赖由解析器按 Python 3.13 重新解析；最终版本保存为 `resolved-freeze.txt`。
+安装不会升级或修复旧环境；若旧环境此前被改成不兼容的 NumPy，需单独恢复它。
+
+在已经配置好 vLLM 的 Guest 内执行（需要网络和额外磁盘空间）：
+
+```bash
+set -o pipefail
+bash /root/CEMU/femu-scripts/setup-shared-opt-guest.sh \
+  2>&1 | tee /root/cemu-shared-setup.log
+```
+
+所有新内容位于 `/root/cemu-shared-cu129`，包括独立 vLLM 克隆、venv、客户端构建目录、
+旧环境版本记录、安装约束和自检报告。脚本在完整依赖检查、NumPy/Numba/FlexGen/vLLM/CEMU
+导入、PyTorch 和 vLLM CUDA kernel、pinned D2H 数据一致性及框架 CPU 单元测试通过后，才发布
+`env.sh`。失败时不会切换测试入口，可保留日志后重跑安装；已发布的环境拒绝原地重装。
+这些检查不加载 OPT-13B、不下发 KV，不代表完整模型验收已经通过。
+
+之后分别在新的 QEMU/NVM 会话中执行，不能因 FDM 已清空就连跑两次完整 B8：
+
+```bash
+env CEMU_GUEST_ENV_FILE=/root/cemu-shared-cu129/env.sh \
+  CEMU_IO_BACKEND=ioctl CEMU_VLLM_STACK_TRACE=1 \
+  bash /root/CEMU/femu-scripts/vllm-opt-guest-test.sh /root/cemu-ab-softmax.json
+```
+
+```bash
+env CEMU_GUEST_ENV_FILE=/root/cemu-shared-cu129/env.sh \
+  CEMU_FLEXGEN_BATCH_SIZE=8 CEMU_FLEXGEN_MICROBATCH_SIZE=8 \
+  CEMU_FLEXGEN_DECODE_STEPS=16 CEMU_FLEXGEN_STACK_TRACE=1 \
+  CEMU_FLEXGEN_DEVICE_PROFILE=b8-p1024-d16 \
+  bash /root/CEMU/femu-scripts/flexgen-b8-guest-test.sh /root/cemu-ab-softmax.json
+```
+
+`/root/cemu-ab-softmax.json` 指事先保存在 Guest 系统盘上的同一份 B8/P1024/D16 ratio，须用实际路径替换。
+两个入口均使用共享目录内同一个 Release 客户端；KV 包格式、打包代码、设备端和 NAND 配置不变。
+复测时保存 `/root/cemu-shared-cu129/environment.json` 与 `resolved-freeze.txt`，并检查每轮日志中的
+NumPy 版本。恢复旧入口只需不设置 `CEMU_GUEST_ENV_FILE`，不删除原环境。
 
 ## 按模式查接口
 

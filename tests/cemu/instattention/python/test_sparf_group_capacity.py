@@ -1,3 +1,8 @@
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +14,86 @@ from cemu_flexgen.sparf_group_capacity import (
 
 
 class SparfGroupCapacityTest(unittest.TestCase):
+    def launch_profile(self, profile, model="OPT-13B", **overrides):
+        repo = Path(__file__).resolve().parents[4]
+        environment = {name: value for name, value in os.environ.items()
+                       if not name.startswith(("CEMU_", "CUDA_"))}
+        environment.update(CEMU_NATIVE_PROFILE=profile, CEMU_NATIVE_DRY_RUN="1",
+                           CEMU_NATIVE_CSD_TARGET="cpu", CEMU_NATIVE_KV_PLACEMENT="balanced",
+                           CEMU_QEMU_BINARY="/nonexistent/qemu")
+        environment.update(overrides)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "sessions"
+            environment["CEMU_NATIVE_TEST_PARENT"] = str(parent)
+            result = subprocess.run(["bash", str(repo / "femu-scripts/run-native-opt-test.sh"), model],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertFalse(parent.exists())
+        settings = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        return result, settings
+
+    def test_b8_launch_capacity_keeps_nand_and_compute_unchanged(self):
+        result, settings = self.launch_profile("b8-p1024-d16")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("input slot is sized by the Guest client", result.stderr)
+        self.assertEqual(settings["guest_memory"], "64G")
+        self.assertEqual(settings["native_buffer_budget"], str(12 * 1024**3))
+        self.assertEqual(settings["native_page_limit"], str(1 << 22))
+        self.assertEqual(settings["native_kv_placement"], "balanced")
+        self.assertEqual(settings["nvm_backend"], "file")
+        path = Path(settings["device_config"])
+        self.assertEqual(path.name, "fdm_opt13b_b8_p1024_d16.json")
+        config = json.loads(path.read_text())
+        previous = json.loads(path.with_name("fdm_opt13b_b4_p1024_d16.json").read_text())
+        self.assertEqual(config["namespaces"][1]["size"], "16gb")
+        config["namespaces"][1]["size"] = previous["namespaces"][1]["size"]
+        self.assertEqual(config, previous)
+        capacity = plan_group_capacity(
+            num_layers=40, batch_size=8, num_kv_heads=40, head_dim=128,
+            element_bytes=2, page_bytes=4096, channels_per_page=8, max_seq_len=1040)
+        self.assertEqual(capacity.pages, 2688000)
+        self.assertEqual(capacity.pool_bytes, 11010048000)
+        self.assertLessEqual(capacity.pages, int(settings["native_page_limit"]))
+        self.assertLess(capacity.pool_bytes, 96 * 1024**3)
+        reserve = grouped_attention_reserve_bytes(
+            attention_slots=2, batch_size=8, query_heads=40, kv_heads=40,
+            head_dim=128, element_bytes=2, max_seq_len=1040, top_r=16, compression_ratio=8)
+        self.assertLess(8 * 1024**3 + 128 * 1024**2 + reserve, 16 * 1024**3)
+
+    def test_existing_launch_capacities_are_unchanged(self):
+        for profile, model, memory, budget, pages in (
+                ("smoke", "OPT-125M", "8G", 67108864, 65536),
+                ("smoke", "OPT-13B", "64G", 536870912, 65536),
+                ("b4-p1024-d16", "OPT-13B", "64G", 6442450944, 2097152)):
+            with self.subTest(profile=profile, model=model):
+                result, settings = self.launch_profile(profile, model)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(settings["guest_memory"], memory)
+                self.assertEqual(int(settings["native_buffer_budget"]), budget)
+                self.assertEqual(int(settings["native_page_limit"]), pages)
+                self.assertNotIn("multi-data-MR", result.stderr)
+                if profile == "b4-p1024-d16":
+                    self.assertEqual(Path(settings["device_config"]).name,
+                                     "cemu_config_opt13b_sparf_engines2.json")
+
+    def test_capacity_dry_run_validates_selection_and_honors_override(self):
+        result, _ = self.launch_profile("b8-p1024-d16", "OPT-125M")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires OPT-13B", result.stderr)
+        result, _ = self.launch_profile("invalid")
+        self.assertNotEqual(result.returncode, 0)
+        result, _ = self.launch_profile("b8-p1024-d16", CEMU_NATIVE_DRY_RUN="invalid")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CEMU_NATIVE_DRY_RUN", result.stderr)
+        result, _ = self.launch_profile("b8-p1024-d16", CEMU_NATIVE_CONFIG="/nonexistent/config.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Device config not readable", result.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "custom.json"
+            config.write_text("{}")
+            result, settings = self.launch_profile("b8-p1024-d16", CEMU_NATIVE_CONFIG=str(config))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(settings["device_config"], str(config))
+
     def test_batched_scratch_matches_device_allocation(self):
         from cemu_flexgen.sparf_group_device import SparfGroupedDevice
         from cemu_flexgen.sparf_group_layout import SparfGroupLayout

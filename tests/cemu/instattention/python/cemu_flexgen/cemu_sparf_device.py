@@ -6,7 +6,7 @@ from threading import RLock
 import numpy as np
 from _cemu_client import get_file_extents
 
-from phase_profiler import profile_scope
+from phase_profiler import profile_scope, profile_request, request_context, profile_lock
 
 from .cemu_device import CemuDevice, RangeSpec
 from .kv_layout import SparfKvCacheLayout, align_up
@@ -38,12 +38,26 @@ class CemuSparfDevice:
                  namespace_path="/dev/ng0n3", cuda_target=True,
                  approximate_runtime_ns=0, exact_qk_runtime_ns=0,
                  pv_runtime_ns=0, runtime_model=None, logger=None, name_prefix="sparf", profiler=None, staged=False,
-                 buffer_tokens=0, autonomous=False, grouped_store=None, grouped_stream_base=0):
+                 buffer_tokens=0, autonomous=False, grouped_store=None, grouped_stream_base=0,
+                 attention_scale=1.0, read_trace=True, ragged=False):
         if not isinstance(layout, SparfKvCacheLayout):
             raise TypeError("layout must be a SparfKvCacheLayout")
         self.layout = layout
         self.paths = tuple(Path(path) for path in (token_k_path, channel_k_path, token_v_path))
         self.query_heads = int(query_heads)
+        self.attention_scale = float(attention_scale)
+        if not math.isfinite(self.attention_scale) or self.attention_scale <= 0:
+            raise ValueError("attention_scale must be finite and positive")
+        self.ragged = bool(ragged)
+        if ragged and (not autonomous or staged or grouped_store is None):
+            raise ValueError("ragged batches require autonomous FDM storage")
+        self.read_trace = bool(read_trace)
+        if not self.read_trace and logger is not None:
+            raise ValueError("logging modeled runtime requires read_trace=True")
+        if self.query_heads <= 0 or self.query_heads % layout.config.num_kv_heads:
+            raise ValueError("query heads must be a positive multiple of KV heads")
+        self._mean_head_indices = np.arange(self.query_heads) // (
+            self.query_heads // layout.config.num_kv_heads)
         self.top_r = min(int(top_r), layout.config.head_dim)
         self.compression_ratio = int(compression_ratio)
         if self.top_r <= 0 or self.compression_ratio <= 0:
@@ -84,6 +98,8 @@ class CemuSparfDevice:
             top_r=self.top_r, compression_ratio=self.compression_ratio,
             buffer_tokens=self.buffer_tokens,
         )
+        if self.ragged:
+            sizes = sizes[:7] + (sizes[7] + layout.config.batch_size * 20,) + sizes[8:]
         names = ("query", "channel_k", "selected_k", "selected_v", "value_mean",
                  "current_k", "current_v", "alpha", "probability", "output", "trace")
         if self.staged:
@@ -96,6 +112,7 @@ class CemuSparfDevice:
             function_name="sparf_attention", ranges=ranges,
             control_path=control_path, namespace_path=namespace_path,
             cuda_target=cuda_target, replace_existing=True,
+            profiler=profiler, profile_range_names=dict(enumerate(names)),
         )
         self._device = None
         self._maps = None
@@ -122,11 +139,15 @@ class CemuSparfDevice:
 
     def _prepare_decode(self, query, layer, valid_tokens, value_mean, current_key=None,
                         current_value=None, cache_paths=None, buffered_kv=None,
-                        grouped_stream_base=None):
+                        grouped_stream_base=None, batch_rows=None):
         if not self.is_open:
             raise RuntimeError("CEMU SparF device is not open")
         if self._active is not None:
             raise RuntimeError("SparF slot already has an active workflow")
+        if batch_rows is not None:
+            return self._prepare_batch(query, layer, value_mean, batch_rows)
+        if self.ragged:
+            raise ValueError("ragged device requires batch_rows")
         config = self.layout.config
         if (not isinstance(layer, int) or isinstance(layer, bool) or
                 not 0 <= layer < config.num_layers):
@@ -149,8 +170,9 @@ class CemuSparfDevice:
         expected_mean_shape = (config.batch_size, config.num_kv_heads, config.head_dim)
         if value_mean.shape != expected_mean_shape:
             raise ValueError(f"value_mean must have shape {expected_mean_shape}, got {value_mean.shape}")
-        head_indices = np.arange(self.query_heads) // (self.query_heads // self.layout.config.num_kv_heads)
-        mean = np.ascontiguousarray(np.asarray(value_mean)[:, head_indices, :], dtype=query.dtype)
+        mean = np.ascontiguousarray(
+            value_mean if self.query_heads == config.num_kv_heads else
+            value_mean[:, self._mean_head_indices, :], dtype=query.dtype)
         top_k = max(1, math.ceil(valid_tokens / self.compression_ratio))
         runtimes = self.runtimes
         if self.runtime_model is not None:
@@ -194,20 +216,20 @@ class CemuSparfDevice:
                     metadata = pack_native(
                         self.layout, layer, valid_tokens, self.query_heads, self.top_r, top_k,
                         request_stream_base, approximate_runtime_ns=runtimes[0],
-                        exact_qk_runtime_ns=runtimes[1], pv_runtime_ns=runtimes[2], scale=1.0)
+                        exact_qk_runtime_ns=runtimes[1], pv_runtime_ns=runtimes[2], scale=self.attention_scale)
                 else:
                     metadata = pack_grouped_sparf_workflow(
                         self.layout, layer, valid_tokens, self.query_heads, self.top_r, top_k,
                         self.grouped_store.cookie, request_stream_base,
                         approximate_runtime_ns=runtimes[0], exact_qk_runtime_ns=runtimes[1],
-                        pv_runtime_ns=runtimes[2], scale=1.0,
+                        pv_runtime_ns=runtimes[2], scale=self.attention_scale,
                     )
             else:
                 maps = self._resolve_maps(self.paths if cache_paths is None else cache_paths)
                 metadata = pack_sparf_workflow(
                     self.layout, layer, valid_tokens, self.query_heads, self.top_r, top_k,
                     *maps, approximate_runtime_ns=runtimes[0],
-                    exact_qk_runtime_ns=runtimes[1], pv_runtime_ns=runtimes[2], scale=1.0,
+                    exact_qk_runtime_ns=runtimes[1], pv_runtime_ns=runtimes[2], scale=self.attention_scale,
                     buffered_tokens=buffered_tokens,
                     autonomous=self.autonomous,
                 )
@@ -217,21 +239,62 @@ class CemuSparfDevice:
         self._active = request
         return request
 
+    def _prepare_batch(self, query, layer, value_mean, rows):
+        if not self.ragged:
+            raise ValueError("device was not allocated for ragged batches")
+        config = self.layout.config
+        batch = len(rows)
+        query = np.ascontiguousarray(query, dtype=config.dtype)
+        value_mean = np.asarray(value_mean)
+        if (query.shape != (batch, self.query_heads, config.head_dim) or
+                value_mean.shape != (batch, config.num_kv_heads, config.head_dim)):
+            raise ValueError("ragged Q/mean shapes must match batch rows")
+        # Validate metadata before any writes. No Q/KV padding or per-request EXEC.
+        with profile_scope(self.profiler, "decode.metadata_wall"):
+            runtimes = self.runtimes
+            if self.runtime_model is not None:
+                shapes = {(row[1], row[2]) for row in rows}
+                if len(shapes) != 1:
+                    raise ValueError("uniform Softmax ratios do not model unequal row lengths; "
+                                     "measure a ragged runtime model before timing this batch")
+                tokens, selected = next(iter(shapes))
+                estimate = self.runtime_model.estimate(
+                    batch, self.query_heads, config.head_dim, tokens,
+                    self.top_r, selected, self.layout.element_size)
+                runtimes = (estimate.approximate_ns, estimate.exact_qk_ns, estimate.pv_ns)
+            metadata = self.grouped_store.pack_batch_workflow(
+                self.layout, layer, self.query_heads, self.top_r, rows, scale=self.attention_scale,
+                runtimes=runtimes, trace=self.read_trace)
+            mean = np.ascontiguousarray(
+                value_mean if self.query_heads == config.num_kv_heads else
+                value_mean[:, self._mean_head_indices, :], dtype=query.dtype)
+        with profile_scope(self.profiler, "decode.fdm_write_wall"):
+            self._device.write_tensor(0, query)
+            self._device.write_tensor(4, mean)
+        self._workflow_id = self._workflow_id % 0xffffffff + 1
+        request = SparfStagedDecode(self._workflow_id, layer, max(r[1] for r in rows),
+                                   query.shape, query.dtype, metadata)
+        self._active = request
+        return request
+
     def prepare_decode(self, *args, **kwargs):
         """Prepare one slot request without Guest KV selection/read."""
         if not (self.staged or self.autonomous):
             raise RuntimeError("device was not configured for scheduled execution")
-        with self._lock:
+        with profile_lock(self.profiler, "decode.device_prepare", self._lock):
             return self._prepare_decode(*args, **kwargs)
 
     def execute_autonomous(self, request):
         """Run one v3 parent command; internal stages belong to the device."""
-        with self._lock:
+        with profile_lock(self.profiler, "decode.device_execute", self._lock):
             self._require_request(request)
             if not self.autonomous or request.completed_stages:
                 raise RuntimeError("no autonomous SparF request to execute")
             try:
-                with profile_scope(self.profiler, "decode.execute_wait_wall"):
+                context = request_context(self.profiler)
+                if context is not None:
+                    context = dict(context, program=self._device.program_id)
+                with profile_request(self.profiler, context), profile_scope(self.profiler, "decode.execute_wait_wall"):
                     self._device.execute(cparam1=SPARF_WORKFLOW_COMMAND,
                                          metadata=request.metadata)
                 request.completed_stages = len(SPARF_STAGES)
@@ -261,13 +324,13 @@ class CemuSparfDevice:
                 self._active = None
                 raise
 
-    def collect_decode(self, request):
-        with self._lock:
+    def collect_decode(self, request, *, output=None):
+        with profile_lock(self.profiler, "decode.device_collect", self._lock):
             self._require_request(request)
             if request.completed_stages != len(SPARF_STAGES):
                 raise RuntimeError("SparF output requested before PV completed")
             try:
-                return self._collect_decode(request)
+                return self._collect_decode(request, output=output)
             finally:
                 self._active = None
 
@@ -282,7 +345,7 @@ class CemuSparfDevice:
         if request is not self._active:
             raise RuntimeError("stale request or request belongs to another SparF slot")
 
-    def run_decode(self, *args, **kwargs):
+    def run_decode(self, *args, output=None, **kwargs):
         with self._lock:
             request = self._prepare_decode(*args, **kwargs)
             try:
@@ -294,14 +357,22 @@ class CemuSparfDevice:
                         self._device.execute(cparam1=SPARF_WORKFLOW_COMMAND,
                                              metadata=request.metadata)
                     request.completed_stages = len(SPARF_STAGES)
-                return self.collect_decode(request)
+                return self.collect_decode(request, output=output)
             finally:
                 self._active = None
 
-    def _collect_decode(self, request):
+    def _collect_decode(self, request, *, output=None):
         output_bytes = math.prod(request.shape) * request.dtype.itemsize
         with profile_scope(self.profiler, "decode.output_read_wall", output_bytes):
-            output = self._device.read_tensor(9, request.shape, request.dtype)
+            if output is None:
+                output = self._device.read_tensor(9, request.shape, request.dtype)
+            else:
+                if output.shape != request.shape or output.dtype != request.dtype:
+                    raise ValueError("decode output shape/dtype must match the query")
+                self._device.read_tensor_into(9, output)
+        if not self.read_trace:
+            self.decode_count += 1
+            return output
         with profile_scope(self.profiler, "decode.trace_read_wall", SPARF_WORKFLOW_TRACE_BYTES):
             trace = self._device.read_tensor(10, (SPARF_WORKFLOW_TRACE_BYTES,), np.uint8)
         self.last_trace = SparfWorkflowTrace.unpack(trace)

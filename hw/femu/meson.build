@@ -13,7 +13,7 @@ softmmu_ss.add(when: 'CONFIG_FEMU_PCI', if_true: files(
   'bbssd/instattention_buffer.c',
   'bbssd/instattention_attention.c',
   'fdm_kv_layout.c', 'fdm_kv_buffer.c', 'fdm_kv_binding.c', 'fdm_kv_receive.c',
-  'fdm_kv_writer.c', 'fdm_kv_attention.c',
+  'fdm_kv_writer.c', 'fdm_kv_attention.c', 'fdm_io_trace.c',
   'csd/memory.c', 'csd/compute.c', 'csd/sched.c', 'csd/sched_fifo.c',
   'csd/sched_rr.c', 'csd/sched_grouped_fifo.c',
   'csd/sched_grouped_rr.c', 'statistics/statistics.c'))

@@ -41,6 +41,13 @@ typedef struct SparfAutonomous {
     SparfAutonomousTrace *timeline;
 } SparfAutonomous;
 
+static const struct cemu_sparf_batch_row *sparf_batch_rows(const ComputeJob *job)
+{
+    const struct cemu_sparf_workflow_header *h = job->args.data_buffer;
+    return (h->flags & CEMU_SPARF_WORKFLOW_RAGGED) ?
+        (const void *)((const uint8_t *)h + sizeof(*h) + sizeof(struct cemu_sparf_fdm_binding)) : NULL;
+}
+
 static bool sparf_start_bound_read(ComputeJob *job, SparfAutonomous *state,
     const struct cemu_sparf_workflow_header *header, const uint32_t *indices,
     uint32_t kind, uint32_t destination_range, struct rte_ring *ring,
@@ -52,9 +59,11 @@ static bool sparf_start_bound_read(ComputeJob *job, SparfAutonomous *state,
     }
     uint64_t vectors = (uint64_t)header->batch_size * header->num_query_heads;
     uint32_t element = header->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+    const struct cemu_sparf_batch_row *rows = sparf_batch_rows(job);
     uint64_t bytes = kind == CEMU_SPARF_GROUP_CHANNEL_K ?
-        vectors * header->top_r * header->valid_tokens * element :
-        vectors * (header->top_k + (kind == CEMU_SPARF_GROUP_TOKEN_V)) * header->head_dim * element;
+        cemu_sparf_history_count(header, rows) * header->top_r * element :
+        (cemu_sparf_selected_count(header, rows) +
+         (kind == CEMU_SPARF_GROUP_TOKEN_V ? vectors : 0)) * header->head_dim * element;
     CemuSparfStorageResult result = {0};
 
     if (job->args.mr_len[destination_range] < 0 || bytes > (uint64_t)job->args.mr_len[destination_range] ||
@@ -149,20 +158,22 @@ static uint64_t run_sparf_phase(ComputeJob *job, uint32_t phase,
         lengths[index] = job->args.mr_len[source];
         backends[index] = job->mr_backend[source];
     }
+    const struct cemu_sparf_workflow_header *header = job->args.data_buffer;
+    const struct cemu_sparf_batch_row *rows = sparf_batch_rows(job);
+    uint64_t vectors = (uint64_t)metadata->batch_size * metadata->num_query_heads;
+    uint64_t selected = cemu_sparf_selected_count(header, rows);
+    uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
+    uint64_t alpha_bytes = vectors * sizeof(float) + (rows ? header->batch_size * sizeof(*rows) : 0);
     if (phase == CEMU_SPARF_PHASE_EXACT_QK) {
-        uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
-        lengths[0] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
-                     metadata->head_dim * element;
-        lengths[1] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
-                     metadata->selected_tokens * metadata->head_dim * element;
-        lengths[2] = (uint64_t)metadata->batch_size * metadata->num_query_heads *
-                     sizeof(float);
+        lengths[0] = vectors * metadata->head_dim * element;
+        lengths[1] = selected * metadata->head_dim * element;
+        lengths[2] = alpha_bytes;
+        lengths[3] = (selected + vectors) * sizeof(float);
     } else {
-        uint64_t element = metadata->dtype == CEMU_SPARF_FLOAT16 ? 2 : 4;
-        uint64_t vectors = (uint64_t)metadata->batch_size * metadata->num_query_heads;
-        lengths[0] = vectors * (metadata->selected_tokens + 1) * sizeof(float);
-        lengths[1] = vectors * (metadata->selected_tokens + 1) *
-                     metadata->head_dim * element;
+        lengths[0] = (selected + vectors) * sizeof(float);
+        lengths[1] = (selected + vectors) * metadata->head_dim * element;
+        if (rows) lengths[2] = alpha_bytes;
+        lengths[count - 1] = vectors * metadata->head_dim * element;
     }
     struct ubpf_jit_args arguments = job->args;
     arguments.numr = count;
@@ -272,6 +283,9 @@ static uint64_t run_sparf_workflow(ComputeJob *job, uint64_t *modeled_runtime,
     struct cemu_sparf_workflow_trace trace = { 0 };
     memcpy(&header, job->args.data_buffer, sizeof(header));
     bool grouped = header.flags & CEMU_SPARF_WORKFLOW_GROUPED;
+    const struct cemu_sparf_batch_row *rows = sparf_batch_rows(job);
+    uint64_t history_count = cemu_sparf_history_count(&header, rows);
+    uint64_t selected_count = cemu_sparf_selected_count(&header, rows);
     if (grouped && (!autonomous || (!autonomous->group_session && !autonomous->storage_read))) return (uint64_t)-1;
     struct cemu_sparf_buffer_tail tail = { header.valid_tokens, 0 };
     if (header.flags & CEMU_SPARF_WORKFLOW_BUFFERED) {
@@ -319,19 +333,20 @@ static uint64_t run_sparf_workflow(ComputeJob *job, uint64_t *modeled_runtime,
     bool resume = autonomous && autonomous->resume != SPARF_RESUME_START;
     struct rte_ring *ring = resume ? autonomous->ring : femu_ring_create(FEMU_RING_TYPE_MP_SC, 8);
     uint32_t *channels = resume ? autonomous->channels : select ? g_new(uint32_t, (uint64_t)vectors * header.top_r) : NULL;
-    uint32_t *tokens = resume ? autonomous->tokens : g_new(uint32_t, (uint64_t)vectors * header.top_k);
+    uint32_t *tokens = resume ? autonomous->tokens : g_new(uint32_t, selected_count);
     float *scores = resume ? autonomous->scores : select ? g_new(float, header.valid_tokens) : NULL;
     SparfScoreIndex *score_indices = resume ? autonomous->score_indices : select ? g_new(SparfScoreIndex, header.valid_tokens) : NULL;
     float *query_values = resume ? autonomous->query_values : select ? g_new(float, (uint64_t)vectors * header.head_dim) : NULL;
     float *channel_values = resume ? autonomous->channel_values : select ? g_new(float,
-        (uint64_t)vectors * header.top_r * header.valid_tokens) : NULL;
+        history_count * header.top_r) : NULL;
     float *current_key_values = resume ? autonomous->current_key_values : select && !grouped ? g_new(float,
         (uint64_t)header.batch_size * header.num_kv_heads * header.head_dim) : NULL;
     SparfScoreIndex *channel_indices = resume ? autonomous->channel_indices : select ? g_new(SparfScoreIndex, header.head_dim) : NULL;
     uint64_t result = (uint64_t)-1;
     SparfRead channel_read = { 0 }, key_read = { 0 }, value_read = { 0 };
     struct cemu_sparf_attention_metadata metadata = {
-        .version = CEMU_SPARF_ATTENTION_VERSION,
+        .version = rows ? CEMU_SPARF_ATTENTION_RAGGED_VERSION : CEMU_SPARF_ATTENTION_VERSION,
+        .reserved = rows ? selected_count : 0,
         .phase = CEMU_SPARF_PHASE_EXACT_QK,
         .dtype = header.dtype,
         .batch_size = header.batch_size,
@@ -433,7 +448,7 @@ resume_channel:
 resume_approx:
         if (timeline) sparf_trace_stamp(&timeline->computes[0].functional_start);
         for (uint64_t index = 0;
-             index < (uint64_t)vectors * header.top_r * header.valid_tokens;
+             index < history_count * header.top_r;
              ++index) {
             if (grouped) {
                 channel_values[index] = sparf_load_scalar(job->args.mr_addr[1], index, header.dtype);
@@ -459,10 +474,16 @@ resume_approx:
                                                           header.dtype);
         }
         float *alpha = (float *)job->args.mr_addr[7];
-        if (backend_cuda_prepare_host(job->mr_backend[7], alpha, vectors * sizeof(float)) != 0) goto out;
+        if (backend_cuda_prepare_host(job->mr_backend[7], alpha, (vectors * sizeof(float) + (rows ? header.batch_size * sizeof(*rows) : 0))) != 0) goto out;
         for (uint32_t vector = 0; vector < vectors; ++vector) {
             uint32_t batch = vector / header.num_query_heads;
             uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
+            struct cemu_sparf_batch_row r = cemu_sparf_row(&header, rows, batch);
+            uint32_t valid_tokens = r.valid_tokens, top_k = r.top_k;
+            uint64_t token_base = (uint64_t)r.selected_offset * header.num_query_heads +
+                (vector % header.num_query_heads) * top_k;
+            uint64_t channel_base = ((uint64_t)r.history_offset * header.num_query_heads +
+                (vector % header.num_query_heads) * valid_tokens) * header.top_r;
             float q_norm = 0.0f, selected_norm = 0.0f, maximum = -INFINITY;
             for (uint32_t dimension = 0; dimension < header.head_dim; ++dimension)
                 q_norm += fabsf(query_values[(uint64_t)vector * header.head_dim + dimension]);
@@ -470,61 +491,62 @@ resume_approx:
                 selected_norm += fabsf(query_values[(uint64_t)vector * header.head_dim +
                     channels[(uint64_t)vector * header.top_r + rank]]);
             float ratio = q_norm / MAX(selected_norm, 1.17549435e-38f);
-            for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            for (uint32_t token = 0; token < valid_tokens; ++token) {
                 scores[token] = 0.0f;
             }
             for (uint32_t rank = 0; rank < header.top_r; ++rank) {
                 uint32_t dimension = channels[(uint64_t)vector * header.top_r + rank];
                 float query_value = query_values[(uint64_t)vector * header.head_dim + dimension];
                 const float *key_values = &channel_values[
-                    ((uint64_t)vector * header.top_r + rank) * header.valid_tokens];
-                for (uint32_t token = 0; token + 1 < header.valid_tokens; ++token) {
+                    channel_base + (uint64_t)rank * valid_tokens];
+                for (uint32_t token = 0; token + 1 < valid_tokens; ++token) {
                     scores[token] += query_value * key_values[token];
                 }
-                scores[header.valid_tokens - 1] += query_value * (grouped ? key_values[header.valid_tokens - 1] :
+                scores[valid_tokens - 1] += query_value * (grouped ? key_values[valid_tokens - 1] :
                     current_key_values[((uint64_t)batch * header.num_kv_heads + head) * header.head_dim + dimension]);
             }
-            for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            for (uint32_t token = 0; token < valid_tokens; ++token) {
                 scores[token] *= ratio * header.scale;
                 maximum = MAX(maximum, scores[token]);
             }
             float denominator = 0.0f;
-            for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            for (uint32_t token = 0; token < valid_tokens; ++token) {
                 scores[token] = expf(scores[token] - maximum);
                 denominator += scores[token];
             }
-            for (uint32_t token = 0; token < header.valid_tokens; ++token) scores[token] /= denominator;
-            for (uint32_t token = 0; token < header.valid_tokens; ++token) {
+            for (uint32_t token = 0; token < valid_tokens; ++token) scores[token] /= denominator;
+            for (uint32_t token = 0; token < valid_tokens; ++token) {
                 score_indices[token].score = scores[token];
                 score_indices[token].index = token;
             }
-            qsort(score_indices, header.valid_tokens, sizeof(*score_indices),
+            qsort(score_indices, valid_tokens, sizeof(*score_indices),
                   sparf_score_index_compare);
             bool current_selected = false;
-            for (uint32_t rank = 0; rank < header.top_k; ++rank) {
-                tokens[(uint64_t)vector * header.top_k + rank] = score_indices[rank].index;
-                current_selected |= score_indices[rank].index + 1 == header.valid_tokens;
+            for (uint32_t rank = 0; rank < top_k; ++rank) {
+                tokens[token_base + rank] = score_indices[rank].index;
+                current_selected |= score_indices[rank].index + 1 == valid_tokens;
             }
-            uint32_t current = header.valid_tokens - 1;
+            uint32_t current = valid_tokens - 1;
             if (!current_selected) {
                 uint32_t weakest = 0;
-                for (uint32_t rank = 1; rank < header.top_k; ++rank) {
-                    if (scores[tokens[(uint64_t)vector * header.top_k + rank]] <
-                        scores[tokens[(uint64_t)vector * header.top_k + weakest]]) {
+                for (uint32_t rank = 1; rank < top_k; ++rank) {
+                    if (scores[tokens[token_base + rank]] <
+                        scores[tokens[token_base + weakest]]) {
                         weakest = rank;
                     }
                 }
-                tokens[(uint64_t)vector * header.top_k + weakest] = current;
+                tokens[token_base + weakest] = current;
             }
             alpha[vector] = 0.0f;
-            for (uint32_t rank = 0; rank < header.top_k; ++rank)
-                alpha[vector] += scores[tokens[(uint64_t)vector * header.top_k + rank]];
+            for (uint32_t rank = 0; rank < top_k; ++rank)
+                alpha[vector] += scores[tokens[token_base + rank]];
         }
-        backend_cuda_mark_host_dirty(job->mr_backend[7], alpha, vectors * sizeof(float));
+        if (rows) memcpy(alpha + vectors, rows, header.batch_size * sizeof(*rows));
+        backend_cuda_mark_host_dirty(job->mr_backend[7], alpha, (vectors * sizeof(float) + (rows ? header.batch_size * sizeof(*rows) : 0)));
         trace.approximate_model_ns = header.approximate_runtime_ns;
         if (timeline) sparf_trace_stamp(&timeline->computes[0].functional_end);
         trace.selected_channels = (uint64_t)vectors * header.top_r;
-        trace.selected_tokens = (uint64_t)vectors * header.top_k;
+        trace.selected_tokens = selected_count;
         if (autonomous) {
             *modeled_runtime = header.approximate_runtime_ns;
             autonomous->resume = SPARF_RESUME_KEY_START;
@@ -570,8 +592,8 @@ resume_key:
             goto suspend;
         }
 resume_exact:
-        if (backend_cuda_prepare_host(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]) != 0) goto out;
-        for (uint32_t vector = 0; vector < vectors; ++vector) {
+        if (!grouped && backend_cuda_prepare_host(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]) != 0) goto out;
+        for (uint32_t vector = 0; !grouped && vector < vectors; ++vector) {
             uint32_t batch = vector / header.num_query_heads;
             uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
             for (uint32_t rank = 0; rank < header.top_k; ++rank) {
@@ -587,7 +609,7 @@ resume_exact:
                 }
             }
         }
-        backend_cuda_mark_host_dirty(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]);
+        if (!grouped) backend_cuda_mark_host_dirty(job->mr_backend[2], job->args.mr_addr[2], job->args.mr_len[2]);
         if (stage) {
             result = 0;
             goto out;
@@ -630,15 +652,15 @@ resume_value:
             (!autonomous && exact_result == (uint64_t)-1)) goto out;
         sparf_observe_end(observation, SPARF_OBS_V_OUTSTANDING);
         if (backend_cuda_prepare_host(job->mr_backend[3], job->args.mr_addr[3],
-                                      job->args.mr_len[3]) != 0 ||
+                                      (selected_count + vectors) * header.head_dim * element) != 0 ||
             backend_cuda_prepare_host(job->mr_backend[4], job->args.mr_addr[4],
-                                      job->args.mr_len[4]) != 0 ||
+                                      (uint64_t)vectors * header.head_dim * element) != 0 ||
             (!grouped && backend_cuda_prepare_host(job->mr_backend[6], job->args.mr_addr[6],
                                       job->args.mr_len[6]) != 0)) goto out;
         for (uint32_t vector = 0; vector < vectors; ++vector) {
             uint32_t batch = vector / header.num_query_heads;
             uint32_t head = (vector % header.num_query_heads) / heads_per_kv;
-            for (uint32_t rank = 0; rank < header.top_k; ++rank) {
+            for (uint32_t rank = 0; !grouped && rank < header.top_k; ++rank) {
                 uint32_t selected = tokens[(uint64_t)vector * header.top_k + rank];
                 if (!grouped && (selected >= tail.published_tokens || selected + 1 == header.valid_tokens)) {
                     uint64_t buffered_offset = selected >= tail.published_tokens
@@ -650,12 +672,16 @@ resume_value:
                            header.head_dim * element);
                 }
             }
+            struct cemu_sparf_batch_row r = cemu_sparf_row(&header, rows, batch);
+            uint64_t probability_base = (uint64_t)r.selected_offset * header.num_query_heads +
+                (vector % header.num_query_heads) * r.top_k + vector;
             memcpy((uint8_t *)job->args.mr_addr[3] +
-                       ((uint64_t)vector * (header.top_k + 1) + header.top_k) * header.head_dim * element,
+                       (probability_base + r.top_k) * header.head_dim * element,
                    (uint8_t *)job->args.mr_addr[4] + (uint64_t)vector * header.head_dim * element,
                    header.head_dim * element);
         }
-        backend_cuda_mark_host_dirty(job->mr_backend[3], job->args.mr_addr[3], job->args.mr_len[3]);
+        backend_cuda_mark_host_dirty(job->mr_backend[3], job->args.mr_addr[3],
+                                     (selected_count + vectors) * header.head_dim * element);
         trace.exact_qk_model_ns = header.exact_qk_runtime_ns;
         if (autonomous) {
             autonomous->deadline = autonomous->read_start + trace.token_v_read_model_ns;
@@ -670,9 +696,11 @@ resume_value:
     }
 resume_pv:;
     const uint32_t pv_ranges[] = { 8, 3, 9 };
+    const uint32_t ragged_pv_ranges[] = { 8, 3, 7, 9 };
     sparf_observe_begin(observation, SPARF_OBS_PV);
     if (timeline) sparf_trace_stamp(&timeline->computes[2].functional_start);
-    result = run_sparf_phase(job, CEMU_SPARF_PHASE_PV, pv_ranges, 3, &metadata);
+    result = run_sparf_phase(job, CEMU_SPARF_PHASE_PV,
+                             rows ? ragged_pv_ranges : pv_ranges, rows ? 4 : 3, &metadata);
     sparf_observe_end(observation, SPARF_OBS_PV);
     if (timeline) sparf_trace_stamp(&timeline->computes[2].functional_end);
     trace.pv_model_ns = header.pv_runtime_ns;

@@ -11,7 +11,7 @@ import json
 
 OUT = Path(__file__).resolve().parent
 ROOT = OUT.parents[5]
-SOURCE = ROOT / 'native-batch-device-timeline.jsonl'
+SOURCE = ROOT / 'cemu-logs/archives/workspace-root-20261102/native-batch-device-timeline.jsonl'
 spec = importlib.util.spec_from_file_location('sequence_renderer', OUT.parent / 'serial-sequence/render.py')
 renderer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(renderer)

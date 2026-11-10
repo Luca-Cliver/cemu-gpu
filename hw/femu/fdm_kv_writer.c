@@ -154,6 +154,7 @@ static void complete_writeback(NvmeRequest *request, bool cancelled)
     }
     mark_metadata(binding);
     g_cond_broadcast(&writer->wake);
+    fdm_kv_async_notify_locked(binding);
     g_mutex_unlock(writer_lock(binding));
 }
 
@@ -228,8 +229,7 @@ static void *buffer_worker(void *opaque)
                         .head = coordinate->head, .kind = coordinate->kind,
                         .token = coordinate->token, .channel = coordinate->channel },
                     .valid_tokens = page->valid_tokens,
-                    .buffer = buffer->staged_data + (uint64_t)(page_index - 1) *
-                              buffer->layout.geometry.page_bytes,
+                    .buffer = fdm_kv_page_data(buffer, page_index),
                     .bytes = buffer->layout.geometry.page_bytes };
                 page_index = page->next;
             }

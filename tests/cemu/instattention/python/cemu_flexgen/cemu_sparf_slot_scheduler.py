@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from queue import Queue
 from threading import Lock
+from phase_profiler import profile_scope, stack_profiler, submit_profiled
 
 from .cemu_attention_slot_scheduler import CemuAttentionSharedWorkers
 
@@ -26,6 +27,7 @@ class CemuSparfSlotScheduler:
         elif any(not slot.staged or getattr(slot, "autonomous", False) for slot in self.slots):
             raise ValueError("SparF slots must use the same staged or autonomous mode")
         self.workers = workers or CemuAttentionSharedWorkers()
+        self.profiler = getattr(self.slots[0], "profiler", None)
         self._available = Queue()
         self._lock = Lock()
         self._users = 0
@@ -76,9 +78,11 @@ class CemuSparfSlotScheduler:
             result = Future()
             result.set_running_or_notify_cancel()
             self._requests.add(result)
-        slot = self._available.get()
+        with profile_scope(stack_profiler(self.profiler), "decode.slot_wait_wall"):
+            slot = self._available.get()
         try:
-            self.workers.submit_load(self._prepare, slot, result, args, kwargs)
+            submit_profiled(self.workers.submit_load, self._prepare, self.profiler,
+                            "decode.slot_prepare", slot, result, args, kwargs)
         except Exception as error:
             self._finish(slot, result, error=error)
         return result
@@ -88,7 +92,8 @@ class CemuSparfSlotScheduler:
         try:
             request = slot.prepare_decode(*args, **kwargs)
             if self.autonomous:
-                self._autonomous_executor.submit(self._autonomous, slot, request, result)
+                submit_profiled(self._autonomous_executor.submit, self._autonomous, self.profiler,
+                                "decode.slot_execute", slot, request, result)
                 return
         except Exception as error:
             if request is not None:
@@ -100,7 +105,8 @@ class CemuSparfSlotScheduler:
     def _autonomous(self, slot, request, result):
         try:
             slot.execute_autonomous(request)
-            self.workers.submit_store(self._collect, slot, request, result)
+            submit_profiled(self.workers.submit_store, self._collect, self.profiler,
+                            "decode.slot_collect", slot, request, result)
         except Exception as error:
             self._abort(slot, request)
             self._finish(slot, result, error=error)

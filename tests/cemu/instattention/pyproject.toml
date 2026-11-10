@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cemu-vllm-adapter"
+version = "0.1.0"
+description = "CEMU FDM/SparF Attention adapter for the pinned vLLM V1 runner"
+requires-python = ">=3.11"
+dependencies = ["numpy"]
+
+[project.entry-points."vllm.general_plugins"]
+cemu = "vllm_adapter:register"
+
+[tool.setuptools]
+packages = ["vllm_adapter", "cemu_flexgen", "experiments"]
+py-modules = ["phase_profiler"]
+package-dir = {"" = "python", "experiments" = "experiments"}

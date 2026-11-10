@@ -7,7 +7,7 @@ import numpy as np
 
 from cemu_flexgen import SparfKvCacheStore
 from cemu_flexgen.sparf_write_buffer import SparfWriteBuffer
-from phase_profiler import profile_scope
+from phase_profiler import profile_scope, stack_profiler, profile_lock
 
 
 @dataclass(frozen=True)
@@ -286,7 +286,7 @@ class SparfGroupedAttentionBackend:
             self._mean_count[layer] = count
 
     def write_prefill(self, layer, keys, values):
-        with self._lock:
+        with profile_lock(self.profiler, "prefill.backend", self._lock):
             self._require_ready()
             self._require_layer(layer)
             if self._mean_count.get(layer, 0):
@@ -296,8 +296,9 @@ class SparfGroupedAttentionBackend:
                     raise RuntimeError("cannot append grouped KV while Attention is in flight")
                 self._wait_pending_locked()
             with profile_scope(self.profiler, "prefill.grouped_append_wall"):
-                keys = self._kv(keys, "keys")
-                values = self._kv(values, "values")
+                with profile_scope(stack_profiler(self.profiler), "prefill.kv_export_wall"):
+                    keys = self._kv(keys, "keys")
+                    values = self._kv(values, "values")
                 if keys.shape != values.shape or not len(keys):
                     raise ValueError("Prefill K/V must contain matching nonempty token arrays")
                 if len(keys) > self.layout.config.max_seq_len:
@@ -308,7 +309,7 @@ class SparfGroupedAttentionBackend:
     def append_decode(self, layer, token, key, value):
         if not isinstance(token, int) or isinstance(token, bool) or token < 0:
             raise ValueError("decode token must be a nonnegative integer")
-        with self._lock:
+        with profile_lock(self.profiler, "decode.backend_append", self._lock):
             self._require_ready()
             self._require_layer(layer)
             if self._pending is not None:
@@ -321,8 +322,9 @@ class SparfGroupedAttentionBackend:
             if token != expected:
                 raise ValueError(f"decode token {token} is not the next accepted token {expected}")
             with profile_scope(self.profiler, "decode.grouped_append_wall"):
-                keys = self._kv(key, "key")
-                values = self._kv(value, "value")
+                with profile_scope(stack_profiler(self.profiler), "decode.kv_export_wall"):
+                    keys = self._kv(key, "key")
+                    values = self._kv(value, "value")
                 if keys.shape != values.shape or keys.shape[0] != 1:
                     raise ValueError("Decode K/V must contain one matching token")
                 if token >= self.layout.config.max_seq_len:
@@ -333,12 +335,16 @@ class SparfGroupedAttentionBackend:
         # A tiled append can commit a prefix before failing. Never retry it
         # using a Guest mean that still describes the previous prefix.
         try:
-            self.grouped_store.append_batch(
-                self._stream(layer, 0, 0), token,
-                keys.reshape(len(keys), -1, keys.shape[-1]),
-                values.reshape(len(values), -1, values.shape[-1]),
-            )
-            self._update_mean(layer, values)
+            phase = "prefill" if token == 0 else "decode"
+            detailed = stack_profiler(self.profiler)
+            with profile_scope(detailed, phase + ".store_append_wall", keys.nbytes + values.nbytes):
+                self.grouped_store.append_batch(
+                    self._stream(layer, 0, 0), token,
+                    keys.reshape(len(keys), -1, keys.shape[-1]),
+                    values.reshape(len(values), -1, values.shape[-1]),
+                )
+            with profile_scope(detailed, phase + ".value_mean_update_wall"):
+                self._update_mean(layer, values)
         except BaseException as error:
             self._failure = error
             raise
@@ -370,7 +376,11 @@ class SparfGroupedAttentionBackend:
             raise ValueError(
                 f"valid_tokens={valid_tokens} does not match accepted KV prefix {accepted}"
             )
-        return self._query(query).copy(), layer, valid_tokens, self._mean(layer).copy()
+        with profile_scope(stack_profiler(self.profiler), "decode.query_export_wall"):
+            exported = self._query(query).copy()
+        with profile_scope(stack_profiler(self.profiler), "decode.value_mean_prepare_wall"):
+            mean = self._mean(layer).copy()
+        return exported, layer, valid_tokens, mean
 
     def decode(self, layer, query, valid_tokens):
         with self._lock:
@@ -389,7 +399,7 @@ class SparfGroupedAttentionBackend:
                 raise
 
     def submit_decode(self, layer, query, valid_tokens):
-        with self._lock:
+        with profile_lock(self.profiler, "decode.backend_submit", self._lock):
             self._require_ready()
             if self._pending is not None and not self._pending.done():
                 raise RuntimeError("grouped backend already has an in-flight request")

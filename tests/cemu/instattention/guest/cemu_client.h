@@ -27,6 +27,13 @@ struct ExecuteOptions {
     std::uint32_t runtime = 0;
 };
 
+struct IoProfile {
+    std::uint64_t prepare_ns = 0;
+    std::uint64_t wait_ns = 0;
+    std::uint64_t finish_ns = 0;
+    std::uint64_t bytes = 0;
+};
+
 class CemuClient {
 public:
     CemuClient(std::string control_path = "/dev/nvme0c3",
@@ -55,14 +62,22 @@ public:
     void write_range(std::size_t range_index,
                      const void *data,
                      std::size_t size,
-                     std::uint64_t range_offset = 0);
+                     std::uint64_t range_offset = 0,
+                     IoProfile *profile = nullptr);
     std::vector<std::uint8_t> read_range(std::size_t range_index,
                                          std::size_t size,
-                                         std::uint64_t range_offset = 0) const;
+                                         std::uint64_t range_offset = 0,
+                                         IoProfile *profile = nullptr) const;
+    void read_range_into(std::size_t range_index,
+                         void *data,
+                         std::size_t size,
+                         std::uint64_t range_offset = 0,
+                         IoProfile *profile = nullptr) const;
 
     std::uint32_t execute(const ExecuteOptions &options,
                           const void *metadata = nullptr,
-                          std::size_t metadata_size = 0);
+                          std::size_t metadata_size = 0,
+                          IoProfile *profile = nullptr);
 
     void close() noexcept;
 

@@ -1,0 +1,18 @@
+{
+  "fdm_directory": "/mnt/fdm0/vllm-opt13b",
+  "program_path": "/home/lihan/cemu/CEMU/tests/cemu/build/sparf_attention_devptr.so",
+  "aggregate_program": "/home/lihan/cemu/CEMU/tests/cemu/build/fdm_kv_aggregate.so",
+  "request_capacity": 2,
+  "max_tokens": 128,
+  "attention_slots": 1,
+  "top_r": 128,
+  "compression_ratio": 1,
+  "channels_per_page": 8,
+  "meta_bytes": 67108864,
+  "data_bytes": 536870912,
+  "batch_pages": 256,
+  "control_path": "/dev/nvme0c3",
+  "namespace_path": "/dev/ng0n3",
+  "runtime_config": null,
+  "read_trace": false
+}

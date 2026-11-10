@@ -61,10 +61,10 @@ $(BUILD_DIR)/attention_phases.so: attention_phases.cc attention_phases_abi.h att
 $(BUILD_DIR)/attention_phases_devptr.so: attention_phases_devptr.cu attention_phases_abi.h attention_phases_common.h cemu_def.h | $(BUILD_DIR)
 	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 
-$(BUILD_DIR)/sparf_attention.so: sparf_attention.cc sparf_attention_abi.h sparf_attention_common.h cemu_def.h | $(BUILD_DIR)
+$(BUILD_DIR)/sparf_attention.so: sparf_attention.cc sparf_attention_abi.h ../../../include/hw/femu/sparf_attention_abi.h sparf_attention_common.h cemu_def.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $<
 
-$(BUILD_DIR)/sparf_attention_devptr.so: sparf_attention_devptr.cu sparf_attention_abi.h sparf_attention_common.h cemu_def.h | $(BUILD_DIR)
+$(BUILD_DIR)/sparf_attention_devptr.so: sparf_attention_devptr.cu sparf_attention_abi.h ../../../include/hw/femu/sparf_attention_abi.h sparf_attention_common.h cemu_def.h | $(BUILD_DIR)
 	nvcc -shared -Xcompiler -fPIC -O2 -o $@ $<
 
 $(BUILD_DIR)/lz4.so: lz4.cc

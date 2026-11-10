@@ -37,29 +37,36 @@ __global__ void exact_qk(const Scalar *query, const Scalar *keys,
     __shared__ float scratch[threads];
     const uint64_t vectors = static_cast<uint64_t>(config.batch_size) * config.num_query_heads;
     for (uint64_t vector = blockIdx.x; vector < vectors; vector += gridDim.x) {
+        const auto *rows = config.version == CEMU_SPARF_ATTENTION_RAGGED_VERSION ?
+            reinterpret_cast<const cemu_sparf_batch_row *>(alpha + vectors) : nullptr;
+        const auto *r = rows ? &rows[vector / config.num_query_heads] : nullptr;
+        const uint32_t selected = r ? r->top_k : config.selected_tokens;
+        const uint64_t key_base = r ? static_cast<uint64_t>(r->selected_offset) * config.num_query_heads +
+            (vector % config.num_query_heads) * selected : vector * selected;
+        const uint64_t probability_base = key_base + vector;
         float maximum = -CUDART_INF_F;
-        for (uint32_t token = threadIdx.x; token < config.selected_tokens; token += blockDim.x) {
+        for (uint32_t token = threadIdx.x; token < selected; token += blockDim.x) {
             float score = 0.0f;
             for (uint32_t dimension = 0; dimension < config.head_dim; ++dimension) {
                 score += scalar(query[vector * config.head_dim + dimension]) *
-                         scalar(keys[(vector * config.selected_tokens + token) * config.head_dim + dimension]);
+                         scalar(keys[(key_base + token) * config.head_dim + dimension]);
             }
-            probability[vector * (config.selected_tokens + 1) + token] = score * config.scale;
+            probability[probability_base + token] = score * config.scale;
             maximum = fmaxf(maximum, score * config.scale);
         }
         maximum = reduce<true>(maximum, scratch);
         float denominator = 0.0f;
-        for (uint32_t token = threadIdx.x; token < config.selected_tokens; token += blockDim.x) {
-            float &item = probability[vector * (config.selected_tokens + 1) + token];
+        for (uint32_t token = threadIdx.x; token < selected; token += blockDim.x) {
+            float &item = probability[probability_base + token];
             item = expf(item - maximum);
             denominator += item;
         }
         denominator = reduce<false>(denominator, scratch);
-        for (uint32_t token = threadIdx.x; token < config.selected_tokens; token += blockDim.x) {
-            probability[vector * (config.selected_tokens + 1) + token] *= alpha[vector] / denominator;
+        for (uint32_t token = threadIdx.x; token < selected; token += blockDim.x) {
+            probability[probability_base + token] *= alpha[vector] / denominator;
         }
         if (threadIdx.x == 0) {
-            probability[vector * (config.selected_tokens + 1) + config.selected_tokens] = 1.0f - alpha[vector];
+            probability[probability_base + selected] = 1.0f - alpha[vector];
         }
         __syncthreads();
     }
@@ -67,15 +74,22 @@ __global__ void exact_qk(const Scalar *query, const Scalar *keys,
 
 template <typename Scalar>
 __global__ void pv(const float *probability, const Scalar *values, Scalar *output,
-                   cemu_sparf_attention_metadata config)
+                   const float *alpha, cemu_sparf_attention_metadata config)
 {
     const uint64_t vectors = static_cast<uint64_t>(config.batch_size) * config.num_query_heads;
     for (uint64_t vector = blockIdx.x; vector < vectors; vector += gridDim.x) {
+        const auto *rows = config.version == CEMU_SPARF_ATTENTION_RAGGED_VERSION ?
+            reinterpret_cast<const cemu_sparf_batch_row *>(alpha + vectors) : nullptr;
+        const auto *r = rows ? &rows[vector / config.num_query_heads] : nullptr;
+        const uint32_t selected = r ? r->top_k : config.selected_tokens;
+        const uint64_t key_base = r ? static_cast<uint64_t>(r->selected_offset) * config.num_query_heads +
+            (vector % config.num_query_heads) * selected : vector * selected;
+        const uint64_t probability_base = key_base + vector;
         for (uint32_t dimension = threadIdx.x; dimension < config.head_dim; dimension += blockDim.x) {
             float result = 0.0f;
-            for (uint32_t token = 0; token <= config.selected_tokens; ++token) {
-                result += probability[vector * (config.selected_tokens + 1) + token] *
-                          scalar(values[(vector * (config.selected_tokens + 1) + token) * config.head_dim + dimension]);
+            for (uint32_t token = 0; token <= selected; ++token) {
+                result += probability[probability_base + token] *
+                          scalar(values[(probability_base + token) * config.head_dim + dimension]);
             }
             output[vector * config.head_dim + dimension] = static_cast<Scalar>(result);
         }
@@ -95,7 +109,9 @@ void launch(cemu_args *args, cemu_sparf_attention_metadata config, unsigned bloc
         pv<<<blocks, threads, 0, cudaStreamPerThread>>>(
             static_cast<const float *>(args->mr_dev_addr[0]),
             static_cast<const Scalar *>(args->mr_dev_addr[1]),
-            static_cast<Scalar *>(args->mr_dev_addr[2]), config);
+            static_cast<Scalar *>(args->mr_dev_addr[config.version == CEMU_SPARF_ATTENTION_RAGGED_VERSION ? 3 : 2]),
+            config.version == CEMU_SPARF_ATTENTION_RAGGED_VERSION ?
+                static_cast<const float *>(args->mr_dev_addr[2]) : nullptr, config);
     }
 }
 }

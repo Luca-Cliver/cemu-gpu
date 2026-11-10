@@ -158,6 +158,7 @@ static size_t check_buffer(const FDMKV_InitParams_t *params,
         { buffer->blocks, buffer->domains * sizeof(*buffer->blocks) },
         { buffer->page_hash, buffer->hash_size * sizeof(*buffer->page_hash) },
         { buffer->writebacks, (buffer->writeback_capacity + 1ULL) * sizeof(*buffer->writebacks) },
+        { buffer->segments, buffer->segment_count * sizeof(*buffer->segments) },
     };
     uintptr_t meta_start = (uintptr_t)params->meta_addr;
     uint64_t used = 0;
@@ -450,9 +451,14 @@ static uint64_t prepare_aggregate(FDMKV_Buffer_t *buffer, uint32_t batch, uint32
 static long long invoke_aggregate(AggregateFunction function, const FDMKV_InitParams_t *params,
                                   uint64_t now_ns)
 {
-    void *addresses[] = { params->meta_addr, params->data_addr };
-    long long lengths[] = { params->meta_bytes, params->data_bytes };
-    struct cemu_args args = { .numr = 2, .mr_addr = addresses, .mr_len = lengths,
+    void *addresses[CEMU_FDM_KV_MAX_DATA_MRS + 1] = { params->meta_addr, params->data_addr };
+    long long lengths[CEMU_FDM_KV_MAX_DATA_MRS + 1] = { params->meta_bytes, params->data_bytes };
+    for (uint32_t index = 0; index < params->segment_count; index++) {
+        addresses[index + 1] = params->data_segments[index].address;
+        lengths[index + 1] = params->data_segments[index].bytes;
+    }
+    struct cemu_args args = { .numr = params->segment_count ? params->segment_count + 1 : 2,
+        .mr_addr = addresses, .mr_len = lengths,
         .cparam1 = CEMU_FDM_KV_AGGREGATE_COMMAND, .cparam2 = now_ns };
     return function(&args);
 }
@@ -510,7 +516,7 @@ static void check_aggregate_pages(const FDMKV_Buffer_t *buffer)
                     memcpy(expected + element * geometry->element_bytes, &sample, geometry->element_bytes);
                 }
             }
-            assert(memcmp(expected, buffer->staged_data + (uint64_t)(index - 1) * geometry->page_bytes,
+            assert(memcmp(expected, fdm_kv_page_data(buffer, index),
                           geometry->page_bytes) == 0);
             if (page->ready) {
                 uint32_t domain = ((coordinate->batch * geometry->layers + coordinate->layer) * 3 +
@@ -650,6 +656,224 @@ static void test_aggregate(AggregateFunction function)
     g_free(meta);
 }
 
+static void test_segmented_aggregate(AggregateFunction function)
+{
+    void *meta = g_malloc(128 * 1024);
+    uint8_t *input = g_malloc(128 * 1024);
+    uint8_t *tail = g_malloc(2 * 1024 * 1024);
+    FDMKV_InitParams_t params = buffer_params(meta, input);
+    FDMKV_DataSegment_t segments[] = {
+        { .address = input, .bytes = 73728 },
+        { .address = tail, .bytes = 2 * 1024 * 1024 },
+    };
+    params.segment_count = G_N_ELEMENTS(segments);
+    params.data_segments = segments;
+    FDMKV_Buffer_t *buffer;
+    assert(fdm_kv_buffer_init(&params, &buffer));
+    assert(buffer->segments[0].page_count == 1);
+    assert(fdm_kv_page_data(buffer, 1) == input + 69632);
+    assert(fdm_kv_page_data(buffer, 2) == tail);
+    assert(!fdm_kv_page_data(buffer, 0));
+    assert(!fdm_kv_page_data(buffer, buffer->pool_pages + 1));
+    for (uint32_t first = 0; first < 272; first += 16) {
+        prepare_aggregate(buffer, 1, 1, 0, 2, first, 16);
+        assert(invoke_aggregate(function, &params, 9000) == FDM_KV_AGGREGATE_OK);
+        check_aggregate_pages(buffer);
+        assert(fdm_kv_receive_release(buffer));
+    }
+    prepare_aggregate(buffer, 1, 1, 0, 2, 272, 1);
+    buffer->segments[1].address++;
+    assert(invoke_aggregate(function, &params, 9000) == FDM_KV_AGGREGATE_INVALID);
+    buffer->segments[1].address--;
+    buffer->segments[1].first_page++;
+    assert(invoke_aggregate(function, &params, 9000) == FDM_KV_AGGREGATE_INVALID);
+    buffer->segments[1].first_page--;
+    assert(invoke_aggregate(function, &params, 9000) == FDM_KV_AGGREGATE_OK);
+    check_aggregate_pages(buffer);
+    segments[1].address = input;
+    assert(!fdm_kv_buffer_init(&params, &buffer));
+    segments[1].address = meta;
+    assert(!fdm_kv_buffer_init(&params, &buffer));
+    segments[1].address = tail;
+    segments[1].bytes = 4096;
+    assert(!fdm_kv_buffer_init(&params, &buffer));
+    segments[1].bytes = UINT64_C(1) << 32;
+    assert(!fdm_kv_buffer_init(&params, &buffer));
+    g_free(tail);
+    g_free(input);
+    g_free(meta);
+}
+
+static void test_aggregate_plan_boundaries(AggregateFunction function)
+{
+    void *meta = g_malloc(1024 * 1024), *data = g_malloc(32 * 1024 * 1024);
+    FDMKV_InitParams_t params = buffer_params(meta, data);
+    params.meta_bytes = 1024 * 1024;
+    params.data_bytes = 32 * 1024 * 1024;
+    params.input_bytes = 128 * 1024;
+    params.geometry.batches = params.geometry.layers = 1;
+    params.geometry.max_tokens = 33;
+    /* 18 pages/head: 113 heads fit in 2048 cached indices; 114/128
+     * exercise bounded-plan fallback, including the existing-page case. */
+    const unsigned counts[] = { 113, 114, 128 };
+    for (unsigned choice = 0; choice < G_N_ELEMENTS(counts); choice++) {
+        params.geometry.heads = counts[choice];
+        FDMKV_Buffer_t *buffer;
+        memset(data, 0x5a, params.data_bytes);
+        assert(fdm_kv_buffer_init(&params, &buffer));
+        for (unsigned token = 0; token < 2; token++) {
+            prepare_aggregate(buffer, 0, 0, 0, counts[choice], token, 1);
+            buffer->head_states[counts[choice] - 1].readers = 1;
+            expect_unchanged(function, &params, 9000, FDM_KV_AGGREGATE_BUSY);
+            buffer->head_states[counts[choice] - 1].readers = 0;
+            if (token) {
+                /* Reject a bad page at the end of preflight without writing
+                 * any of the earlier heads, on both fast and fallback paths. */
+                uint32_t last = 0;
+                for (uint32_t index = 1; index <= buffer->pool_pages; index++) {
+                    FDMKV_StagedPage_t *page = &buffer->staged[index];
+                    if (page->valid_tokens == token &&
+                        page->coordinate.head == counts[choice] - 1 &&
+                        page->coordinate.kind == FDM_KV_TOKEN_V) {
+                        last = index;
+                        break;
+                    }
+                }
+                assert(last);
+                buffer->staged[last].valid_tokens++;
+                expect_unchanged(function, &params, 9000, FDM_KV_AGGREGATE_INVALID);
+                buffer->staged[last].valid_tokens--;
+                buffer->staged[last].ready = 1;
+                expect_unchanged(function, &params, 9000, FDM_KV_AGGREGATE_INVALID);
+                buffer->staged[last].ready = 0;
+            }
+            assert(invoke_aggregate(function, &params, 9000) == FDM_KV_AGGREGATE_OK);
+            check_aggregate_pages(buffer);
+            assert(fdm_kv_receive_release(buffer));
+        }
+    }
+    g_free(data);
+    g_free(meta);
+}
+
+static FDMKV_ProfileFunction profile_function;
+static uint64_t profile_ticks;
+
+static uint64_t profile_test_clock(void)
+{
+    return ++profile_ticks;
+}
+
+static long long invoke_profiled(struct cemu_args *args)
+{
+    FDMKV_AggregateProfile profile = {0};
+    profile_ticks = 0;
+    long long result = profile_function(args, &profile, profile_test_clock);
+    uint64_t total = 0;
+    for (unsigned stage = 0; stage < FDM_KV_AGG_STAGE_COUNT; stage++) {
+        total += profile.host_ns[stage];
+    }
+    assert(total == profile_ticks - 1);
+    assert(profile.calls == 1);
+    bool success = result == FDM_KV_AGGREGATE_OK || result == FDM_KV_AGGREGATE_PROGRESS;
+    assert(profile.successful_calls == success);
+    if (success) {
+        assert(profile.copied_bytes && profile.channel_elements);
+        for (unsigned stage = 0; stage < FDM_KV_AGG_STAGE_COUNT; stage++) {
+            assert(profile.host_ns[stage]);
+        }
+    }
+    return result;
+}
+
+static void test_layer_packets(AggregateFunction function)
+{
+    void *meta = g_malloc(128 * 1024), *data = g_malloc(4 * 1024 * 1024);
+    FDMKV_InitParams_t params = buffer_params(meta, data);
+    params.input_bytes = 1024 * 1024;
+    params.geometry.max_tokens = 300;
+    params.block_pages = 256;
+    FDMKV_Buffer_t *buffer;
+    assert(fdm_kv_buffer_init(&params, &buffer));
+    uint32_t first = 0;
+    const uint32_t counts[] = {273, 1, 15};
+    for (unsigned packet = 0; packet < G_N_ELEMENTS(counts); packet++) {
+        uint32_t tokens = counts[packet];
+        uint64_t payload = 2ULL * 2 * 2 * tokens * buffer->row_bytes;
+        uint64_t bytes = 512 + payload;
+        uint8_t *wire = g_malloc0(bytes);
+        FDMKV_AppendHeader_t header = {
+            .magic = cpu_to_le32(CEMU_FDM_KV_PACKET_MAGIC),
+            .version = cpu_to_le32(CEMU_FDM_KV_LAYER_PACKET_VERSION),
+            .header_bytes = cpu_to_le32(512), .operation = cpu_to_le32(FDM_KV_OP_APPEND),
+            .session_id = cpu_to_le64(params.identity.session_id),
+            .generation = cpu_to_le64(params.identity.generation),
+            .request_id = cpu_to_le64(packet + 1),
+            .wire_bytes = cpu_to_le64(bytes), .payload_bytes = cpu_to_le64(payload),
+            .batch = 0, .batch_count = cpu_to_le32(2), .layer = cpu_to_le32(1),
+            .head_count = cpu_to_le32(2), .token_first = cpu_to_le64(first),
+            .token_count = cpu_to_le32(tokens),
+        };
+        memcpy(wire, &header, sizeof(header));
+        for (uint32_t kind = 0; kind < 2; kind++) {
+            for (uint32_t batch = 0; batch < 2; batch++) {
+                for (uint32_t head = 0; head < 2; head++) {
+                    for (uint32_t token = 0; token < tokens; token++) {
+                        for (uint32_t dimension = 0; dimension < 128; dimension++) {
+                            uint32_t sample = sample_value(batch, 1, head, first + token, dimension, kind);
+                            uint64_t element = (((uint64_t)kind * 4 + batch * 2 + head) * tokens + token) * 128 + dimension;
+                            memcpy(wire + 512 + element * 2, &sample, 2);
+                        }
+                    }
+                }
+            }
+        }
+        assert(receive_fragment(buffer, wire, 512, bytes - 512, 9000) == FDM_KV_RECEIVE_ACCEPTED);
+        assert(receive_fragment(buffer, wire, 0, 508, 9000) == FDM_KV_RECEIVE_ACCEPTED);
+        assert(receive_fragment(buffer, wire, 508, 4, 9000) == FDM_KV_RECEIVE_READY);
+        expect_unchanged(function, &params, 8999, FDM_KV_AGGREGATE_WAIT_TIME);
+        unsigned calls = 0;
+        for (;;) {
+            long long result = invoke_aggregate(function, &params, 9000);
+            assert(result == FDM_KV_AGGREGATE_OK || result == FDM_KV_AGGREGATE_PROGRESS);
+            check_aggregate_pages(buffer);
+            assert(++calls < 100);
+            if (result == FDM_KV_AGGREGATE_OK) {
+                break;
+            }
+            assert(buffer->stats.append_commands == packet);
+            assert(!fdm_kv_receive_release(buffer));
+            assert(fdm_kv_receive_check(buffer, 0, 512) == FDM_KV_RECEIVE_BUSY);
+            uint32_t batch = buffer->receive->aggregate_batch;
+            FDMKV_HeadState_t *head = &buffer->head_states[(batch * 2 + 1) * 2];
+            head->readers = 1;
+            expect_unchanged(function, &params, 9000, FDM_KV_AGGREGATE_BUSY);
+            head->readers = 0;
+            if (!packet && calls == 1) {
+                uint32_t free_pages = buffer->free_pages;
+                buffer->free_pages = 0;
+                expect_unchanged(function, &params, 9000, FDM_KV_AGGREGATE_NO_SPACE);
+                buffer->free_pages = free_pages;
+            }
+        }
+        first += tokens;
+        assert(buffer->stats.append_commands == packet + 1);
+        assert(buffer->stats.appended_head_tokens == 4ULL * first);
+        for (uint32_t batch = 0; batch < 2; batch++) {
+            for (uint32_t head = 0; head < 2; head++) {
+                assert(buffer->head_states[(batch * 2 + 1) * 2 + head].accepted == first);
+                assert(buffer->head_states[batch * 4 + head].accepted == 0);
+            }
+        }
+        assert(fdm_kv_receive_release(buffer));
+        assert(!buffer->receive->aggregate_batch && !buffer->receive->aggregate_tokens);
+        assert(!buffer->receive->received_units && !buffer->receive->received_end);
+        g_free(wire);
+    }
+    g_free(data);
+    g_free(meta);
+}
+
 int main(int argc, char **argv)
 {
     test_layout();
@@ -664,6 +888,16 @@ int main(int argc, char **argv)
         AggregateFunction function = (AggregateFunction)dlsym(library, "fdm_kv_aggregate");
         assert(function);
         test_aggregate(function);
+        test_segmented_aggregate(function);
+        test_aggregate_plan_boundaries(function);
+        test_layer_packets(function);
+        profile_function = (FDMKV_ProfileFunction)dlsym(library, "fdm_kv_aggregate_profile_v1");
+        assert(profile_function);
+        test_aggregate(invoke_profiled);
+        test_segmented_aggregate(invoke_profiled);
+        test_aggregate_plan_boundaries(invoke_profiled);
+        test_layer_packets(invoke_profiled);
+        puts("FDM KV aggregate profiling: same layout/error/atomicity checks and additive Host stage accounting PASS");
         assert(dlclose(library) == 0);
         puts("FDM KV aggregate module: multi-head token-K/channel-K/V, group boundaries, domain queues, atomic preflight, virtual-time gate and input release PASS; no device dispatch/NAND/Attention");
     }

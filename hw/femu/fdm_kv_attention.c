@@ -24,6 +24,69 @@ static uint64_t head_index(const FDMKV_Buffer_t *buffer, uint32_t batch,
            buffer->layout.geometry.heads + head;
 }
 
+static bool attention_ready(const FDMKV_Attention_t *attention)
+{
+    FDMKV_Buffer_t *buffer = attention->binding->buffer;
+    for (uint32_t b = 0; b < attention->header.batch_size; b++) {
+        uint32_t batch = attention->rows ? attention->rows[b].slot : attention->batch_first + b;
+        uint32_t valid_tokens = attention->rows ? attention->rows[b].valid_tokens : attention->header.valid_tokens;
+        for (uint32_t head = 0; head < attention->header.num_kv_heads; head++) {
+            FDMKV_HeadState_t *state = &buffer->head_states[head_index(buffer, batch, attention->header.layer, head)];
+            if (state->accepted != valid_tokens || state->readers == UINT32_MAX) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void attention_acquire(FDMKV_Attention_t *attention)
+{
+    FDMKV_Buffer_t *buffer = attention->binding->buffer;
+    for (uint32_t b = 0; b < attention->header.batch_size; b++) {
+        uint32_t batch = attention->rows ? attention->rows[b].slot : attention->batch_first + b;
+        for (uint32_t head = 0; head < attention->header.num_kv_heads; head++) {
+            buffer->head_states[head_index(buffer, batch, attention->header.layer, head)].readers++;
+        }
+    }
+    attention->ready = true;
+}
+
+bool fdm_kv_attention_publish_locked(FDMKV_Binding_t *binding)
+{
+    if (binding->buffer->failed || binding->aggregate_stop) {
+        return false;
+    }
+    bool published = false;
+    GList *entry = binding->waiting_attention;
+    while (entry) {
+        GList *next = entry->next;
+        FDMKV_Attention_t *attention = entry->data;
+        if (attention_ready(attention)) {
+            attention_acquire(attention);
+            published = true;
+            binding->waiting_attention = g_list_delete_link(binding->waiting_attention, entry);
+            backend_cuda_mark_host_dirty(binding->fdm_ns->backend, binding->buffer, binding->buffer->meta_bytes);
+        }
+        entry = next;
+    }
+    return published;
+}
+
+bool fdm_kv_attention_wait(FDMKV_Attention_t *attention)
+{
+    FDMKV_Binding_t *binding = attention->binding;
+    g_mutex_lock(attention_lock(binding));
+    while (!attention->ready && !binding->buffer->failed && !binding->aggregate_stop &&
+           !qatomic_read(&binding->nvm_ns->ctrl->native_stop)) {
+        g_cond_wait(&binding->aggregate_wake, attention_lock(binding));
+    }
+    bool ready = attention->ready && !binding->buffer->failed && !binding->aggregate_stop &&
+                 !qatomic_read(&binding->nvm_ns->ctrl->native_stop);
+    g_mutex_unlock(attention_lock(binding));
+    return ready;
+}
+
 static uint64_t page_key(const FDMKV_Attention_t *attention,
                          const CemuKvCoordinate *coordinate, const CemuKvLocation *location)
 {
@@ -54,7 +117,8 @@ static uint32_t staged_page(const FDMKV_Buffer_t *buffer, uint64_t key)
 
 bool fdm_kv_attention_open(FemuCtrl *ctrl,
     const struct cemu_sparf_fdm_binding *wire,
-    const struct cemu_sparf_workflow_header *header, FDMKV_Attention_t *attention)
+    const struct cemu_sparf_workflow_header *header,
+    const struct cemu_sparf_batch_row *rows, FDMKV_Attention_t *attention)
 {
     if (!wire->nvm_nsid || wire->nvm_nsid > ctrl->num_namespaces) {
         return false;
@@ -77,14 +141,16 @@ bool fdm_kv_attention_open(FemuCtrl *ctrl,
         geometry->head_dim, geometry->max_tokens, geometry->channels_per_page,
         geometry->element_bytes, geometry->page_bytes };
     bool valid = false;
+    GHashTable *slots = rows ? g_hash_table_new(g_direct_hash, g_direct_equal) : NULL;
     g_mutex_lock(attention_lock(binding));
     if (buffer->failed || qatomic_read(&ctrl->native_stop) ||
         (buffer->draining && !buffer->sealed) || buffer->leases == UINT32_MAX ||
         (binding->pending_write && buffer->receive->header.operation == FDM_KV_OP_DRAIN) ||
         wire->session_id != buffer->identity.session_id ||
         wire->generation != buffer->identity.generation ||
-        wire->batch_first >= geometry->batches || !header->batch_size ||
-        header->batch_size > geometry->batches - wire->batch_first ||
+        !header->batch_size || header->batch_size > geometry->batches ||
+        (!rows && (wire->batch_first >= geometry->batches ||
+                   header->batch_size > geometry->batches - wire->batch_first)) ||
         header->layer >= geometry->layers || header->head_dim != geometry->head_dim ||
         header->num_kv_heads != geometry->heads || header->max_seq_len > geometry->max_tokens ||
         !header->valid_tokens || header->valid_tokens > header->max_seq_len ||
@@ -92,29 +158,48 @@ bool fdm_kv_attention_open(FemuCtrl *ctrl,
         !cemu_kv_layout_init(&attention->layout, &converted)) {
         goto done;
     }
-    for (uint32_t batch = wire->batch_first; batch < wire->batch_first + header->batch_size; batch++) {
+    for (uint32_t b = 0; b < header->batch_size; b++) {
+        uint32_t batch = rows ? rows[b].slot : wire->batch_first + b;
+        uint32_t valid_tokens = rows ? rows[b].valid_tokens : header->valid_tokens;
+        if (batch >= geometry->batches) goto done;
+        if (slots && !g_hash_table_add(slots, GUINT_TO_POINTER(batch))) goto done;
         for (uint32_t head = 0; head < geometry->heads; head++) {
             FDMKV_HeadState_t *state = &buffer->head_states[head_index(buffer, batch, header->layer, head)];
-            if (state->accepted != header->valid_tokens || state->readers == UINT32_MAX) {
+            if (state->accepted > valid_tokens || state->readers == UINT32_MAX) {
                 goto done;
+            }
+            if (state->accepted < valid_tokens) {
+                const FDMKV_AppendHeader_t *packet = &buffer->receive->header;
+                uint32_t batches = packet->version == CEMU_FDM_KV_LAYER_PACKET_VERSION ? packet->batch_count : 1;
+                if (!binding->aggregate_active || !buffer->receive->header_valid ||
+                    packet->operation != FDM_KV_OP_APPEND || packet->layer != header->layer ||
+                    batch < packet->batch || batch - packet->batch >= batches ||
+                    head < packet->head_first || head - packet->head_first >= packet->head_count ||
+                    state->accepted < packet->token_first ||
+                    packet->token_first + packet->token_count != valid_tokens) {
+                    goto done;
+                }
             }
         }
     }
-    for (uint32_t batch = wire->batch_first; batch < wire->batch_first + header->batch_size; batch++) {
-        for (uint32_t head = 0; head < geometry->heads; head++) {
-            buffer->head_states[head_index(buffer, batch, header->layer, head)].readers++;
-        }
-    }
+    if (rows) attention->rows = g_memdup2(rows, header->batch_size * sizeof(*rows));
     buffer->leases++;
     attention->binding = binding;
+    attention->ready = false;
     attention->batch_first = wire->batch_first;
     attention->identity = (CemuKvIdentity){ ctrl->drive_id, wire->nvm_nsid,
                                             wire->session_id, wire->generation };
     attention->header = *header;
+    if (attention_ready(attention)) {
+        attention_acquire(attention);
+    } else {
+        binding->waiting_attention = g_list_prepend(binding->waiting_attention, attention);
+    }
     backend_cuda_mark_host_dirty(binding->fdm_ns->backend, buffer, buffer->meta_bytes);
     valid = true;
 done:
     g_mutex_unlock(attention_lock(binding));
+    if (slots) g_hash_table_destroy(slots);
     return valid;
 }
 
@@ -128,12 +213,13 @@ static void full_scan(FDMKV_Attention_t *attention, uint32_t kind,
     observation->full_scan_valid = true;
     observation->page_bytes = layout->geometry.page_bytes;
     for (uint32_t batch = 0; batch < header->batch_size; batch++) {
+        struct cemu_sparf_batch_row r = cemu_sparf_row(header, attention->rows, batch);
         for (uint32_t head = 0; head < header->num_kv_heads; head++) {
-            for (uint32_t token = 0; token < header->valid_tokens; token += capacity) {
-                uint64_t bytes = (uint64_t)MIN(capacity, header->valid_tokens - token) *
+            for (uint32_t token = 0; token < r.valid_tokens; token += capacity) {
+                uint64_t bytes = (uint64_t)MIN(capacity, r.valid_tokens - token) *
                     layout->geometry.head_dim * layout->geometry.element_bytes / stripes;
                 for (uint32_t stripe = 0; stripe < stripes; stripe++) {
-                    CemuKvCoordinate coordinate = { attention->batch_first + batch, header->layer,
+                    CemuKvCoordinate coordinate = { attention->rows ? r.slot : attention->batch_first + batch, header->layer,
                         head, kind, token, stripe * layout->geometry.channels_per_page };
                     CemuKvLocation location;
                     bool resolved = cemu_kv_resolve(layout, &attention->identity, &coordinate, &location);
@@ -184,23 +270,27 @@ bool fdm_kv_attention_read(void *opaque,
     FDMKV_Buffer_t *buffer = binding->buffer;
     uint32_t element = attention->layout.geometry.element_bytes;
     uint32_t row = header->head_dim * element;
-    uint32_t ranks = kind == FDM_KV_CHANNEL_K ? header->top_r : header->top_k;
     uint64_t vectors = (uint64_t)header->batch_size * header->num_query_heads;
-    uint64_t required = kind == FDM_KV_CHANNEL_K ? vectors * ranks * header->valid_tokens * element :
-        vectors * (ranks + (kind == FDM_KV_TOKEN_V)) * row;
+    uint64_t history = cemu_sparf_history_count(header, attention->rows);
+    uint64_t selected = cemu_sparf_selected_count(header, attention->rows);
+    uint64_t required = kind == FDM_KV_CHANNEL_K ? history * header->top_r * element :
+        (selected + (kind == FDM_KV_TOKEN_V ? vectors : 0)) * row;
     uint32_t capacity = kind == FDM_KV_CHANNEL_K ? attention->layout.channel_group_tokens :
                                                  attention->layout.token_group_tokens;
-    uint64_t pieces = vectors * ranks * (kind == FDM_KV_CHANNEL_K ?
-        DIV_ROUND_UP(header->valid_tokens, capacity) : 1);
-    if (required != bytes || required > 64 * MiB || !pieces ||
-        pieces > (64 * MiB) / sizeof(*fragments)) {
-        return false;
-    }
-    for (uint64_t index = 0; index < vectors * ranks; index++) {
-        if (indices[index] >= (kind == FDM_KV_CHANNEL_K ? header->head_dim : header->valid_tokens)) {
-            return false;
+    uint64_t pieces = 0;
+    for (uint32_t b = 0; b < header->batch_size; ++b) {
+        struct cemu_sparf_batch_row r = cemu_sparf_row(header, attention->rows, b);
+        uint32_t ranks = kind == FDM_KV_CHANNEL_K ? header->top_r : r.top_k;
+        uint64_t base = kind == FDM_KV_CHANNEL_K ? (uint64_t)b * header->num_query_heads * ranks :
+            (uint64_t)r.selected_offset * header->num_query_heads;
+        pieces += (uint64_t)header->num_query_heads * ranks *
+            (kind == FDM_KV_CHANNEL_K ? DIV_ROUND_UP(r.valid_tokens, capacity) : 1);
+        for (uint64_t i = 0; i < (uint64_t)header->num_query_heads * ranks; ++i) {
+            if (indices[base + i] >= (kind == FDM_KV_CHANNEL_K ? header->head_dim : r.valid_tokens)) return false;
         }
     }
+    if (required != bytes || required > 64 * MiB || !pieces ||
+        pieces > (64 * MiB) / sizeof(*fragments)) return false;
     fragments = g_try_new(FDMKV_ReadFragment_t, pieces);
     scratch = g_try_malloc((uint64_t)buffer->batch_pages * attention->layout.geometry.page_bytes);
     pages = g_try_new(CemuKvDevicePage, buffer->batch_pages);
@@ -209,22 +299,27 @@ bool fdm_kv_attention_read(void *opaque,
         goto done;
     }
     g_mutex_lock(attention_lock(binding));
-    if (buffer->failed || qatomic_read(&binding->nvm_ns->ctrl->native_stop)) {
+    if (!attention->ready || buffer->failed || qatomic_read(&binding->nvm_ns->ctrl->native_stop)) {
         result->status = CEMU_KV_IO_FAILED;
         g_mutex_unlock(attention_lock(binding));
         goto done;
     }
     if (observation) {
         full_scan(attention, kind, observation);
-        observation->logical_spans = vectors * ranks;
+        observation->logical_spans = kind == FDM_KV_CHANNEL_K ? vectors * header->top_r : selected;
     }
     for (uint64_t vector = 0; vector < vectors; vector++) {
+        uint32_t b = vector / header->num_query_heads, h = vector % header->num_query_heads;
+        struct cemu_sparf_batch_row r = cemu_sparf_row(header, attention->rows, b);
+        uint32_t ranks = kind == FDM_KV_CHANNEL_K ? header->top_r : r.top_k;
+        uint64_t index_base = kind == FDM_KV_CHANNEL_K ? vector * ranks :
+            (uint64_t)r.selected_offset * header->num_query_heads + h * ranks;
         for (uint32_t rank = 0; rank < ranks; rank++) {
-            CemuKvCoordinate coordinate = { attention->batch_first + vector / header->num_query_heads,
+            CemuKvCoordinate coordinate = { attention->rows ? r.slot : attention->batch_first + b,
                 header->layer, (vector % header->num_query_heads) / (header->num_query_heads / header->num_kv_heads),
-                kind, kind == FDM_KV_CHANNEL_K ? 0 : indices[vector * ranks + rank],
-                kind == FDM_KV_CHANNEL_K ? indices[vector * ranks + rank] : 0 };
-            uint32_t remaining = kind == FDM_KV_CHANNEL_K ? header->valid_tokens : 1;
+                kind, kind == FDM_KV_CHANNEL_K ? 0 : indices[index_base + rank],
+                kind == FDM_KV_CHANNEL_K ? indices[index_base + rank] : 0 };
+            uint32_t remaining = kind == FDM_KV_CHANNEL_K ? r.valid_tokens : 1;
             while (remaining) {
                 CemuKvLocation location;
                 bool resolved = cemu_kv_resolve(&attention->layout, &attention->identity, &coordinate, &location);
@@ -234,8 +329,8 @@ bool fdm_kv_attention_read(void *opaque,
                 uint64_t key = page_key(attention, &coordinate, &location);
                 uint32_t staged = staged_page(buffer, key);
                 if (staged) {
-                    memcpy((uint8_t *)output + cursor, buffer->staged_data +
-                        (uint64_t)(staged - 1) * attention->layout.geometry.page_bytes + location.byte_offset, copied);
+                    memcpy((uint8_t *)output + cursor,
+                        fdm_kv_page_data(buffer, staged) + location.byte_offset, copied);
                     result->tail_bytes += copied;
                     if (observation) {
                         observation->tail_copies++;
@@ -248,6 +343,7 @@ bool fdm_kv_attention_read(void *opaque,
                 remaining -= tokens;
             }
         }
+        if (kind == FDM_KV_TOKEN_V) cursor += row;
     }
     g_mutex_unlock(attention_lock(binding));
     if (observation) {
@@ -293,14 +389,7 @@ bool fdm_kv_attention_read(void *opaque,
         }
         first = next;
     }
-    if (kind == FDM_KV_TOKEN_V) {
-        for (uint64_t vector = vectors; vector-- > 0;) {
-            memmove((uint8_t *)output + vector * (ranks + 1) * row,
-                    (uint8_t *)output + vector * ranks * row, ranks * row);
-            memset((uint8_t *)output + (vector * (ranks + 1) + ranks) * row, 0, row);
-        }
-    }
-    result->output_bytes = cursor;
+    result->output_bytes = cursor - (kind == FDM_KV_TOKEN_V ? vectors * row : 0);
     result->status = CEMU_KV_OK;
     success = true;
 done:
@@ -323,16 +412,24 @@ void fdm_kv_attention_close(void *opaque)
     FDMKV_Binding_t *binding = attention->binding;
     FDMKV_Buffer_t *buffer = binding->buffer;
     g_mutex_lock(attention_lock(binding));
-    for (uint32_t batch = attention->batch_first; batch < attention->batch_first + attention->header.batch_size; batch++) {
-        for (uint32_t head = 0; head < attention->header.num_kv_heads; head++) {
-            FDMKV_HeadState_t *state = &buffer->head_states[head_index(buffer, batch, attention->header.layer, head)];
-            g_assert(state->readers);
-            state->readers--;
+    if (attention->ready) {
+        for (uint32_t b = 0; b < attention->header.batch_size; b++) {
+            uint32_t batch = attention->rows ? attention->rows[b].slot : attention->batch_first + b;
+            for (uint32_t head = 0; head < attention->header.num_kv_heads; head++) {
+                FDMKV_HeadState_t *state = &buffer->head_states[head_index(buffer, batch, attention->header.layer, head)];
+                g_assert(state->readers);
+                state->readers--;
+            }
         }
+    } else {
+        binding->waiting_attention = g_list_remove(binding->waiting_attention, attention);
     }
     g_assert(buffer->leases);
     buffer->leases--;
     backend_cuda_mark_host_dirty(binding->fdm_ns->backend, buffer, buffer->meta_bytes);
+    g_clear_pointer(&attention->rows, g_free);
     attention->binding = NULL;
+    attention->ready = false;
+    fdm_kv_async_notify_locked(binding);
     g_mutex_unlock(attention_lock(binding));
 }

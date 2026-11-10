@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
+from phase_profiler import profile_client_call, profile_scope, stack_profiler
 
 try:
     from _cemu_client import CemuClient, MemoryRange, ProgramTarget
@@ -44,6 +45,8 @@ class CemuDevice:
         runtime_scale_tenths: int = 0,
         indirect: bool = False,
         replace_existing: bool = False,
+        profiler=None,
+        profile_range_names=None,
     ):
         if not program_name:
             raise ValueError("program name is required")
@@ -76,6 +79,8 @@ class CemuDevice:
         self.runtime_scale_tenths = runtime_scale_tenths
         self.indirect = indirect
         self.replace_existing = replace_existing
+        self.profiler = profiler
+        self.profile_range_names = dict(profile_range_names or {})
         self._client: Optional[CemuClient] = None
 
     @property
@@ -135,7 +140,9 @@ class CemuDevice:
         spec = self._range_spec(range_index)
         array = self._to_numpy(value)
         self._validate_transfer(spec, array.nbytes, range_offset)
-        self._require_client().write_range(range_index, array, range_offset)
+        name = "attention." + self.profile_range_names.get(range_index, f"mr{range_index}") + ".write"
+        profile_client_call(self.profiler, name, self._require_client().write_range,
+                            range_index, array, range_offset)
 
     def read_tensor(
         self,
@@ -151,8 +158,22 @@ class CemuDevice:
         size = element_count * normalized_dtype.itemsize
         self._validate_transfer(spec, size, range_offset)
 
-        raw = self._require_client().read_range(range_index, size, range_offset)
-        return np.asarray(raw).view(normalized_dtype).reshape(normalized_shape).copy()
+        name = "attention." + self.profile_range_names.get(range_index, f"mr{range_index}") + ".read"
+        raw = profile_client_call(self.profiler, name, self._require_client().read_range,
+                                  range_index, size, range_offset)
+        with profile_scope(stack_profiler(self.profiler), name + ".unpack_wall", size):
+            return np.asarray(raw).view(normalized_dtype).reshape(normalized_shape).copy()
+
+    def read_tensor_into(self, range_index: int, output: np.ndarray,
+                         range_offset: int = 0) -> np.ndarray:
+        if (not isinstance(output, np.ndarray) or not output.flags.c_contiguous or
+                not output.flags.writeable or output.dtype.hasobject):
+            raise ValueError("output must be a writable C-contiguous numeric array")
+        self._validate_transfer(self._range_spec(range_index), output.nbytes, range_offset)
+        name = "attention." + self.profile_range_names.get(range_index, f"mr{range_index}") + ".read"
+        profile_client_call(self.profiler, name, self._require_client().read_range_into,
+                            range_index, output, range_offset)
+        return output
 
     def execute(
         self,
@@ -168,7 +189,7 @@ class CemuDevice:
         ):
             metadata = self._to_numpy(metadata)
 
-        return self._require_client().execute(
+        return profile_client_call(self.profiler, "attention.execute", self._require_client().execute,
             cparam1,
             cparam2,
             group,

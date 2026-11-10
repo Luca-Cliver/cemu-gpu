@@ -75,6 +75,7 @@ enum MemoryType {
 typedef struct MemoryNamespace {
     enum MemoryType type;
     struct FDMKV_Binding *fdm_kv_binding;
+    GRWLock fdm_kv_binding_lock;
     GMutex fdm_kv_lock;
 } MemoryNamespace;
 

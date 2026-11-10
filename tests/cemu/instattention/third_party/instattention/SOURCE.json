@@ -1,0 +1,87 @@
+{
+  "repository": "https://github.com/ChaseLab-PKU/InstAttention",
+  "commit": "3b2d4b27fbba2bf700dfffc672db6609f2efb91b",
+  "source_directory": "flexgen",
+  "files": [
+    {
+      "path": "flexgen/__init__.py",
+      "git_blob": "8b137891791fe96927ad78e64b0aad7bded08bdc"
+    },
+    {
+      "path": "flexgen/compression.py",
+      "git_blob": "37350b9ea586e897f321b9864343d0d55dd81741"
+    },
+    {
+      "path": "flexgen/dist_flex_opt.py",
+      "git_blob": "593bb78f97b86708b2b3bc65eafca5b1b99ebd19"
+    },
+    {
+      "path": "flexgen/dist_utils.py",
+      "git_blob": "df83d0ac73a1db51d4671e30772c2f836ff66701"
+    },
+    {
+      "path": "flexgen/flex_llama.py",
+      "git_blob": "c9b857bc15eaa4bbab9e9e23d7b370e820fbfdff"
+    },
+    {
+      "path": "flexgen/flex_opt.py",
+      "git_blob": "cc33c009b59115829a37cca58ff644fa7b05d2e2"
+    },
+    {
+      "path": "flexgen/llama_config.py",
+      "git_blob": "d39c2ac21784bba817e58761d54dcd9462f8790f"
+    },
+    {
+      "path": "flexgen/opt_config.py",
+      "git_blob": "ef33a0d0dca50e67443834c792da72e40d2dfbf5"
+    },
+    {
+      "path": "flexgen/profile_bandwidth.py",
+      "git_blob": "4964d74343f523cf4cbb9bc69c086f9c5cc06c07"
+    },
+    {
+      "path": "flexgen/profile_matmul.py",
+      "git_blob": "59772e713cf55ef11b65b6f39f87d32e365798ae"
+    },
+    {
+      "path": "flexgen/pytorch_backend.py",
+      "git_blob": "4a1498f7d5dd8183edf32f4f142fcf600c24c408"
+    },
+    {
+      "path": "flexgen/test_convert_llama.py",
+      "git_blob": "8e48e97da51945cb90f846399f0490e04267e48a"
+    },
+    {
+      "path": "flexgen/timer.py",
+      "git_blob": "c5846977885823be2dc1036f2fd46faecac08f5d"
+    },
+    {
+      "path": "flexgen/utils.py",
+      "git_blob": "7e62c9bbc2f2c6f50ee2130aee74bbd4409f1b88"
+    }
+  ],
+  "normalization": {
+    "final_newline_added": [
+      "flexgen/test_convert_llama.py"
+    ]
+  },
+  "import_notes": [
+    "Imported from the committed snapshot, excluding working-tree changes, __pycache__, and generated files.",
+    "Original source inventory; CEMU integration patches are listed separately below.",
+    "Keep source blob IDs unchanged as provenance when applying integration patches to this copy."
+  ],
+  "license_inventory": "The source snapshot has no license file at its root or under flexgen. The separate ssd-gpu-dma/LICENSE was not copied or treated as a framework license.",
+  "integration_patches": {
+    "flexgen/flex_opt.py": [
+      "Optional Attention factory; original normal/single-batch/multi-batch generation loops retained.",
+      "Select separate OPT-compatible backend; Llama methods left unchanged.",
+      "Use configured FFN size; lazy tokenizer import; CPU-capable stream setup for numerical regression.",
+      "Idempotent weight cleanup including partial initialization failures.",
+      "Per-module weight initialization begin/done records via the optional flexgen.weights logger; no extra CUDA synchronization or generation-loop changes."
+    ],
+    "flexgen/opt_backend.py": [
+      "New OPT pre-LN/ReLU attention, MLP and output methods matching the OPT framework call signatures.",
+      "Production Decode is supplied by the CEMU Attention adapter, not this dense reference Decode."
+    ]
+  }
+}

@@ -22,6 +22,7 @@
 #include "param.h"
 #include "hw/femu/read_observation.h"
 #include "hw/femu/kv_page.h"
+#include "hw/femu/fdm_io_trace.h"
 
 struct ComputeJob;
 
@@ -911,6 +912,7 @@ typedef struct NvmeRequest {
     void                    (*internal_complete)(struct NvmeRequest *, bool cancelled);
     void                    *internal_owner;
     bool                    fdm_kv_pending;
+    FdmIoTrace              fdm_io_trace;
     struct NvmeSQueue       *sq;
     struct NvmeCQueue       *cq;
     struct NvmeNamespace    *ns;
@@ -972,6 +974,7 @@ typedef struct DMAOff {
 
 typedef struct NvmeSQueue {
     struct FemuCtrl *ctrl;
+    uint64_t    fdm_input_wait_started;
     uint8_t     phys_contig;
     uint8_t     arb_burst;
     uint16_t    sqid;
