@@ -37,6 +37,17 @@ case "$expected_profile" in
     *) echo 'Unsupported CEMU_FLEXGEN_DEVICE_PROFILE.' >&2; exit 1 ;;
 esac
 maximum=$((1024 + CEMU_FLEXGEN_DECODE_STEPS))
+export CEMU_FLEXGEN_FDM_INPUT_SLOTS=${CEMU_FLEXGEN_FDM_INPUT_SLOTS:-0}
+case "$CEMU_FLEXGEN_FDM_INPUT_SLOTS" in
+    0|1|2) ;;
+    *) echo 'CEMU_FLEXGEN_FDM_INPUT_SLOTS must be 0, 1 or 2.' >&2; exit 1 ;;
+esac
+export CEMU_FLEXGEN_FDM_INPUT_BYTES=$((512 + 2 * CEMU_FLEXGEN_MICROBATCH_SIZE * 40 * maximum * 128 * 2))
+extra_input_bytes=0
+if [[ "$CEMU_FLEXGEN_FDM_INPUT_SLOTS" == 2 ]]; then
+    extra_input_bytes=$(((CEMU_FLEXGEN_FDM_INPUT_BYTES + 4095) / 4096 * 4096))
+fi
+export CEMU_FLEXGEN_FDM_DATA_BYTES=$((8589934592 + extra_input_bytes))
 stack_trace=${CEMU_FLEXGEN_STACK_TRACE:-0}
 case "$stack_trace" in
     0|1) ;;
@@ -58,6 +69,15 @@ settings=/root/cemu-logs/launch-settings.txt
 for setting in "profile=$expected_profile" csd_target=cuda native_kv_placement=balanced read_diagnostics=1; do
     grep -qxF "$setting" "$settings" || { echo "Wrong VM settings: $setting required" >&2; exit 1; }
 done
+if [[ "$CEMU_FLEXGEN_FDM_INPUT_SLOTS" != 0 ]]; then
+    for setting in fdm_async_aggregate=1 fdm_aggregate_mode=poll; do
+        grep -qxF "$setting" "$settings" || { echo "Tagged input requires $setting; restart the VM." >&2; exit 1; }
+    done
+    mountpoint -q /sys/kernel/tracing || mount -t tracefs tracefs /sys/kernel/tracing
+    grep -q 'field:.*transfer_id' /sys/kernel/tracing/events/nvme/nvme_cemu_io/format || {
+        echo 'Tagged input requires the rebuilt Guest kernel.' >&2; exit 1;
+    }
+fi
 if [[ -n $(find /mnt/fdm0 -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     echo 'FDM is not empty. Finish the previous job and drain/close it; this script will not delete files.' >&2
     exit 1
@@ -110,7 +130,7 @@ finally:
     transport.close()
 assert torch.cuda.is_available(), "Guest CUDA unavailable"
 space = os.statvfs('/mnt/fdm0')
-required = 8 * 1024**3 + 128 * 1024**2 + grouped_attention_reserve_bytes(
+required = int(os.environ['CEMU_FLEXGEN_FDM_DATA_BYTES']) + 128 * 1024**2 + grouped_attention_reserve_bytes(
     attention_slots=2, batch_size=int(os.environ['CEMU_FLEXGEN_MICROBATCH_SIZE']), query_heads=40, kv_heads=40,
     head_dim=128, element_bytes=2, max_seq_len=1024 + int(os.environ['CEMU_FLEXGEN_DECODE_STEPS']),
     top_r=16, compression_ratio=8)
@@ -140,6 +160,9 @@ printf 'batch=%s\nmicrobatch=%s\nmicrobatches=%s\nprompt=1024\ndecode_steps=%s\n
     "$CEMU_FLEXGEN_DECODE_STEPS" "$((CEMU_FLEXGEN_DECODE_STEPS + 1))" \
     > "$run/workload-settings.txt"
 printf 'stack_trace=%s\n' "$stack_trace" >> "$run/workload-settings.txt"
+printf 'fdm_input_slots=%s\nfdm_input_bytes=%s\nfdm_data_bytes=%s\n' \
+    "$CEMU_FLEXGEN_FDM_INPUT_SLOTS" "$CEMU_FLEXGEN_FDM_INPUT_BYTES" \
+    "$CEMU_FLEXGEN_FDM_DATA_BYTES" >> "$run/workload-settings.txt"
 cp -- instattention/experiments/configs/opt13b_sparf_1csd.json "$run/runtime.json"
 ratio=${1:-}
 if [[ -n "$ratio" ]]; then
@@ -177,7 +200,8 @@ fi
     --model-dir /root/models/OPT-13B --weights-dir /root/models/flexgen-weights \
     --storage fdm --batch-size "$CEMU_FLEXGEN_BATCH_SIZE" --gpu-batch-size "$CEMU_FLEXGEN_MICROBATCH_SIZE" \
     --prompt-length 1024 --decode-steps "$CEMU_FLEXGEN_DECODE_STEPS" --attention-slots 2 \
-    --fdm-meta-bytes 134217728 --fdm-data-bytes 8589934592 \
+    --fdm-meta-bytes 134217728 --fdm-data-bytes "$CEMU_FLEXGEN_FDM_DATA_BYTES" \
+    --fdm-input-slots "$CEMU_FLEXGEN_FDM_INPUT_SLOTS" --fdm-input-bytes "$CEMU_FLEXGEN_FDM_INPUT_BYTES" \
     --csd-target cuda --program "$program" --aggregate-program "$aggregate" \
     --runtime-config "$run/runtime.json" --softmax-ratio-file "$run/softmax.json" \
     --profile-stack --profile-output "$run/profile.csv" --result-output "$run/result.json" \
@@ -232,6 +256,9 @@ maximum = 1024 + steps
 requests = 40 * steps * (batch // microbatch)
 assert result['arguments']['batch_size'] == batch
 assert result['arguments']['gpu_batch_size'] == microbatch
+assert result['arguments']['fdm_input_slots'] == int(os.environ['CEMU_FLEXGEN_FDM_INPUT_SLOTS'])
+assert result['arguments']['fdm_input_bytes'] == int(os.environ['CEMU_FLEXGEN_FDM_INPUT_BYTES'])
+assert result['arguments']['fdm_data_bytes'] == int(os.environ['CEMU_FLEXGEN_FDM_DATA_BYTES'])
 pages_per_head = 2 * ((maximum + 15) // 16) + 16 * ((maximum + 255) // 256)
 assert result['attention_submissions'] == requests
 assert len(result['tokens']) == batch and all(len(tokens) == steps + 1 for tokens in result['tokens'])

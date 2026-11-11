@@ -46,6 +46,10 @@ def arguments():
     parser.add_argument("--native-budget", type=int, default=6 * 1024**3)
     parser.add_argument("--fdm-meta-bytes", type=int, default=64 * 1024**2)
     parser.add_argument("--fdm-data-bytes", type=int, default=3968 * 1024**2)
+    parser.add_argument("--fdm-input-slots", type=int, choices=(0, 1, 2), default=0,
+                        help="0: legacy input; 1/2: tagged synchronous input slots")
+    parser.add_argument("--fdm-input-bytes", type=int, default=None,
+                        help="capacity of each KV input slot; default fits a whole-layer packet")
     parser.add_argument("--channels-per-page", type=int, default=8)
     parser.add_argument("--write-batch-pages", type=int, default=256)
     parser.add_argument("--attention-slots", type=int, default=2)
@@ -56,7 +60,10 @@ def arguments():
     parser.add_argument("--profile-output", required=True)
     parser.add_argument("--profile-stack", action="store_true", help="detailed Guest scheduling, packing and client IO intervals; not pure CPU time")
     parser.add_argument("--result-output", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.storage != "fdm" and (args.fdm_input_slots or args.fdm_input_bytes is not None):
+        parser.error("FDM input slot options require --storage fdm")
+    return args
 
 
 def open_backends(stack, args, config, directory, runtime, profiler):
@@ -76,10 +83,12 @@ def open_backends(stack, args, config, directory, runtime, profiler):
         control_path=args.control, namespace_path=args.namespace, batch_pages=args.write_batch_pages)
     if args.storage == "fdm":
         store = FDM_KVbuffer(**common, fdm_directory=directory, meta_bytes=args.fdm_meta_bytes,
-            data_bytes=args.fdm_data_bytes, aggregate_program=args.aggregate_program, profiler=profiler)
+            data_bytes=args.fdm_data_bytes, aggregate_program=args.aggregate_program, profiler=profiler,
+            input_slots=args.fdm_input_slots, input_bytes=args.fdm_input_bytes)
         print(f"[flexgen-cemu] FDM layer packets: input_bytes={store.input_bytes}, "
-              f"batch_count={args.gpu_batch_size}; one write per layer/microbatch, "
-              "completion after aggregation", flush=True)
+              f"input_slots={store.input_slots}, data_bytes={store.data_bytes}, "
+              f"batch_count={args.gpu_batch_size}; one write per layer/microbatch; "
+              "completion policy follows device binding", flush=True)
     else:
         store = NativeKvStore(**common, device_path=args.native_device, budget=args.native_budget)
     stack.enter_context(store)

@@ -40,15 +40,18 @@ static bool valid_buffer(const struct cemu_args *args, const FDMKV_Buffer_t *buf
                            CEMU_FDM_KV_KIND_COUNT * buffer->nand_channels ||
         !buffer->hash_size || (buffer->hash_size & (buffer->hash_size - 1)) ||
         !buffer->writeback_capacity || buffer->writeback_capacity > buffer->pool_pages ||
-        buffer->input != args->mr_addr[1] || buffer->input_bytes % 512 ||
+        buffer->input_slots > CEMU_FDM_KV_MAX_INPUT_SLOTS ||
+        buffer->active_slot >= (buffer->input_slots ? buffer->input_slots : 1) ||
+        buffer->input_bytes % 512 ||
         buffer->input_bytes < 512 + 2ULL * buffer->row_bytes ||
-        buffer->input_bytes > (uint64_t)args->mr_len[1]) {
+        buffer->input_bytes > (uint64_t)args->mr_len[1] /
+                              (buffer->input_slots ? buffer->input_slots : 1)) {
         return false;
     }
-    if (!arena_region(meta, buffer->meta_bytes, &used, buffer->receive, 1, sizeof(*buffer->receive))) {
+    const FDMKV_ReceiveState_t *receive = (const void *)(meta + sizeof(*buffer));
+    if (!arena_region(meta, buffer->meta_bytes, &used, receive, 1, sizeof(*receive))) {
         return false;
     }
-    const FDMKV_ReceiveState_t *receive = buffer->receive;
     uint64_t units = buffer->input_bytes / CEMU_FDM_KV_RECEIVE_UNIT_BYTES;
     if (receive->bitmap_bytes != units / 8 + (units % 8 != 0) ||
         !arena_region(meta, buffer->meta_bytes, &used, receive->received_bitmap, receive->bitmap_bytes, 1) ||
@@ -60,12 +63,48 @@ static bool valid_buffer(const struct cemu_args *args, const FDMKV_Buffer_t *buf
         !arena_region(meta, buffer->meta_bytes, &used, buffer->segments, buffer->segment_count, sizeof(*buffer->segments))) {
         return false;
     }
-    uint64_t padding = (layout.geometry.page_bytes - buffer->input_bytes % layout.geometry.page_bytes) %
-                       layout.geometry.page_bytes;
-    if (padding > (uint64_t)args->mr_len[1] - buffer->input_bytes) {
+    if (buffer->input_slots) {
+        if (!arena_region(meta, buffer->meta_bytes, &used, buffer->slots,
+                          buffer->input_slots, sizeof(*buffer->slots)) ||
+            !arena_region(meta, buffer->meta_bytes, &used, buffer->received_heads,
+                          layout.head_count, sizeof(*buffer->received_heads))) {
+            return false;
+        }
+        for (uint32_t index = 0; index < buffer->input_slots; index++) {
+            const FDMKV_InputSlot_t *slot = &buffer->slots[index];
+            if ((uintptr_t)slot->input != data + index * buffer->input_bytes) {
+                return false;
+            }
+            if (!index) {
+                if (slot->receive != receive) {
+                    return false;
+                }
+            } else if (!arena_region(meta, buffer->meta_bytes, &used, slot->receive,
+                                     1, sizeof(*slot->receive)) ||
+                       slot->receive->bitmap_bytes != receive->bitmap_bytes ||
+                       !arena_region(meta, buffer->meta_bytes, &used,
+                                     slot->receive->received_bitmap, receive->bitmap_bytes, 1)) {
+                return false;
+            }
+        }
+        const FDMKV_InputSlot_t *active = &buffer->slots[buffer->active_slot];
+        if (active->state != FDM_KV_SLOT_CONSUMING || active->dma_active ||
+            buffer->receive != active->receive || buffer->input != active->input ||
+            active->receive->header.request_id != buffer->next_aggregate_id) {
+            return false;
+        }
+    } else if (buffer->slots || buffer->received_heads || buffer->next_receive_id ||
+               buffer->next_aggregate_id || buffer->last_transfer_id ||
+               buffer->receive != receive || buffer->input != args->mr_addr[1]) {
         return false;
     }
-    uint64_t offset = buffer->input_bytes + padding;
+    uint64_t input_pool_bytes = buffer->input_bytes * (buffer->input_slots ? buffer->input_slots : 1);
+    uint64_t padding = (layout.geometry.page_bytes - input_pool_bytes % layout.geometry.page_bytes) %
+                       layout.geometry.page_bytes;
+    if (padding > (uint64_t)args->mr_len[1] - input_pool_bytes) {
+        return false;
+    }
+    uint64_t offset = input_pool_bytes + padding;
     uint64_t pages = 0, total_bytes = 0;
     for (uint32_t index = 0; index < buffer->segment_count; index++) {
         const FDMKV_DataSegment_t *segment = &buffer->segments[index];
@@ -572,4 +611,29 @@ long long fdm_kv_aggregate_profile_v1(void *args, FDMKV_AggregateProfile *profil
     long long result = aggregate_impl(args, &timer);
     profile_stage(&timer, FDM_KV_AGG_STAGE_commit);
     return result;
+}
+
+static long long service_aggregate(void *args, FDMKV_AggregateProfile *profile,
+                                   FDMKV_ProfileClock now_ns)
+{
+    return profile ? fdm_kv_aggregate_profile_v1(args, profile, now_ns) :
+                     aggregate_impl(args, NULL);
+}
+
+int fdm_kv_aggregate_service_v1(const FDMKV_ServiceRuntime *runtime)
+{
+    if (!runtime || runtime->version != CEMU_FDM_KV_SERVICE_VERSION ||
+        runtime->bytes != sizeof(*runtime) || !runtime->step || !runtime->relax) {
+        return -1;
+    }
+    for (;;) {
+        FDMKV_ServiceResult result = runtime->step(runtime->opaque, service_aggregate);
+        if (result == FDM_KV_SERVICE_STOP) {
+            return 0;
+        }
+        if (result != FDM_KV_SERVICE_IDLE && result != FDM_KV_SERVICE_PROGRESS) {
+            return -1;
+        }
+        runtime->relax(runtime->opaque, result);
+    }
 }

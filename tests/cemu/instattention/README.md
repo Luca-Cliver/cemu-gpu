@@ -1160,6 +1160,46 @@ KV包数、写入字节数仍按总B4校验。`concurrency.json`保存设备实�
 `result.json`另存 `prefill_seconds` 和 `decode_step_seconds`，用于区分首步衔接等待。
 统计中的模型阶段累计时间可能重叠，不可当作整轮墙钟时间或直接与Guest耗时相减。
 
+### 同步双 input 槽全流程验收
+
+Guest 双槽 smoke 通过后，可在 FlexGen 完整测试中显式设置
+`CEMU_FLEXGEN_FDM_INPUT_SLOTS=2`；默认 0 保留旧协议，1 表示 tagged 单槽。
+这不是 Attention 的 `--attention-slots`，也不是 io_uring 模式。
+当前先接 FlexGen；vLLM 测试入口尚未接此开关。
+
+先正常关闭 smoke VM，再在 Host 启动完整配置：
+
+```bash
+cd /home/lihan/cemu
+make -C linux-cemu -j4 vmlinux
+make -C CEMU/build -j4
+make -C CEMU/tests/cemu/kernel ../build/fdm_kv_aggregate.so ../build/sparf_attention_devptr.so
+sudo env CEMU_NATIVE_KERNEL=/home/lihan/cemu/linux-cemu/vmlinux \
+  CEMU_FDM_ASYNC_AGGREGATE=1 CEMU_FDM_AGGREGATE_MODE=poll \
+  bash CEMU/femu-scripts/run-flexgen-b8-microbatch-test.sh
+```
+
+在 Guest 挂载 `/root/CEMU` 后执行：
+
+```bash
+env CEMU_FLEXGEN_FDM_INPUT_SLOTS=2 \
+  bash /root/CEMU/femu-scripts/flexgen-b8-microbatch-guest-test.sh
+```
+
+配置保持 OPT-13B、B8/MB4、P1024/D16、32 LUN、11703ns 页读、两路 Attention slot。
+每个 input 槽为 85,197,312 字节，MR1 预留两个槽；数据文件预算在原 8 GiB 上增加
+85,200,896 字节（单槽容量向 4 KiB 对齐），不挤占旧预算中的暂存页空间。
+MR0 仍为 128 MiB，FDM namespace 仍为 16 GiB；启动前检查容量，设备 BIND 仍做最终校验。
+Guest 会拒绝非 poll/async 配置或没有 transfer_id trace 字段的旧内核。
+
+本轮应有 1360 个 APPEND 包和 1280 个 Attention EXEC，最终 accepted/三种 committed
+均为 1040，failed=0，drain 后 staged/inflight/pending 均为 0。
+`workload-settings.txt` 和 `result.json` 保存实际槽数、单槽容量和数据预算。
+如已有相同输入/配置的旧结果，可用 `CEMU_FLEXGEN_REFERENCE_RESULT` 设置结果 JSON，
+并将对应 MB4 的 softmax.json 作为脚本参数，启用 token 对照；不设置就不宣称数值一致。
+新路径禁止 tagged bio 合并，统计命令数时需区分 pwrite 包数和 NVMe 子命令数。
+分析脚本的 `max_active_requests` 检查是 Attention 并发检查，不是 input 槽占用证明。
+
 B8与上述B4对照时，Host使用 `femu-scripts/run-flexgen-b8-microbatch-test.sh`，
 Guest使用 `femu-scripts/flexgen-b8-microbatch-guest-test.sh`。固定B8/MB4/P1024/D16，
 两组microbatch、双slot，父Execute仍为1280次；KV包为66560个。Host显式复用B4的

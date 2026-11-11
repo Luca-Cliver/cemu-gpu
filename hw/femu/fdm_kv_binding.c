@@ -39,14 +39,21 @@ static bool valid_range(FemuCtrl *ctrl, const MemoryRange *range,
 }
 
 uint16_t fdm_kv_bind(NvmeNamespace *compute_ns, MemoryRangeSet *mrs,
-                     const FDMKV_BindParams_t *wire, Program *program)
+                     const FDMKV_BindSlotsParams_t *descriptor, uint32_t bytes, Program *program)
 {
+    const FDMKV_BindParams_t *wire = &descriptor->base;
+    bool multislot = bytes == sizeof(*descriptor) &&
+        le32_to_cpu(wire->version) == CEMU_FDM_KV_BIND_SLOTS_VERSION;
+    uint32_t input_slots = multislot ? le32_to_cpu(descriptor->input_slots) : 0;
     FemuCtrl *ctrl = compute_ns->ctrl;
     NvmeNamespace *meta_ns, *data_ns;
     if (ctrl->native_kv != (program != NULL) || !mrs || mrs->numr < 2 ||
         mrs->numr > CEMU_FDM_KV_MAX_DATA_MRS + 1 || !mrs->mr ||
         le32_to_cpu(wire->magic) != CEMU_FDM_KV_BIND_MAGIC ||
-        le32_to_cpu(wire->version) != CEMU_FDM_KV_BIND_VERSION) {
+        (!multislot && (bytes != sizeof(*wire) ||
+                       le32_to_cpu(wire->version) != CEMU_FDM_KV_BIND_VERSION)) ||
+        (multislot && (!input_slots || input_slots > CEMU_FDM_KV_MAX_INPUT_SLOTS ||
+                      le32_to_cpu(descriptor->transfer_protocol) != CEMU_FDM_KV_TRANSFER_PROTOCOL))) {
         return NVME_INVALID_FIELD;
     }
     if (program && (program->state != PROGRAM_STATE_ACTIVATED ||
@@ -60,6 +67,27 @@ uint16_t fdm_kv_bind(NvmeNamespace *compute_ns, MemoryRangeSet *mrs,
     }
     if (program && ctrl->native_inflight) {
         return NVME_CMD_SEQ_ERROR;
+    }
+    const char *mode = g_getenv("CEMU_FDM_AGGREGATE_MODE");
+    bool polling = g_strcmp0(mode, "poll") == 0;
+    if (multislot && !polling) {
+        return NVME_INVALID_FIELD;
+    }
+    FDMKV_ServiceFunction service_fn = NULL;
+    if (mode && *mode && !polling && strcmp(mode, "notify")) {
+        femu_err("CEMU_FDM_AGGREGATE_MODE must be notify or poll\n");
+        return NVME_INVALID_FIELD;
+    }
+    if (polling) {
+        if (!program || g_strcmp0(g_getenv("CEMU_FDM_ASYNC_AGGREGATE"), "1")) {
+            femu_err("poll aggregation requires an operator and CEMU_FDM_ASYNC_AGGREGATE=1\n");
+            return NVME_INVALID_FIELD;
+        }
+        service_fn = dlsym(program->shared_lib.so_handle, "fdm_kv_aggregate_service_v1");
+        if (!service_fn) {
+            femu_err("poll aggregation requires rebuilt fdm_kv_aggregate.so with service v1\n");
+            return NVME_INVALID_PROGRAM_DATA;
+        }
     }
     FDMKV_ProfileFunction profile_fn = NULL;
     if (program && g_strcmp0(g_getenv("CEMU_FDM_AGGREGATE_PROFILE"), "1") == 0) {
@@ -136,6 +164,7 @@ uint16_t fdm_kv_bind(NvmeNamespace *compute_ns, MemoryRangeSet *mrs,
         .data_segments = segments,
         .segment_count = mrs->numr - 1,
         .input_bytes = le64_to_cpu(wire->input_bytes),
+        .input_slots = input_slots,
         .nand_channels = nand->nchs,
         .block_pages = nand->pgs_per_blk,
         .batch_pages = le32_to_cpu(wire->batch_pages),
@@ -152,6 +181,7 @@ uint16_t fdm_kv_bind(NvmeNamespace *compute_ns, MemoryRangeSet *mrs,
     binding->mrs = mrs;
     binding->aggregate_program = program;
     binding->aggregate_profile_fn = profile_fn;
+    binding->aggregate_service_fn = service_fn;
     binding->input_sb = mrs->mr[CEMU_FDM_KV_DATA_MR].sb;
     binding->input_bytes = params.input_bytes;
     binding->async_aggregate = program && g_strcmp0(g_getenv("CEMU_FDM_ASYNC_AGGREGATE"), "1") == 0;
@@ -176,13 +206,57 @@ uint16_t fdm_kv_bind(NvmeNamespace *compute_ns, MemoryRangeSet *mrs,
         qatomic_inc(&program->fdm_kv_users);
     }
     if (binding->async_aggregate) {
-        binding->aggregate_request = g_new0(NvmeRequest, 1);
+        if (input_slots) {
+            binding->slot_tasks = g_new0(FDMKV_SlotTask_t, input_slots);
+        } else {
+            binding->aggregate_request = g_new0(NvmeRequest, 1);
+        }
         binding->aggregate_worker = g_thread_new("fdm-kv-aggregate", aggregate_worker, binding);
+        femu_log("FDM KV aggregation mode=%s, input_slots=%u, idle_poll_us=%u\n",
+                 service_fn ? "poll-service-v1" : "notify", input_slots ? input_slots : 1,
+                 service_fn ? 10 : 0);
     }
     backend_cuda_mark_host_dirty(meta_ns->backend, params.meta_addr, params.meta_bytes);
     g_mutex_unlock(&fdm_state->fdm_kv_lock);
     g_rw_lock_writer_unlock(&fdm_state->fdm_kv_binding_lock);
     return NVME_SUCCESS;
+}
+
+static void select_slot_locked(FDMKV_Binding_t *binding, uint32_t index)
+{
+    FDMKV_InputSlot_t *slot = &binding->buffer->slots[index];
+    FDMKV_SlotTask_t *runtime = &binding->slot_tasks[index];
+    binding->buffer->active_slot = index;
+    binding->buffer->input = slot->input;
+    binding->buffer->receive = slot->receive;
+    binding->pending_write = runtime->pending;
+    binding->aggregate_request = &runtime->task;
+    binding->aggregate_qid = runtime->qid;
+}
+
+static void save_slot_locked(FDMKV_Binding_t *binding, uint32_t index)
+{
+    FDMKV_SlotTask_t *runtime = &binding->slot_tasks[index];
+    runtime->pending = binding->pending_write;
+    runtime->qid = binding->aggregate_qid;
+    runtime->background = runtime->pending == &runtime->task;
+    bool active = false;
+    for (uint32_t slot = 0; slot < binding->buffer->input_slots; slot++) {
+        active |= binding->slot_tasks[slot].background;
+    }
+    qatomic_set(&binding->aggregate_active, active);
+}
+
+static bool slots_busy_locked(const FDMKV_Binding_t *binding)
+{
+    for (uint32_t index = 0; index < binding->buffer->input_slots; index++) {
+        const FDMKV_InputSlot_t *slot = &binding->buffer->slots[index];
+        if (binding->slot_tasks[index].pending || slot->dma_active ||
+            (!binding->buffer->failed && slot->state != FDM_KV_SLOT_EMPTY)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool unbind_buffer(MemoryRangeSet *mrs, bool cancel)
@@ -195,7 +269,8 @@ static bool unbind_buffer(MemoryRangeSet *mrs, bool cancel)
     MemoryNamespace *fdm_state = binding->fdm_ns->private;
     g_rw_lock_writer_lock(&fdm_state->fdm_kv_binding_lock);
     g_mutex_lock(&fdm_state->fdm_kv_lock);
-    if (mrs->in_use != 1 || (!cancel && (binding->pending_write || binding->aggregate_active ||
+    if (mrs->in_use != 1 || (!cancel && (slots_busy_locked(binding) ||
+        binding->pending_write || binding->aggregate_active ||
         binding->buffer->stats.inflight_blocks || binding->buffer->leases ||
         (binding->writer && !binding->buffer->failed &&
          (binding->buffer->stats.staged_pages ||
@@ -204,7 +279,7 @@ static bool unbind_buffer(MemoryRangeSet *mrs, bool cancel)
         g_rw_lock_writer_unlock(&fdm_state->fdm_kv_binding_lock);
         return false;
     }
-    binding->aggregate_stop = true;
+    qatomic_set(&binding->aggregate_stop, true);
     g_cond_broadcast(&binding->aggregate_wake);
     fdm_kv_writer_request_stop(binding);
     g_mutex_unlock(&fdm_state->fdm_kv_lock);
@@ -237,7 +312,11 @@ static bool unbind_buffer(MemoryRangeSet *mrs, bool cancel)
                  binding->aggregate_calls, binding->aggregate_host_ns);
     }
     g_assert(!binding->waiting_attention);
-    g_free(binding->aggregate_request);
+    if (binding->slot_tasks) {
+        g_free(binding->slot_tasks);
+    } else {
+        g_free(binding->aggregate_request);
+    }
     g_cond_clear(&binding->aggregate_wake);
     g_free(binding);
     g_mutex_unlock(&fdm_state->fdm_kv_lock);
@@ -250,10 +329,11 @@ bool fdm_kv_unbind(MemoryRangeSet *mrs)
     return unbind_buffer(mrs, false);
 }
 
-static bool complete_write_locked(NvmeRequest *request)
+static bool complete_write_locked(NvmeRequest *request, FDMKV_ProfileFunction service_step)
 {
     MemoryNamespace *memory = request->ns->private;
     FDMKV_Binding_t *binding = memory->fdm_kv_binding;
+    uint32_t slot_index = binding ? binding->buffer->active_slot : 0;
     uint64_t result = FDM_KV_AGGREGATE_INVALID;
     if (!binding || binding->pending_write != request || !binding->aggregate_program) {
         request->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
@@ -276,7 +356,8 @@ static bool complete_write_locked(NvmeRequest *request)
         const FDMKV_AppendHeader_t *header = &binding->buffer->receive->header;
         const FDMKV_Geometry_t *geometry = &binding->buffer->layout.geometry;
         uint32_t batches = header->version == CEMU_FDM_KV_LAYER_PACKET_VERSION ? header->batch_count : 1;
-        for (uint32_t batch = header->batch; batch < header->batch + batches; batch++) {
+        for (uint32_t batch = header->batch;
+             !binding->slot_tasks && batch < header->batch + batches; batch++) {
             for (uint32_t head = header->head_first; head < header->head_first + header->head_count; head++) {
                 uint64_t index = ((uint64_t)batch * geometry->layers + header->layer) * geometry->heads + head;
                 if (binding->buffer->head_states[index].accepted != header->token_first) {
@@ -284,6 +365,10 @@ static bool complete_write_locked(NvmeRequest *request)
                     goto finish;
                 }
             }
+        }
+        if (binding->slot_tasks && !fdm_kv_slot_publish(binding->buffer, slot_index, now)) {
+            request->status = NVME_INVALID_FIELD | NVME_DNR;
+            goto finish;
         }
         NvmeRequest *task = binding->aggregate_request;
         memset(task, 0, sizeof(*task));
@@ -303,7 +388,9 @@ static bool complete_write_locked(NvmeRequest *request)
         request->fdm_kv_pending = false;
         request->fdm_io_trace.async_aggregate = true;
         request->fdm_io_trace.accepted_ns = now;
-        g_cond_signal(&binding->aggregate_wake);
+        if (!binding->aggregate_service_fn) {
+            g_cond_signal(&binding->aggregate_wake);
+        }
         return true;
     }
     if (binding->buffer->receive->header.operation == FDM_KV_OP_DRAIN) {
@@ -357,8 +444,11 @@ static bool complete_write_locked(NvmeRequest *request)
     uint64_t host_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     uint64_t aggregate_start = request->fdm_io_trace.enabled ? clock_ns() : 0;
     if (binding->aggregate_profile_fn && request->fdm_io_trace.enabled) {
-        result = binding->aggregate_profile_fn(&arguments,
+        FDMKV_ProfileFunction aggregate = service_step ? service_step : binding->aggregate_profile_fn;
+        result = aggregate(&arguments,
             &request->fdm_io_trace.aggregate_profile, aggregate_profile_clock);
+    } else if (service_step) {
+        result = service_step(&arguments, NULL, NULL);
     } else {
         result = binding->aggregate_program->shared_lib.jit_fn(&arguments);
     }
@@ -423,7 +513,9 @@ static bool complete_write_locked(NvmeRequest *request)
         goto retry;
     }
 release:
-    if (result == FDM_KV_AGGREGATE_OK && fdm_kv_receive_release(binding->buffer)) {
+    if (result == FDM_KV_AGGREGATE_OK &&
+        (binding->slot_tasks ? fdm_kv_slot_release(binding->buffer, slot_index) :
+                               fdm_kv_receive_release(binding->buffer))) {
         request->status = NVME_SUCCESS;
         fdm_kv_writer_wake(binding);
     } else {
@@ -432,7 +524,11 @@ release:
     }
 finish:
     if (request->status) {
-        fdm_kv_receive_fail(binding->buffer);
+        if (binding->slot_tasks) {
+            fdm_kv_slot_fail(binding->buffer, slot_index);
+        } else {
+            fdm_kv_receive_fail(binding->buffer);
+        }
     }
     binding->pending_write = NULL;
     for (uint32_t index = 0; index < binding->mrs->numr; index++) {
@@ -455,7 +551,43 @@ bool fdm_kv_complete_write(NvmeRequest *request)
     uint64_t start = fdm_io_trace_check_begin(request);
     MemoryNamespace *memory = request->ns->private;
     g_mutex_lock(&memory->fdm_kv_lock);
-    bool done = complete_write_locked(request);
+    FDMKV_Binding_t *binding = memory->fdm_kv_binding;
+    uint32_t index = 0;
+    bool done;
+    if (binding && binding->slot_tasks) {
+        for (; index < binding->buffer->input_slots; index++) {
+            if (binding->slot_tasks[index].pending == request) {
+                break;
+            }
+        }
+        if (index == binding->buffer->input_slots) {
+            request->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+            request->cqe.n.result = 0;
+            request->fdm_kv_pending = false;
+            done = true;
+            goto unlock;
+        }
+        select_slot_locked(binding, index);
+        FDMKV_InputSlot_t *slot = &binding->buffer->slots[index];
+        if (!binding->buffer->failed && slot->receive->header.operation == FDM_KV_OP_DRAIN) {
+            if (slot->receive->header.request_id != binding->buffer->next_aggregate_id ||
+                (slot->state == FDM_KV_SLOT_RECEIVED &&
+                 !fdm_kv_slot_publish(binding->buffer, index, clock_ns())) ||
+                (slot->state == FDM_KV_SLOT_READY && !fdm_kv_slot_begin(binding->buffer, index))) {
+                request->stat.expire_time = MAX(clock_ns() + 10000, slot->receive->max_write_ready_ns);
+                done = false;
+                goto unlock;
+            }
+        }
+    }
+    done = complete_write_locked(request, NULL);
+    if (binding && binding->slot_tasks) {
+        save_slot_locked(binding, index);
+        if (binding->buffer->failed) {
+            g_cond_broadcast(&binding->aggregate_wake);
+        }
+    }
+unlock:
     g_mutex_unlock(&memory->fdm_kv_lock);
     fdm_io_trace_check_end(request, start);
     return done;
@@ -469,45 +601,137 @@ void fdm_kv_async_notify_locked(FDMKV_Binding_t *binding)
     }
 }
 
+static FDMKV_ServiceResult aggregate_step_locked(FDMKV_Binding_t *binding,
+                                                 FDMKV_ProfileFunction service_step)
+{
+    NvmeRequest *task = binding->aggregate_request;
+    if (!task->fdm_io_trace.started_ns) {
+        task->fdm_io_trace.started_ns = clock_ns();
+    }
+    uint64_t start = fdm_io_trace_check_begin(task);
+    task->fdm_io_trace.retry = FDM_IO_RETRY_NONE;
+    bool done = complete_write_locked(task, service_step);
+    fdm_io_trace_check_end(task, start);
+    if (fdm_kv_attention_publish_locked(binding) || binding->buffer->failed) {
+        g_cond_broadcast(&binding->aggregate_wake);
+    }
+    if (done) {
+        if (task->status) {
+            femu_err("FDM KV background aggregation failed: session=%" PRIu64
+                     ", packet=%" PRIu64 ", status=%u\n",
+                     binding->buffer->identity.session_id,
+                     binding->buffer->receive->header.request_id, task->status);
+        }
+        task->fdm_io_trace.finished_ns = clock_ns();
+        fdm_io_trace_background(task, binding->aggregate_qid);
+        qatomic_set(&binding->aggregate_active, false);
+    }
+    return done || task->fdm_io_trace.retry == FDM_IO_RETRY_AGGREGATE ?
+           FDM_KV_SERVICE_PROGRESS : FDM_KV_SERVICE_IDLE;
+}
+
+static FDMKV_ServiceResult aggregate_service_step(void *opaque,
+                                                  FDMKV_ProfileFunction service_step)
+{
+    FDMKV_Binding_t *binding = opaque;
+    if (qatomic_read(&binding->aggregate_stop)) {
+        return FDM_KV_SERVICE_STOP;
+    }
+    if (!qatomic_read(&binding->aggregate_active)) {
+        return FDM_KV_SERVICE_IDLE;
+    }
+    MemoryNamespace *memory = binding->fdm_ns->private;
+    g_mutex_lock(&memory->fdm_kv_lock);
+    FDMKV_ServiceResult result = FDM_KV_SERVICE_IDLE;
+    if (binding->aggregate_stop) {
+        result = FDM_KV_SERVICE_STOP;
+    } else if (!binding->slot_tasks) {
+        result = aggregate_step_locked(binding, service_step);
+    } else {
+        for (uint32_t index = 0; index < binding->buffer->input_slots; index++) {
+            FDMKV_InputSlot_t *slot = &binding->buffer->slots[index];
+            if (!binding->slot_tasks[index].background ||
+                (!binding->buffer->failed &&
+                 slot->receive->header.request_id != binding->buffer->next_aggregate_id)) {
+                continue;
+            }
+            if (!binding->buffer->failed && slot->state == FDM_KV_SLOT_READY &&
+                !fdm_kv_slot_begin(binding->buffer, index)) {
+                fdm_kv_slot_fail(binding->buffer, index);
+            }
+            select_slot_locked(binding, index);
+            result = aggregate_step_locked(binding, service_step);
+            save_slot_locked(binding, index);
+            break;
+        }
+    }
+    g_mutex_unlock(&memory->fdm_kv_lock);
+    return result;
+}
+
+static void aggregate_service_relax(void *opaque, FDMKV_ServiceResult result)
+{
+    if (result == FDM_KV_SERVICE_IDLE) {
+        g_usleep(10);
+    } else {
+        g_thread_yield();
+    }
+}
+
 static void *aggregate_worker(void *opaque)
 {
     FDMKV_Binding_t *binding = opaque;
     MemoryNamespace *memory = binding->fdm_ns->private;
     NvmeRequest *task = binding->aggregate_request;
-    g_mutex_lock(&memory->fdm_kv_lock);
-    while (!binding->aggregate_stop) {
+    if (binding->aggregate_service_fn) {
+        FDMKV_ServiceRuntime runtime = {
+            .version = CEMU_FDM_KV_SERVICE_VERSION,
+            .bytes = sizeof(runtime),
+            .opaque = binding,
+            .step = aggregate_service_step,
+            .relax = aggregate_service_relax,
+        };
+        int status = binding->aggregate_service_fn(&runtime);
+        g_mutex_lock(&memory->fdm_kv_lock);
+        if (status || !binding->aggregate_stop) {
+            femu_err("FDM KV persistent service terminated unexpectedly: status=%d\n", status);
+            fdm_kv_receive_fail(binding->buffer);
+            backend_cuda_mark_host_dirty(binding->fdm_ns->backend, binding->buffer,
+                                         binding->buffer->meta_bytes);
+            fdm_kv_attention_publish_locked(binding);
+        }
+    } else {
+        g_mutex_lock(&memory->fdm_kv_lock);
+    }
+    while (!binding->aggregate_service_fn && !binding->aggregate_stop) {
         if (!binding->aggregate_active) {
             g_cond_wait(&binding->aggregate_wake, &memory->fdm_kv_lock);
             continue;
         }
-        if (!task->fdm_io_trace.started_ns) {
-            task->fdm_io_trace.started_ns = clock_ns();
-        }
-        uint64_t start = fdm_io_trace_check_begin(task);
-        task->fdm_io_trace.retry = FDM_IO_RETRY_NONE;
-        bool done = complete_write_locked(task);
-        fdm_io_trace_check_end(task, start);
-        if (fdm_kv_attention_publish_locked(binding) || binding->buffer->failed) {
-            g_cond_broadcast(&binding->aggregate_wake);
-        }
-        if (done) {
-            if (task->status) {
-                femu_err("FDM KV background aggregation failed: session=%" PRIu64
-                         ", packet=%" PRIu64 ", status=%u\n",
-                         binding->buffer->identity.session_id,
-                         binding->buffer->receive->header.request_id, task->status);
-            }
-            task->fdm_io_trace.finished_ns = clock_ns();
-            fdm_io_trace_background(task, binding->aggregate_qid);
-            qatomic_set(&binding->aggregate_active, false);
-        } else if (task->fdm_io_trace.retry != FDM_IO_RETRY_AGGREGATE) {
+        if (aggregate_step_locked(binding, NULL) == FDM_KV_SERVICE_IDLE) {
             g_cond_wait(&binding->aggregate_wake, &memory->fdm_kv_lock);
         }
         g_mutex_unlock(&memory->fdm_kv_lock);
         g_thread_yield();
         g_mutex_lock(&memory->fdm_kv_lock);
     }
-    if (binding->aggregate_active) {
+    if (binding->slot_tasks) {
+        for (uint32_t index = 0; index < binding->buffer->input_slots; index++) {
+            FDMKV_SlotTask_t *runtime = &binding->slot_tasks[index];
+            if (binding->buffer->slots[index].state != FDM_KV_SLOT_EMPTY) {
+                fdm_kv_slot_fail(binding->buffer, index);
+            }
+            if (runtime->background) {
+                runtime->task.status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
+                runtime->task.fdm_io_trace.finished_ns = clock_ns();
+                fdm_io_trace_background(&runtime->task, runtime->qid);
+                runtime->pending = NULL;
+                runtime->background = false;
+            }
+        }
+        binding->pending_write = NULL;
+        qatomic_set(&binding->aggregate_active, false);
+    } else if (binding->aggregate_active) {
         fdm_kv_receive_fail(binding->buffer);
         binding->pending_write = NULL;
         task->status = NVME_INTERNAL_DEV_ERROR | NVME_DNR;
@@ -537,6 +761,29 @@ bool fdm_kv_input_busy(FemuCtrl *ctrl, const NvmeCmd *command)
     uint64_t offset = le64_to_cpu(write->sb);
     bool busy = binding && qatomic_read(&binding->aggregate_active) &&
         offset >= binding->input_sb && offset - binding->input_sb < binding->input_bytes;
+    if (binding && binding->slot_tasks && offset >= binding->input_sb &&
+        offset - binding->input_sb < binding->input_bytes) {
+        uint64_t transfer = le32_to_cpu(write->rsvd13[0]) |
+                            ((uint64_t)le32_to_cpu(write->rsvd13[1]) << 32);
+        uint64_t total = le32_to_cpu(write->rsvd13[2]);
+        uint64_t length = le32_to_cpu(write->wl);
+        g_mutex_lock(&memory->fdm_kv_lock);
+        busy = !binding->buffer->failed && !binding->aggregate_stop &&
+            !binding->buffer->draining && !binding->buffer->sealed &&
+            transfer > binding->buffer->last_transfer_id && total && !(total % 512) &&
+            total <= binding->input_bytes && length && !(length % 4) &&
+            offset >= binding->input_sb && !((offset - binding->input_sb) % 4) &&
+            offset - binding->input_sb < total && length <= total - (offset - binding->input_sb);
+        for (uint32_t index = 0; busy && index < binding->buffer->input_slots; index++) {
+            const FDMKV_InputSlot_t *slot = &binding->buffer->slots[index];
+            if (slot->state == FDM_KV_SLOT_EMPTY || slot->state == FDM_KV_SLOT_RECEIVING ||
+                slot->state == FDM_KV_SLOT_RECEIVED ||
+                slot->receive->header.operation == FDM_KV_OP_DRAIN) {
+                busy = false;
+            }
+        }
+        g_mutex_unlock(&memory->fdm_kv_lock);
+    }
     g_rw_lock_reader_unlock(&memory->fdm_kv_binding_lock);
     return busy;
 }
@@ -547,7 +794,7 @@ void fdm_kv_aggregators_stop(FemuCtrl *ctrl)
         FDMKV_Binding_t *binding = entry->data;
         MemoryNamespace *memory = binding->fdm_ns->private;
         g_mutex_lock(&memory->fdm_kv_lock);
-        binding->aggregate_stop = true;
+        qatomic_set(&binding->aggregate_stop, true);
         g_cond_broadcast(&binding->aggregate_wake);
         g_mutex_unlock(&memory->fdm_kv_lock);
     }
@@ -592,6 +839,13 @@ uint16_t fdm_kv_write_check(const FDMKV_Binding_t *binding,
     if (offset < binding->input_sb || offset - binding->input_sb >= binding->input_bytes ||
         bytes > binding->input_bytes - (offset - binding->input_sb)) {
         return NVME_INVALID_FIELD | NVME_DNR;
+    }
+    if (binding->slot_tasks) {
+        if (binding->aggregate_stop) {
+            return NVME_CMD_SEQ_ERROR | NVME_DNR;
+        }
+        *input = true;
+        return NVME_SUCCESS;
     }
     FDMKV_ReceiveResult result = fdm_kv_receive_check(
         binding->buffer, offset - binding->input_sb, bytes);

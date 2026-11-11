@@ -50,6 +50,13 @@ def fixture():
 
 
 class PwriteStackTraceTest(unittest.TestCase):
+    def test_nvme_transfer_tags_preserve_existing_time_accounting(self):
+        lines, packet, device = fixture()
+        tagged = [entry.rstrip("\n") + " transfer_id=91 packet_bytes=512\n"
+                  if "nvme_cemu_io" in entry else entry for entry in lines]
+        self.assertEqual(TRACE.analyze(TRACE.parse_guest(lines), [packet], [device]),
+                         TRACE.analyze(TRACE.parse_guest(tagged), [packet], [device]))
+
     def test_vllm_phase_windows_do_not_require_flexgen_future(self):
         from test_sparf_autonomous_timeline import sample
 

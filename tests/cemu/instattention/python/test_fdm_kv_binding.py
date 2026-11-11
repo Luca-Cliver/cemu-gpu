@@ -47,6 +47,34 @@ def new_store(module, **kwargs):
 
 
 class FdmBindingClientTest(unittest.TestCase):
+    def test_tagged_binding_uses_pinned_mrs_and_versioned_descriptor(self):
+        client = Mock()
+        store = new_store(store_module(Mock(return_value=client)), input_slots=2).open()
+        client.create_memory_ranges.assert_called_once_with(store.ranges, pinned=True)
+        descriptor = client.bind_fdm_kv_buffer.call_args.args[0]
+        self.assertEqual(len(descriptor), 88)
+        self.assertEqual(struct.unpack_from("<I", descriptor, 4)[0], 2)
+        self.assertEqual(struct.unpack_from("<2I", descriptor, 80), (2, 1))
+        store.close()
+        client.release_memory_ranges.assert_called_once()
+
+    def test_tagged_binding_rejects_slot_count_and_input_pool_overflow(self):
+        for count in (-1, 3, True, 1.5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                new_store(store_module(Mock()), input_slots=count)
+        with self.assertRaisesRegex(ValueError, "all FDM input slots"):
+            new_store(store_module(Mock()), input_slots=2, data_bytes=128 * 1024)
+
+    def test_tagged_registration_failure_closes_without_legacy_fallback(self):
+        client = Mock()
+        client.bind_fdm_kv_buffer.side_effect = OSError("unsupported registration")
+        store = new_store(store_module(Mock(return_value=client)), input_slots=2)
+        with self.assertRaisesRegex(OSError, "unsupported registration"):
+            store.open()
+        self.assertFalse(store.registered)
+        client.bind_fdm_kv_buffer.assert_called_once()
+        client.close.assert_called_once()
+
     def test_payload_contiguous_buffers_preserve_wire_bits_and_ownership(self):
         from phase_profiler import PhaseProfiler
 
@@ -445,7 +473,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                 self.call(1, 5, (65536, 0, 512, 0, 0, 0), namespace=2, payload=sentinel)
                 self.bind(rsid)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
+                self.assertEqual(struct.unpack_from("<2I", header), (4, 424))
                 self.assertEqual(struct.unpack_from("<I", header, 12)[0], 1)
                 self.assertEqual(struct.unpack_from("<2Q", header, 16), (store.session_id, 1))
                 self.assertEqual(struct.unpack_from("<4I", header, 32), (1, 1, 2, 128))
@@ -526,7 +554,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                          namespace=2, payload=payload, expected_status=expected_status)
 
     def receive_state(self):
-        return struct.unpack_from("<2I2Q", self.read_memory(376, 128))
+        return struct.unpack_from("<2I2Q", self.read_memory(424, 128))
 
     def test_input_fragments_protection_dma_failure_and_reset(self):
         config = ROOT / "tests/cemu/instattention/experiments/configs/native_csd_smoke.json"
@@ -693,15 +721,15 @@ class FdmBindingDeviceTest(unittest.TestCase):
                                     (2, store.data_bytes, store.meta_bytes)))
                 self.bind(rsid, program=1)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
+                self.assertEqual(struct.unpack_from("<2I", header), (4, 424))
                 self.assertEqual(struct.unpack_from("<Q", header, 88)[0], 1600)
                 self.assertEqual(struct.unpack_from("<Q", header, 104)[0], 35200)
                 self.assertEqual(struct.unpack_from("<I", header, 148)[0], 32600)
                 self.assertEqual(struct.unpack_from("<4I", header, 176), (1, 0, 0, 0))
-                base = struct.unpack_from("<Q", header, 352)[0] - 376
+                base = struct.unpack_from("<Q", header, 352)[0] - 424
                 writebacks = struct.unpack_from("<I", header, 140)[0]
                 meta_used = struct.unpack_from("<Q", header, 232)[0] - base + (writebacks + 1) * 24
-                self.assertEqual(meta_used, 2214960 +
+                self.assertEqual(meta_used, 2215008 +
                                  ((store.input_bytes // 4 + 7) // 8 + 7) // 8 * 8 - 4096)
                 self.assertLess(meta_used, store.meta_bytes)
                 data_used = store.input_bytes + 32600 * 4096
@@ -739,16 +767,16 @@ class FdmBindingDeviceTest(unittest.TestCase):
                                     (2, store.data_bytes, store.meta_bytes)))
                 self.bind(rsid, program=1)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
+                self.assertEqual(struct.unpack_from("<2I", header), (4, 424))
                 self.assertEqual(struct.unpack_from("<Q", header, 88)[0], 6400)
                 self.assertEqual(struct.unpack_from("<Q", header, 104)[0], 1344000)
                 self.assertEqual(struct.unpack_from("<I", header, 148)[0], 972800)
                 self.assertEqual(struct.unpack_from("<3I", header, 164), (3840, 8, 256))
                 self.assertEqual(struct.unpack_from("<4I", header, 176), (1, 0, 0, 0))
-                base = struct.unpack_from("<Q", header, 352)[0] - 376
+                base = struct.unpack_from("<Q", header, 352)[0] - 424
                 writebacks = struct.unpack_from("<I", header, 140)[0]
                 meta_used = struct.unpack_from("<Q", header, 232)[0] - base + (writebacks + 1) * 24
-                self.assertEqual(meta_used, 63370936 +
+                self.assertEqual(meta_used, 63370984 +
                                  ((store.input_bytes // 4 + 7) // 8 + 7) // 8 * 8 - 4096)
                 self.assertLess(meta_used, store.meta_bytes)
                 data_used = store.input_bytes + 972800 * 4096
@@ -805,13 +833,13 @@ class FdmBindingDeviceTest(unittest.TestCase):
                 rsid = self.create(descriptors)
                 self.bind(rsid, program=1)
                 header = self.read_memory(0)
-                self.assertEqual(struct.unpack_from("<2I", header), (3, 376))
+                self.assertEqual(struct.unpack_from("<2I", header), (4, 424))
                 self.assertEqual(struct.unpack_from("<Q", header, 88)[0], 12800)
                 self.assertEqual(struct.unpack_from("<Q", header, 104)[0], 2688000)
                 self.assertEqual(struct.unpack_from("<Q", header, 120)[0], 8 * 1024**3)
                 self.assertEqual(struct.unpack_from("<I", header, 148)[0], 1944800)
                 self.assertEqual(struct.unpack_from("<I", header, 360)[0], 3)
-                base = struct.unpack_from("<Q", header, 352)[0] - 376
+                base = struct.unpack_from("<Q", header, 352)[0] - 424
                 segments_offset = struct.unpack_from("<Q", header, 368)[0] - base
                 segments = self.read_memory(segments_offset, 72)
                 counts = [struct.unpack_from("<2Q2I", segments, index * 24)[3] for index in range(3)]
@@ -893,8 +921,8 @@ class FdmBindingDeviceTest(unittest.TestCase):
         else:
             self.assertEqual(self.wait_completion(command_id), (0, length))
         memory = self.device.read(address, length)
-        self.assertEqual(struct.unpack_from("<2I", memory), (3, 376))
-        base = struct.unpack_from("<Q", memory, 352)[0] - 376
+        self.assertEqual(struct.unpack_from("<2I", memory), (4, 424))
+        base = struct.unpack_from("<Q", memory, 352)[0] - 424
         head_offset, page_offset, block_offset, hash_offset, writeback_offset = (
             pointer - base for pointer in struct.unpack_from("<5Q", memory, 200))
         pool_pages, free_page, free_pages, hash_size, domains, channels, block_pages = \
@@ -911,7 +939,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
             memory=memory, pool_pages=pool_pages, free_page=free_page, free_pages=free_pages,
             channels=channels, block_pages=block_pages, stats=stats,
             initialized=initialized, draining=draining, sealed=sealed, failed=failed,
-            receive=struct.unpack_from("<2I2Q", memory, 376),
+            receive=struct.unpack_from("<2I2Q", memory, 424),
             heads=[struct.unpack_from("<4Q2I", memory, head_offset + index * 40)
                    for index in range(head_count)],
             pages=[struct.unpack_from("<Q4IQ6I", memory, page_offset + index * 56)
@@ -1009,7 +1037,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
 
     def verify_staged(self, tokens, heads):
         header = self.read_memory(0)
-        meta_base = struct.unpack_from("<Q", header, 352)[0] - 376
+        meta_base = struct.unpack_from("<Q", header, 352)[0] - 424
         head_offset, staged_offset, blocks_offset = (
             pointer - meta_base for pointer in struct.unpack_from("<3Q", header, 200))
         input_address = struct.unpack_from("<Q", header, 240)[0]
@@ -1136,7 +1164,7 @@ class FdmBindingDeviceTest(unittest.TestCase):
                     self.assertEqual(self.device.completion(1), (0, 512))
                     self.assertEqual(self.device.wait(1), (0, 512))
                     header = self.device.read(DATA + 256 * 1024, 512)
-                    self.assertEqual(struct.unpack_from("<I", header, 376)[0], 4)
+                    self.assertEqual(struct.unpack_from("<I", header, 424)[0], 4)
                     self.assertEqual(struct.unpack_from("<Q", header, 264)[0], 0)
                     self.call(0, 0x21, (1 | (rsid << 16), 0, 0, 0, 0, 0), expected_status=0x95)
                     if reset:

@@ -261,7 +261,7 @@ static void test_buffer_init(void)
     assert(fdm_kv_buffer_init(&params, &buffer));
     check_buffer(&params, buffer);
 
-    for (unsigned int choice = 0; choice < 28; choice++) {
+    for (unsigned int choice = 0; choice < 31; choice++) {
         params = buffer_params(meta, data);
         memset(meta, 0xa5, params.meta_bytes);
         switch (choice) {
@@ -293,6 +293,15 @@ static void test_buffer_init(void)
         case 25: params.geometry.max_tokens = UINT64_MAX; break;
         case 26: params.data_bytes = params.input_bytes; break;
         case 27: params.meta_bytes = sizeof(*buffer); break;
+        case 28: params.input_slots = CEMU_FDM_KV_MAX_INPUT_SLOTS + 1; break;
+        case 29:
+            params.input_slots = 2;
+            params.input_bytes = UINT64_MAX - 511;
+            break;
+        case 30:
+            params.input_slots = 2;
+            params.data_bytes = 2 * params.input_bytes - 1;
+            break;
         }
         buffer = (FDMKV_Buffer_t *)meta;
         assert(!fdm_kv_buffer_init(&params, &buffer));
@@ -874,6 +883,323 @@ static void test_layer_packets(AggregateFunction function)
     g_free(meta);
 }
 
+typedef struct ServiceTest {
+    uint32_t calls;
+    uint32_t relax_calls;
+    bool invalid_result;
+    FDMKV_ProfileFunction aggregate;
+} ServiceTest;
+
+static FDMKV_ServiceResult service_test_step(void *opaque, FDMKV_ProfileFunction aggregate)
+{
+    ServiceTest *test = opaque;
+    assert(aggregate);
+    assert(aggregate(NULL, NULL, NULL) == FDM_KV_AGGREGATE_INVALID);
+    test->aggregate = aggregate;
+    test->calls++;
+    if (test->invalid_result) {
+        return (FDMKV_ServiceResult)99;
+    }
+    return test->calls == 1 ? FDM_KV_SERVICE_IDLE :
+           test->calls == 2 ? FDM_KV_SERVICE_PROGRESS : FDM_KV_SERVICE_STOP;
+}
+
+static void service_test_relax(void *opaque, FDMKV_ServiceResult result)
+{
+    ServiceTest *test = opaque;
+    assert(result == (test->calls == 1 ? FDM_KV_SERVICE_IDLE : FDM_KV_SERVICE_PROGRESS));
+    test->relax_calls++;
+}
+
+static uint64_t make_slot_packet(uint8_t *packet, const FDMKV_Buffer_t *buffer,
+                                 uint64_t request_id, uint64_t first, uint32_t tokens,
+                                 uint32_t batches)
+{
+    uint32_t heads = buffer->layout.geometry.heads;
+    uint64_t bytes = make_packet(packet, buffer, batches * heads, tokens);
+    FDMKV_AppendHeader_t header;
+    memcpy(&header, packet, sizeof(header));
+    header.version = cpu_to_le32(CEMU_FDM_KV_LAYER_PACKET_VERSION);
+    header.request_id = cpu_to_le64(request_id);
+    header.head_count = cpu_to_le32(heads);
+    header.batch_count = cpu_to_le32(batches);
+    header.token_first = cpu_to_le64(first);
+    memcpy(packet, &header, sizeof(header));
+    for (uint32_t kind = 0; kind < 2; kind++) {
+        for (uint32_t batch = 0; batch < batches; batch++) {
+            for (uint32_t head = 0; head < heads; head++) {
+                for (uint32_t token = 0; token < tokens; token++) {
+                    for (uint32_t channel = 0; channel < buffer->layout.geometry.head_dim; channel++) {
+                        uint32_t sample = sample_value(batch, 0, head, first + token, channel, kind);
+                        uint64_t row = (((uint64_t)kind * batches + batch) * heads + head) * tokens + token;
+                        memcpy(packet + 512 + row * buffer->row_bytes +
+                               channel * buffer->layout.geometry.element_bytes,
+                               &sample, buffer->layout.geometry.element_bytes);
+                    }
+                }
+            }
+        }
+    }
+    return bytes;
+}
+
+static FDMKV_ReceiveResult slot_fragment(FDMKV_Buffer_t *buffer, uint64_t transfer_id,
+                                        const uint8_t *packet, uint64_t wire_bytes,
+                                        uint64_t offset, uint64_t bytes, uint64_t ready_ns,
+                                        uint32_t *index)
+{
+    uint8_t *destination;
+    assert(fdm_kv_slot_acquire(buffer, transfer_id, wire_bytes, offset, bytes,
+                               index, &destination) == FDM_KV_RECEIVE_ACCEPTED);
+    assert(destination == buffer->slots[*index].input + offset);
+    memcpy(destination, packet + offset, bytes);
+    return fdm_kv_slot_record(buffer, *index, offset, bytes, ready_ns);
+}
+
+static void test_input_slots(AggregateFunction function)
+{
+    uint8_t *meta = g_malloc(128 * 1024);
+    uint8_t *data = g_malloc(4 * 1024 * 1024);
+    uint8_t *packet = g_malloc(128 * 1024);
+    FDMKV_InitParams_t params = buffer_params(meta, data);
+    FDMKV_Buffer_t *buffer;
+    uint32_t first, second, unused;
+    uint8_t *destination;
+    params.input_slots = 2;
+
+    for (uint32_t segmented = 0; segmented < 2; segmented++) {
+        FDMKV_DataSegment_t ranges[] = {
+            {.address = data, .bytes = 2 * params.input_bytes + 8192},
+            {.address = data + 2 * params.input_bytes + 8192,
+             .bytes = params.data_bytes - 2 * params.input_bytes - 8192},
+        };
+        params.segment_count = segmented ? 2 : 0;
+        params.data_segments = segmented ? ranges : NULL;
+        memset(data, 0x5a, params.data_bytes);
+        assert(fdm_kv_buffer_init(&params, &buffer));
+        assert(buffer->input_slots == 2 && buffer->active_slot == 0);
+        assert(buffer->slots[0].input == data);
+        assert(buffer->slots[1].input == data + params.input_bytes);
+        assert(buffer->slots[0].receive != buffer->slots[1].receive);
+        assert(buffer->slots[0].receive->received_bitmap != buffer->slots[1].receive->received_bitmap);
+        assert(buffer->staged_data == data + DIV_ROUND_UP(2 * params.input_bytes, 4096) * 4096);
+        assert(fdm_kv_page_data(buffer, 1) == buffer->staged_data);
+        for (uint32_t index = 1; index <= buffer->pool_pages; index++) {
+            assert(fdm_kv_page_data(buffer, index) >= data + 2 * params.input_bytes);
+        }
+        assert(buffer->next_receive_id == 1 && buffer->next_aggregate_id == 1);
+
+        uint64_t bytes = make_slot_packet(packet, buffer, 1, 0, 3, 2);
+        assert(slot_fragment(buffer, 101, packet, bytes, 512, bytes - 512, 9000, &first) ==
+               FDM_KV_RECEIVE_ACCEPTED);
+        assert(!buffer->slots[first].receive->header_valid);
+        assert(fdm_kv_slot_acquire(buffer, 101, bytes, 512, bytes - 512, &unused, &destination) ==
+               FDM_KV_RECEIVE_BUSY);
+        assert(fdm_kv_slot_acquire(buffer, 102, bytes, 0, 512, &unused, &destination) ==
+               FDM_KV_RECEIVE_INVALID);
+        assert(fdm_kv_slot_acquire(buffer, 101, bytes + 512, 0, 512, &unused, &destination) ==
+               FDM_KV_RECEIVE_INVALID);
+        assert(slot_fragment(buffer, 101, packet, bytes, 0, 512, 8000, &first) ==
+               FDM_KV_RECEIVE_READY);
+        assert(buffer->slots[first].state == FDM_KV_SLOT_RECEIVED);
+        assert(buffer->received_heads[0] == 3 && !buffer->head_states[0].accepted);
+        assert(!fdm_kv_slot_publish(buffer, first, 8999));
+        assert(!fdm_kv_slot_begin(buffer, first));
+        assert(!fdm_kv_slot_release(buffer, first));
+        assert(fdm_kv_slot_publish(buffer, first, 9000));
+        assert(!fdm_kv_slot_publish(buffer, first, 9000));
+        assert(fdm_kv_slot_begin(buffer, first));
+        void *saved = g_memdup2(buffer->slots[first].input, bytes);
+
+        bytes = make_slot_packet(packet, buffer, 2, 3, 3, 2);
+        assert(slot_fragment(buffer, 102, packet, bytes, 0, bytes, 9100, &second) ==
+               FDM_KV_RECEIVE_READY);
+        assert(first != second);
+        assert(memcmp(buffer->slots[first].input, saved, bytes) == 0);
+        g_free(saved);
+        assert(buffer->received_heads[0] == 6 && !buffer->head_states[0].accepted);
+        assert(buffer->received_heads[4] == 6 && !buffer->head_states[4].accepted);
+        assert(fdm_kv_slot_publish(buffer, second, 9100));
+        assert(!fdm_kv_slot_begin(buffer, second));
+        assert(fdm_kv_slot_acquire(buffer, 103, bytes, 0, bytes, &unused, &destination) ==
+               FDM_KV_RECEIVE_BUSY);
+        assert(buffer->last_transfer_id == 102);
+
+        long long result;
+        expect_unchanged(function, &params, 8999, FDM_KV_AGGREGATE_WAIT_TIME);
+        buffer->head_states[0].readers = 1;
+        expect_unchanged(function, &params, 10000, FDM_KV_AGGREGATE_BUSY);
+        buffer->head_states[0].readers = 0;
+        uint32_t free_pages = buffer->free_pages;
+        buffer->free_pages = 0;
+        expect_unchanged(function, &params, 10000, FDM_KV_AGGREGATE_NO_SPACE);
+        buffer->free_pages = free_pages;
+        do {
+            result = invoke_aggregate(function, &params, 10000);
+        } while (result == FDM_KV_AGGREGATE_PROGRESS);
+        assert(result == FDM_KV_AGGREGATE_OK);
+        check_aggregate_pages(buffer);
+        assert(fdm_kv_slot_release(buffer, first));
+        assert(!fdm_kv_slot_release(buffer, first));
+        assert(buffer->next_receive_id == 3 && buffer->next_aggregate_id == 2);
+        assert(buffer->head_states[0].accepted == 3 && buffer->received_heads[0] == 6);
+        assert(fdm_kv_slot_acquire(buffer, 101, bytes, 0, bytes, &unused, &destination) ==
+               FDM_KV_RECEIVE_INVALID);
+
+        assert(fdm_kv_slot_begin(buffer, second));
+        FDMKV_ReceiveState_t *saved_receive = buffer->receive;
+        buffer->receive = (void *)(uintptr_t)1;
+        expect_unchanged(function, &params, 10000, FDM_KV_AGGREGATE_INVALID);
+        buffer->receive = saved_receive;
+        bytes = make_slot_packet(packet, buffer, 3, 6, buffer->append_max_tokens + 3, 1);
+        assert(slot_fragment(buffer, 103, packet, bytes, 0, bytes, 9200, &unused) ==
+               FDM_KV_RECEIVE_READY);
+        assert(unused == first);
+        assert(fdm_kv_slot_publish(buffer, first, 9200));
+        assert(buffer->active_slot == second && buffer->receive == saved_receive);
+        do {
+            result = invoke_aggregate(function, &params, 10000);
+        } while (result == FDM_KV_AGGREGATE_PROGRESS);
+        assert(result == FDM_KV_AGGREGATE_OK);
+        check_aggregate_pages(buffer);
+        assert(fdm_kv_slot_release(buffer, second));
+        assert(fdm_kv_slot_begin(buffer, first));
+        assert(invoke_aggregate(function, &params, 10000) == FDM_KV_AGGREGATE_PROGRESS);
+        assert(buffer->slots[first].state == FDM_KV_SLOT_CONSUMING);
+        assert(!fdm_kv_slot_release(buffer, first));
+        assert(invoke_aggregate(function, &params, 10000) == FDM_KV_AGGREGATE_OK);
+        check_aggregate_pages(buffer);
+        assert(fdm_kv_slot_release(buffer, first));
+        assert(buffer->next_receive_id == 4 && buffer->next_aggregate_id == 4);
+        assert(buffer->stats.append_commands == 3);
+        assert_bytes(buffer->slots[first].receive->received_bitmap,
+                     buffer->slots[first].receive->bitmap_bytes, 0);
+    }
+
+    params.segment_count = 0;
+    params.data_segments = NULL;
+    assert(fdm_kv_buffer_init(&params, &buffer));
+    uint64_t meta_bytes = params.meta_bytes;
+    FDMKV_ReceiveState_t *last_receive = buffer->slots[1].receive;
+    params.meta_bytes = last_receive->received_bitmap + last_receive->bitmap_bytes - meta - 1;
+    memset(meta, 0xa5, meta_bytes);
+    assert(!fdm_kv_buffer_init(&params, &buffer));
+    assert_bytes(meta, meta_bytes, 0xa5);
+    params.meta_bytes = meta_bytes;
+    for (uint32_t failure = 0; failure < 5; failure++) {
+        assert(fdm_kv_buffer_init(&params, &buffer));
+        uint64_t bytes = make_slot_packet(packet, buffer, failure == 0 ? 2 : 1,
+                                          failure == 1 ? 1 : 0, 3, 2);
+        if (failure == 2) {
+            packet[100] = 1;
+        }
+        if (failure == 3) {
+            buffer->received_heads[5] = 1;
+        }
+        uint64_t wire_bytes = bytes + (failure == 4 ? 512 : 0);
+        assert(slot_fragment(buffer, 101, packet, wire_bytes, 0, bytes, 100, &first) ==
+               FDM_KV_RECEIVE_INVALID);
+        assert(buffer->failed && buffer->slots[first].state == FDM_KV_SLOT_FAILED);
+        assert(!buffer->received_heads[0] && !buffer->head_states[0].accepted);
+        assert(!fdm_kv_slot_publish(buffer, first, 1000));
+        assert(fdm_kv_slot_acquire(buffer, 102, bytes, 0, bytes, &unused, &destination) ==
+               FDM_KV_RECEIVE_INVALID);
+    }
+    assert(fdm_kv_buffer_init(&params, &buffer));
+    uint64_t bytes = make_slot_packet(packet, buffer, 1, 0, 3, 1);
+    assert(fdm_kv_slot_acquire(buffer, 101, bytes, 0, 512, &first, &destination) ==
+           FDM_KV_RECEIVE_ACCEPTED);
+    assert(fdm_kv_slot_acquire(buffer, 101, bytes, 512, 512, &unused, &destination) ==
+           FDM_KV_RECEIVE_BUSY);
+    assert(fdm_kv_slot_record(buffer, first, 0, 508, 100) == FDM_KV_RECEIVE_INVALID);
+    assert(buffer->slots[first].dma_active);
+    fdm_kv_slot_fail(buffer, first);
+    assert(buffer->failed && !buffer->slots[first].dma_active);
+
+    assert(fdm_kv_buffer_init(&params, &buffer));
+    bytes = make_slot_packet(packet, buffer, 1, 0, 3, 1);
+    assert(slot_fragment(buffer, 101, packet, bytes, 0, bytes, 100, &first) == FDM_KV_RECEIVE_READY);
+    assert(fdm_kv_slot_publish(buffer, first, 100));
+    FDMKV_AppendHeader_t drain = {
+        .magic = cpu_to_le32(CEMU_FDM_KV_PACKET_MAGIC),
+        .version = cpu_to_le32(CEMU_FDM_KV_PACKET_VERSION),
+        .header_bytes = cpu_to_le32(512), .operation = cpu_to_le32(FDM_KV_OP_DRAIN),
+        .session_id = cpu_to_le64(buffer->identity.session_id),
+        .generation = cpu_to_le64(buffer->identity.generation),
+        .request_id = cpu_to_le64(2), .wire_bytes = cpu_to_le64(512),
+    };
+    memset(packet, 0, 512);
+    memcpy(packet, &drain, sizeof(drain));
+    assert(slot_fragment(buffer, 102, packet, 512, 0, 512, 100, &second) == FDM_KV_RECEIVE_READY);
+    assert(fdm_kv_slot_publish(buffer, second, 100));
+    assert(!fdm_kv_slot_begin(buffer, second));
+    assert(fdm_kv_slot_acquire(buffer, 103, bytes, 0, bytes, &unused, &destination) ==
+           FDM_KV_RECEIVE_INVALID);
+    assert(fdm_kv_slot_begin(buffer, first));
+    assert(invoke_aggregate(function, &params, 1000) == FDM_KV_AGGREGATE_OK);
+    assert(fdm_kv_slot_release(buffer, first));
+    assert(fdm_kv_slot_begin(buffer, second));
+    assert(!fdm_kv_slot_release(buffer, second));
+
+    params.input_slots = 1;
+    assert(fdm_kv_buffer_init(&params, &buffer));
+    bytes = make_slot_packet(packet, buffer, 1, 0, 3, 1);
+    assert(slot_fragment(buffer, 101, packet, bytes, 0, bytes, 100, &first) == FDM_KV_RECEIVE_READY);
+    assert(fdm_kv_slot_publish(buffer, first, 100));
+    assert(fdm_kv_slot_begin(buffer, first));
+    assert(invoke_aggregate(function, &params, 1000) == FDM_KV_AGGREGATE_OK);
+    check_aggregate_pages(buffer);
+    assert(fdm_kv_slot_release(buffer, first));
+
+    g_free(packet);
+    g_free(data);
+    g_free(meta);
+    puts("FDM KV two-slot core: independent receive, ordered aggregation, reuse, prefixes, deadlines, segmented staging and failures PASS");
+}
+
+static FDMKV_ProfileFunction service_test_aggregate;
+
+static long long invoke_service_step(struct cemu_args *args)
+{
+    return service_test_aggregate(args, NULL, NULL);
+}
+
+static void test_aggregate_service(FDMKV_ServiceFunction function)
+{
+    ServiceTest test = {0};
+    FDMKV_ServiceRuntime runtime = {
+        .version = CEMU_FDM_KV_SERVICE_VERSION,
+        .bytes = sizeof(runtime),
+        .opaque = &test,
+        .step = service_test_step,
+        .relax = service_test_relax,
+    };
+    assert(function(NULL) == -1);
+    runtime.version++;
+    assert(function(&runtime) == -1);
+    runtime.version--;
+    runtime.bytes--;
+    assert(function(&runtime) == -1);
+    runtime.bytes++;
+    runtime.step = NULL;
+    assert(function(&runtime) == -1);
+    runtime.step = service_test_step;
+    runtime.relax = NULL;
+    assert(function(&runtime) == -1);
+    runtime.relax = service_test_relax;
+    assert(!test.calls);
+    assert(function(&runtime) == 0);
+    assert(test.calls == 3 && test.relax_calls == 2);
+    service_test_aggregate = test.aggregate;
+    test.invalid_result = true;
+    assert(function(&runtime) == -1);
+    assert(test.calls == 4 && test.relax_calls == 2);
+    test_aggregate(invoke_service_step);
+    test_layer_packets(invoke_service_step);
+    test_input_slots(invoke_service_step);
+    puts("FDM KV persistent service: ABI checks, idle/progress/stop and internal aggregation step PASS");
+}
+
 int main(int argc, char **argv)
 {
     test_layout();
@@ -891,13 +1217,18 @@ int main(int argc, char **argv)
         test_segmented_aggregate(function);
         test_aggregate_plan_boundaries(function);
         test_layer_packets(function);
+        test_input_slots(function);
         profile_function = (FDMKV_ProfileFunction)dlsym(library, "fdm_kv_aggregate_profile_v1");
         assert(profile_function);
         test_aggregate(invoke_profiled);
         test_segmented_aggregate(invoke_profiled);
         test_aggregate_plan_boundaries(invoke_profiled);
         test_layer_packets(invoke_profiled);
+        test_input_slots(invoke_profiled);
         puts("FDM KV aggregate profiling: same layout/error/atomicity checks and additive Host stage accounting PASS");
+        FDMKV_ServiceFunction service = (FDMKV_ServiceFunction)dlsym(library, "fdm_kv_aggregate_service_v1");
+        assert(service);
+        test_aggregate_service(service);
         assert(dlclose(library) == 0);
         puts("FDM KV aggregate module: multi-head token-K/channel-K/V, group boundaries, domain queues, atomic preflight, virtual-time gate and input release PASS; no device dispatch/NAND/Attention");
     }

@@ -42,8 +42,14 @@ timeline=${CEMU_NATIVE_TIMELINE:-0}
 io_trace=${CEMU_NATIVE_IO_TRACE:-0}
 aggregate_profile=${CEMU_FDM_AGGREGATE_PROFILE:-0}
 async_aggregate=${CEMU_FDM_ASYNC_AGGREGATE:-0}
+aggregate_mode=${CEMU_FDM_AGGREGATE_MODE:-notify}
 if [[ "$async_aggregate" != 0 && "$async_aggregate" != 1 ]]; then
     echo 'CEMU_FDM_ASYNC_AGGREGATE must be 0 or 1' >&2
+    exit 1
+fi
+if [[ "$aggregate_mode" != notify && "$aggregate_mode" != poll ]] ||
+   [[ "$aggregate_mode" == poll && "$async_aggregate" != 1 ]]; then
+    echo 'CEMU_FDM_AGGREGATE_MODE must be notify or poll; poll requires CEMU_FDM_ASYNC_AGGREGATE=1.' >&2
     exit 1
 fi
 if [[ "$aggregate_profile" != 0 && "$aggregate_profile" != 1 ]] ||
@@ -187,7 +193,8 @@ if [[ "$dry_run" == 1 ]]; then
     printf '%s\n' "model=$model" "profile=$profile" "device_config=$config" \
         "guest_memory=$memory" "guest_vcpus=$vcpus" \
         "native_buffer_budget=$buffer_budget" "native_page_limit=$page_limit" \
-        "native_kv_placement=$kv_placement" "nvm_backend=file"
+        "native_kv_placement=$kv_placement" "nvm_backend=file" \
+        "fdm_async_aggregate=$async_aggregate" "fdm_aggregate_mode=$aggregate_mode"
     echo 'Dry run only: no VM, GPU access, image creation, or hardware/resource validation.'
     exit 0
 fi
@@ -281,6 +288,7 @@ printf '%s\n' "csd_target=$csd_target" "program=$operator" "profile=$profile" \
     "guest_memory=$memory" "guest_vcpus=$vcpus" "native_buffer_budget=$buffer_budget" "native_page_limit=$page_limit" \
     "timeline=$timeline_path" "fdm_io_trace=$io_trace_path" "aggregate_profile=$aggregate_profile" "fdm_async_aggregate=$async_aggregate" "read_diagnostics=$read_diagnostics" "device_init_order=$device_init_order" \
     "native_kv_placement=$kv_placement" \
+    "fdm_aggregate_mode=$aggregate_mode" \
     "host_numa_policy=$CEMU_NATIVE_NUMA_POLICY" \
     "cuda_library_path=${CEMU_CUDA_LIBRARY_PATH:-}" \
     "${cuda_env[@]}" > "$directory/guest-logs/launch-settings.txt"
@@ -328,6 +336,7 @@ fi
 cd "$repo/tests/cemu"
 env "${cuda_env[@]}" CEMU_COMPUTE_LOG=progress CEMU_COMPUTE_LOG_INTERVAL=1000 \
     CEMU_FDM_IO_TRACE="$io_trace_path" CEMU_FDM_AGGREGATE_PROFILE="$aggregate_profile" CEMU_FDM_ASYNC_AGGREGATE="$async_aggregate" \
+    CEMU_FDM_AGGREGATE_MODE="$aggregate_mode" \
     CEMU_SPARF_AUTONOMOUS_TIMELINE="$timeline_path" CEMU_SPARF_READ_DIAGNOSTICS="$read_diagnostics" \
     "${numa_prefix[@]}" "$qemu" -name "CEMU-native-$model-smoke" \
     -machine q35,accel=kvm -global q35-pcihost.pci-hole64-size=256G \

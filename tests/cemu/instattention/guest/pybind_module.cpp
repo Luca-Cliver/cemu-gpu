@@ -223,7 +223,7 @@ PYBIND11_MODULE(_cemu_client, module)
              py::arg("replace_existing") = false)
         .def("activate_program", &CemuClient::activate_program)
         .def("create_memory_ranges", &CemuClient::create_memory_ranges,
-             py::arg("ranges"))
+             py::arg("ranges"), py::arg("pinned") = false)
         .def("release_memory_ranges", &CemuClient::release_memory_ranges,
              py::call_guard<py::gil_scoped_release>())
         .def("bind_fdm_kv_buffer",

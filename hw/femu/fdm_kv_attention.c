@@ -115,6 +115,80 @@ static uint32_t staged_page(const FDMKV_Buffer_t *buffer, uint64_t key)
     return 0;
 }
 
+static bool packet_covers_head(const FDMKV_AppendHeader_t *packet, uint32_t batch,
+                               uint32_t layer, uint32_t head)
+{
+    uint32_t batches = packet->version == CEMU_FDM_KV_LAYER_PACKET_VERSION ? packet->batch_count : 1;
+    return packet->operation == FDM_KV_OP_APPEND && packet->layer == layer &&
+        batch >= packet->batch && batch - packet->batch < batches &&
+        head >= packet->head_first && head - packet->head_first < packet->head_count;
+}
+
+static bool queued_snapshot_valid(const FDMKV_Buffer_t *buffer,
+                                  const struct cemu_sparf_workflow_header *header,
+                                  const struct cemu_sparf_batch_row *rows, uint32_t batch_first)
+{
+    uint64_t horizon = 0;
+    for (uint32_t batch_row = 0; batch_row < header->batch_size; batch_row++) {
+        uint32_t batch = rows ? rows[batch_row].slot : batch_first + batch_row;
+        uint64_t target = rows ? rows[batch_row].valid_tokens : header->valid_tokens;
+        for (uint32_t head = 0; head < header->num_kv_heads; head++) {
+            uint64_t index = head_index(buffer, batch, header->layer, head);
+            if (buffer->head_states[index].accepted == target) {
+                continue;
+            }
+            uint64_t boundary = 0;
+            for (uint32_t slot_index = 0; slot_index < buffer->input_slots; slot_index++) {
+                const FDMKV_InputSlot_t *slot = &buffer->slots[slot_index];
+                const FDMKV_AppendHeader_t *packet = &slot->receive->header;
+                if ((slot->state == FDM_KV_SLOT_READY || slot->state == FDM_KV_SLOT_CONSUMING) &&
+                    packet_covers_head(packet, batch, header->layer, head) &&
+                    packet->token_first + packet->token_count == target) {
+                    boundary = packet->request_id;
+                }
+            }
+            if (!boundary || buffer->received_heads[index] < target) {
+                return false;
+            }
+            horizon = MAX(horizon, boundary);
+        }
+    }
+    for (uint32_t slot_index = 0; slot_index < buffer->input_slots; slot_index++) {
+        const FDMKV_InputSlot_t *slot = &buffer->slots[slot_index];
+        const FDMKV_AppendHeader_t *packet = &slot->receive->header;
+        if ((slot->state != FDM_KV_SLOT_READY && slot->state != FDM_KV_SLOT_CONSUMING) ||
+            packet->request_id > horizon) {
+            continue;
+        }
+        for (uint32_t batch_row = 0; batch_row < header->batch_size; batch_row++) {
+            uint32_t batch = rows ? rows[batch_row].slot : batch_first + batch_row;
+            uint64_t target = rows ? rows[batch_row].valid_tokens : header->valid_tokens;
+            for (uint32_t head = 0; head < header->num_kv_heads; head++) {
+                if (packet_covers_head(packet, batch, header->layer, head) &&
+                    packet->token_first + packet->token_count > target) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool drain_pending(const FDMKV_Binding_t *binding)
+{
+    if (!binding->slot_tasks) {
+        return binding->pending_write && binding->buffer->receive->header.operation == FDM_KV_OP_DRAIN;
+    }
+    for (uint32_t index = 0; index < binding->buffer->input_slots; index++) {
+        const FDMKV_InputSlot_t *slot = &binding->buffer->slots[index];
+        if (slot->state != FDM_KV_SLOT_EMPTY && slot->receive->header_valid &&
+            slot->receive->header.operation == FDM_KV_OP_DRAIN) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool fdm_kv_attention_open(FemuCtrl *ctrl,
     const struct cemu_sparf_fdm_binding *wire,
     const struct cemu_sparf_workflow_header *header,
@@ -145,7 +219,7 @@ bool fdm_kv_attention_open(FemuCtrl *ctrl,
     g_mutex_lock(attention_lock(binding));
     if (buffer->failed || qatomic_read(&ctrl->native_stop) ||
         (buffer->draining && !buffer->sealed) || buffer->leases == UINT32_MAX ||
-        (binding->pending_write && buffer->receive->header.operation == FDM_KV_OP_DRAIN) ||
+        drain_pending(binding) ||
         wire->session_id != buffer->identity.session_id ||
         wire->generation != buffer->identity.generation ||
         !header->batch_size || header->batch_size > geometry->batches ||
@@ -168,7 +242,7 @@ bool fdm_kv_attention_open(FemuCtrl *ctrl,
             if (state->accepted > valid_tokens || state->readers == UINT32_MAX) {
                 goto done;
             }
-            if (state->accepted < valid_tokens) {
+            if (!binding->slot_tasks && state->accepted < valid_tokens) {
                 const FDMKV_AppendHeader_t *packet = &buffer->receive->header;
                 uint32_t batches = packet->version == CEMU_FDM_KV_LAYER_PACKET_VERSION ? packet->batch_count : 1;
                 if (!binding->aggregate_active || !buffer->receive->header_valid ||
@@ -181,6 +255,9 @@ bool fdm_kv_attention_open(FemuCtrl *ctrl,
                 }
             }
         }
+    }
+    if (binding->slot_tasks && !queued_snapshot_valid(buffer, header, rows, wire->batch_first)) {
+        goto done;
     }
     if (rows) attention->rows = g_memdup2(rows, header->batch_size * sizeof(*rows));
     buffer->leases++;

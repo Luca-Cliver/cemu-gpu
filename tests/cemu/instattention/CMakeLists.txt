@@ -77,6 +77,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_client_profile PRIVATE cemu_io_transport)
     target_link_options(test_client_profile PRIVATE "-Wl,--wrap=ioctl" "-Wl,--wrap=pread")
     add_test(NAME client_profile COMMAND test_client_profile)
+    add_executable(test_fdm_slot_client guest/test_fdm_slot_client.cpp guest/cemu_client.cpp ../util.c)
+    target_link_libraries(test_fdm_slot_client PRIVATE cemu_io_transport)
+    target_link_options(test_fdm_slot_client PRIVATE "-Wl,--wrap=ioctl")
+    add_test(NAME fdm_slot_client COMMAND test_fdm_slot_client)
 endif()
 
 target_include_directories(_cemu_client PRIVATE

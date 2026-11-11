@@ -94,6 +94,21 @@ class SparfGroupCapacityTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(settings["device_config"], str(config))
 
+    def test_aggregate_poll_selection(self):
+        result, settings = self.launch_profile("smoke")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(settings["fdm_aggregate_mode"], "notify")
+        result, settings = self.launch_profile("smoke", CEMU_FDM_AGGREGATE_MODE="poll",
+                                               CEMU_FDM_ASYNC_AGGREGATE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(settings["fdm_aggregate_mode"], "poll")
+        self.assertEqual(settings["fdm_async_aggregate"], "1")
+        for mode in ("poll", "invalid"):
+            with self.subTest(mode=mode):
+                result, _ = self.launch_profile("smoke", CEMU_FDM_AGGREGATE_MODE=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("CEMU_FDM_AGGREGATE_MODE", result.stderr)
+
     def test_batched_scratch_matches_device_allocation(self):
         from cemu_flexgen.sparf_group_device import SparfGroupedDevice
         from cemu_flexgen.sparf_group_layout import SparfGroupLayout

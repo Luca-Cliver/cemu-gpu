@@ -55,7 +55,7 @@ public:
                                bool replace_existing = false);
     void activate_program();
 
-    std::uint16_t create_memory_ranges(const std::vector<MemoryRange> &ranges);
+    std::uint16_t create_memory_ranges(const std::vector<MemoryRange> &ranges, bool pinned = false);
     void release_memory_ranges();
     void bind_fdm_kv_buffer(const void *metadata, std::size_t metadata_size);
 
@@ -104,6 +104,7 @@ private:
     bool program_loaded_ = false;
     bool program_active_ = false;
     bool memory_ranges_created_ = false;
+    bool memory_ranges_pinned_ = false;
     std::vector<MemoryRange> memory_ranges_;
     std::vector<int> memory_fds_;
 };

@@ -37,4 +37,23 @@ typedef long long (*FDMKV_ProfileFunction)(void *, FDMKV_AggregateProfile *, FDM
 long long fdm_kv_aggregate_profile_v1(void *args, FDMKV_AggregateProfile *profile,
                                     FDMKV_ProfileClock now_ns);
 
+#define CEMU_FDM_KV_SERVICE_VERSION 1U
+
+typedef enum FDMKV_ServiceResult {
+    FDM_KV_SERVICE_STOP,
+    FDM_KV_SERVICE_IDLE,
+    FDM_KV_SERVICE_PROGRESS,
+} FDMKV_ServiceResult;
+
+typedef struct FDMKV_ServiceRuntime {
+    uint32_t version;
+    uint32_t bytes;
+    void *opaque;
+    FDMKV_ServiceResult (*step)(void *opaque, FDMKV_ProfileFunction aggregate);
+    void (*relax)(void *opaque, FDMKV_ServiceResult result);
+} FDMKV_ServiceRuntime;
+
+typedef int (*FDMKV_ServiceFunction)(const FDMKV_ServiceRuntime *runtime);
+int fdm_kv_aggregate_service_v1(const FDMKV_ServiceRuntime *runtime);
+
 #endif

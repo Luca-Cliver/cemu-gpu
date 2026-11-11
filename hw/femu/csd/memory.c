@@ -108,29 +108,51 @@ static uint16_t memory_write(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     FDM_IO_STAMP(req, locked);
     FDMKV_Binding_t *binding = memory->fdm_kv_binding;
     bool input = false;
+    uint32_t slot_index = 0;
+    uint64_t transfer_id = le32_to_cpu(write->rsvd13[0]) |
+                           ((uint64_t)le32_to_cpu(write->rsvd13[1]) << 32);
+    uint64_t packet_bytes = le32_to_cpu(write->rsvd13[2]);
+    uint8_t *destination = backend_addr(ns->backend, sb);
     ret = fdm_kv_write_check(binding, sb, wl, &input);
     if (ret) {
         goto out;
     }
+    if (input && binding->slot_tasks) {
+        FDMKV_ReceiveResult acquired = fdm_kv_slot_acquire(binding->buffer,
+            transfer_id, packet_bytes, sb - binding->input_sb, wl, &slot_index, &destination);
+        if (acquired != FDM_KV_RECEIVE_ACCEPTED) {
+            ret = (acquired == FDM_KV_RECEIVE_BUSY ? NVME_CMD_SEQ_ERROR : NVME_INVALID_FIELD) | NVME_DNR;
+            goto out;
+        }
+    } else if (transfer_id || packet_bytes) {
+        ret = NVME_INVALID_FIELD | NVME_DNR;
+        goto out;
+    }
     if (input && req->fdm_io_trace.enabled) {
         req->fdm_io_trace.session = binding->buffer->identity.session_id;
-        req->fdm_io_trace.packet_id = binding->buffer->receive->next_request_id;
+        req->fdm_io_trace.packet_id = binding->slot_tasks ?
+            binding->buffer->slots[slot_index].receive->next_request_id :
+            binding->buffer->receive->next_request_id;
     }
     FDM_IO_STAMP(req, dma_begin);
-    int dma_status = dma_write_prp(n, backend_addr(ns->backend, sb), wl, prp1, prp2);
+    int dma_status = dma_write_prp(n, destination, wl, prp1, prp2);
     FDM_IO_STAMP(req, dma_end);
     if (dma_status) {
         femu_err("memory_write: dma_read_prp error\n");
         if (input) {
-            fdm_kv_receive_fail(binding->buffer);
-            backend_cuda_mark_host_dirty(ns->backend, backend_addr(ns->backend, sb), wl);
+            if (binding->slot_tasks) {
+                fdm_kv_slot_fail(binding->buffer, slot_index);
+            } else {
+                fdm_kv_receive_fail(binding->buffer);
+            }
+            backend_cuda_mark_host_dirty(ns->backend, destination, wl);
         }
         ret = input ? NVME_DATA_TRAS_ERROR | NVME_DNR : NVME_DNR;
         goto out;
     }
 
     backend_cuda_mark_host_dirty(ns->backend,
-                                 backend_addr(ns->backend, sb), wl);
+                                 destination, wl);
 
     req->stat.pcie_lat = 0;
     req->stat.data_size = wl;
@@ -138,19 +160,27 @@ static uint16_t memory_write(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     req->stat.expire_time += wl / 2;
     req->cqe.n.result = wl;
     if (input) {
-        FDMKV_ReceiveResult result = fdm_kv_receive_record(
-            binding->buffer, sb - binding->input_sb, wl, req->stat.expire_time);
+        FDMKV_ReceiveResult result = binding->slot_tasks ?
+            fdm_kv_slot_record(binding->buffer, slot_index, sb - binding->input_sb,
+                               wl, req->stat.expire_time) :
+            fdm_kv_receive_record(binding->buffer, sb - binding->input_sb, wl, req->stat.expire_time);
+        FDMKV_ReceiveState_t *receive = binding->slot_tasks ?
+            binding->buffer->slots[slot_index].receive : binding->buffer->receive;
         if (result == FDM_KV_RECEIVE_READY) {
             if (req->fdm_io_trace.enabled) {
-                req->fdm_io_trace.operation = binding->buffer->receive->header.operation;
-                req->fdm_io_trace.packet_id = binding->buffer->receive->header.request_id;
-                req->fdm_io_trace.token_first = binding->buffer->receive->header.token_first;
+                req->fdm_io_trace.operation = receive->header.operation;
+                req->fdm_io_trace.packet_id = receive->header.request_id;
+                req->fdm_io_trace.token_first = receive->header.token_first;
             }
             if (binding->aggregate_program) {
-                binding->pending_write = req;
+                if (binding->slot_tasks) {
+                    binding->slot_tasks[slot_index].pending = req;
+                } else {
+                    binding->pending_write = req;
+                }
                 req->fdm_kv_pending = true;
                 req->stat.expire_time = MAX(req->stat.expire_time,
-                    binding->buffer->receive->max_write_ready_ns);
+                    receive->max_write_ready_ns);
             } else {
                 femu_err("FDM KV receive-only binding cannot aggregate; write not acknowledged\n");
                 ret = NVME_INVALID_OPCODE | NVME_DNR;
@@ -166,6 +196,9 @@ out:
     }
     if (input) {
         backend_cuda_mark_host_dirty(ns->backend, binding->buffer, binding->buffer->meta_bytes);
+        if (binding->buffer->failed) {
+            g_cond_broadcast(&binding->aggregate_wake);
+        }
     }
     if (ret) {
         req->cqe.n.result = 0;

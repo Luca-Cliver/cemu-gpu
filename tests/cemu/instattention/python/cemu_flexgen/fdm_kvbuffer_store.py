@@ -16,8 +16,8 @@ BIND_DESCRIPTOR = struct.Struct("<4I3Q4IQ4I")
 BIND_MAGIC = 0x31424B46
 BIND_VERSION = 1
 APPEND_HEADER = struct.Struct("<4I5Q4IQ2I")
-BUFFER_VERSION = 3
-BUFFER_HEADER_BYTES = 376
+BUFFER_VERSION = 4
+BUFFER_HEADER_BYTES = 424
 RECEIVE_STATE_BYTES = 152
 MAX_DATA_MRS = 126
 DATA_MR_BYTES = 2**32 - 65536
@@ -42,7 +42,10 @@ class FDM_KVbuffer:
             batch_pages=256,
             aggregate_program="./build/fdm_kv_aggregate.so",
             profiler=None,
+            input_slots=0,
     ):
+        if isinstance(input_slots, bool) or not isinstance(input_slots, Integral) or input_slots not in (0, 1, 2):
+            raise ValueError("FDM input slots must be 0 (legacy), 1 or 2")
         dimensions = (batches, layers, heads, microbatch_size, nvm_namespace_id, batch_pages)
         capacities = (max_tokens, meta_bytes, data_bytes)
         for values, limit in ((dimensions, 2**32), (capacities, 2**64)):
@@ -67,6 +70,8 @@ class FDM_KVbuffer:
             raise ValueError("FDM KV ranges and input capacity must be 512-byte aligned")
         if not 512 + 2 * layout.head_dim * layout.dtype.itemsize <= input_bytes <= min(data_bytes, DATA_MR_BYTES):
             raise ValueError("FDM KV input must fit its header and one K/V row within MR1")
+        if input_bytes * max(1, input_slots) > min(data_bytes, DATA_MR_BYTES):
+            raise ValueError("all FDM input slots must fit within MR1")
 
         self.layout = layout
         self.profiler = profiler
@@ -94,6 +99,7 @@ class FDM_KVbuffer:
         self.generation = 1
         self.nvm_namespace_id = nvm_namespace_id
         self.input_bytes = input_bytes
+        self.input_slots = input_slots
         self.batch_pages = batch_pages
         self.aggregate_program = str(aggregate_program)
 
@@ -127,7 +133,10 @@ class FDM_KVbuffer:
                     self.control_path,
                     self.namespace_path,
                 )
-                self._rsid = self._client.create_memory_ranges(self.ranges)
+                if self.input_slots:
+                    self._rsid = self._client.create_memory_ranges(self.ranges, pinned=True)
+                else:
+                    self._rsid = self._client.create_memory_ranges(self.ranges)
                 self._client.load_program(
                     f"fdm_kv_{self.session_id:016x}", self.aggregate_program,
                     "fdm_kv_aggregate",
@@ -142,13 +151,14 @@ class FDM_KVbuffer:
             return self
 
     def _binding_descriptor(self):
-        return BIND_DESCRIPTOR.pack(
-            BIND_MAGIC, BIND_VERSION, self.nvm_namespace_id, self.batch_pages,
+        descriptor = BIND_DESCRIPTOR.pack(
+            BIND_MAGIC, 2 if self.input_slots else BIND_VERSION, self.nvm_namespace_id, self.batch_pages,
             self.session_id, self.generation, self.input_bytes,
             self.batches, self.layers, self.heads, self.layout.head_dim,
             self.max_tokens, self.layout.channels_per_page, self.layout.dtype.itemsize,
             self.layout.page_bytes, 0,
         )
+        return descriptor + struct.pack("<2I", self.input_slots, 1) if self.input_slots else descriptor
 
     def close(self):
         with self._lock:

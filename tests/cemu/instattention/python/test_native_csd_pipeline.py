@@ -276,6 +276,206 @@ class FdmCsdPipelineTest(unittest.TestCase):
         with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1"):
             self.test_fdm_attention_boundaries_gqa_dedup_and_identity()
 
+    def test_fdm_poll_attention_boundaries(self):
+        with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.test_fdm_async_attention_boundaries()
+
+    def test_fdm_two_slot_attention_boundaries(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+            self.test_fdm_attention_boundaries_gqa_dedup_and_identity()
+
+    def test_fdm_two_slot_segmented_attention(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+            self.test_segmented_fdm_attention_and_writeback()
+
+    def test_fdm_two_slot_opt_prefill_decode(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+            self.test_opt_prefill_decode_through_fdm_storage_and_attention()
+
+    def test_fdm_two_slot_failure_after_ack(self):
+        with patch.object(self, "input_slots", 2, create=True):
+            self.run_async_failure_case(mode="poll")
+
+    def test_fdm_two_slot_ack_dependency_backpressure_and_reuse(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.run_async_dependency_case(cancel=False)
+
+    def test_fdm_two_slot_reset_with_queued_packets_and_reader(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.run_async_dependency_case(cancel=True)
+
+    def test_fdm_two_slot_drain_waits_for_queued_append_and_reader(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.run_async_dependency_case(cancel=False, drain_queued=True)
+
+    def test_fdm_two_slot_fragment_deadline(self):
+        with patch.object(self, "input_slots", 2, create=True), \
+                patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.test_fdm_async_ack_requires_all_fragments_and_model_time()
+
+    def test_fdm_two_slot_tags_protection_and_stale_transfer(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-slots-tags-") as directory, ExitStack() as stack:
+            with patch.object(self, "input_slots", 2, create=True), \
+                    patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+                self.start_device(directory, stack)
+                store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16).open()
+            offset = store._client.input_offset
+            keys = np.ones((1, 1, 128), dtype=np.float16)
+            with patch.object(store._client, "write_range") as packed:
+                store.append_batch(0, 0, keys, keys)
+            packet = packed.call_args.args[1]
+            for address, transfer, total in ((offset, 0, 0), (offset, 1001, 0),
+                    (offset, 0, len(packet)), (offset + store.input_bytes, 1001, len(packet)),
+                    (4 * 1024**2, 1001, len(packet))):
+                self.call(1, 5, (address, 0, len(packet), transfer, 0, total), 2, packet, rejected=True)
+            self.assertEqual(store.statistics()["failed"], 0)
+            self.call(1, 5, (offset + 512, 0, len(packet) - 512, 1001, 0, len(packet)), 2, packet[512:])
+            self.call(1, 5, (offset + 512, 0, len(packet) - 512, 1001, 0, len(packet)), 2,
+                      packet[512:], rejected=True)
+            self.call(1, 5, (offset, 0, 512, 1002, 0, len(packet)), 2, packet[:512], rejected=True)
+            self.call(0, 0x21, (1 | (store._rsid << 16), 0, 0, 0, 0, 0), 3, rejected=True)
+            self.call(1, 5, (offset, 0, 512, 1001, 0, len(packet)), 2, packet[:512])
+            deadline = time.monotonic() + 5
+            while any(state[0] for state in self.slot_snapshot()[0]):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            self.assertEqual(store.statistics()["accepted_stream0"], 1)
+            self.call(1, 5, (offset, 0, len(packet), 1001, 0, len(packet)), 2, packet, rejected=True)
+            self.assertEqual(store.statistics()["failed"], 0)
+            store._client.transfer_id = 1001
+            store.drain()
+            store.close()
+
+    def test_fdm_two_slot_dma_and_packet_length_failures(self):
+        for dma_failure in (False, True):
+            with self.subTest(dma_failure=dma_failure), \
+                    tempfile.TemporaryDirectory(prefix="fdm-slots-fail-") as directory, ExitStack() as stack:
+                with patch.object(self, "input_slots", 2, create=True), \
+                        patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+                    self.start_device(directory, stack)
+                    store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16).open()
+                keys = np.ones((1, 1, 128), dtype=np.float16)
+                with patch.object(store._client, "write_range") as packed:
+                    store.append_batch(0, 0, keys, keys)
+                packet = packed.call_args.args[1]
+                self.call(1, 5, (store._client.input_offset, 0, 512, 1001, 0, len(packet) + 512),
+                          2, packet[:512], rejected=True, **({"prp1": 0} if dma_failure else {}))
+                self.assertEqual(store.statistics()["failed"], 1)
+                self.assertEqual(store.statistics()["accepted_stream0"], 0)
+                with self.assertRaises((AssertionError, RuntimeError)):
+                    store.drain()
+                store.close()
+
+    def test_fdm_two_slot_bind_validation(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-slots-bind-") as directory, ExitStack() as stack:
+            with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+                self.start_device(directory, stack)
+            for count in (0, 3):
+                with patch.object(self, "input_slots", count, create=True):
+                    store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
+                    with self.assertRaisesRegex(AssertionError, r"opcode=0x21 ns=3 status=0x[1-9a-f]"):
+                        store.open()
+                    self.assertFalse(store.registered)
+            with patch.object(self, "input_slots", 2, create=True):
+                store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16).open()
+                store.close()
+
+    def test_fdm_poll_ack_requires_all_fragments_and_model_time(self):
+        with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.test_fdm_async_ack_requires_all_fragments_and_model_time()
+
+    def test_fdm_poll_ack_read_dependency_and_input_backpressure(self):
+        with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.test_fdm_async_ack_read_dependency_and_input_backpressure()
+
+    def test_fdm_poll_reset_cancels_waiting_reader_and_aggregation(self):
+        with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll"):
+            self.test_fdm_async_reset_cancels_waiting_reader_and_aggregation()
+
+    def test_fdm_poll_failure_after_ack_is_sticky(self):
+        self.run_async_failure_case(mode="poll")
+
+    def test_fdm_poll_service_rejects_runtime(self):
+        self.run_poll_service_exit_case(status=-1)
+
+    def test_fdm_poll_service_unexpected_successful_return_is_failure(self):
+        self.run_poll_service_exit_case(status=0)
+
+    def run_poll_service_exit_case(self, status):
+        with tempfile.TemporaryDirectory(prefix="fdm-poll-exit-") as directory, ExitStack() as stack:
+            with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1",
+                            CEMU_FDM_AGGREGATE_PROFILE="0"):
+                self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
+            source = Path(directory) / "exit.c"
+            source.write_text(
+                f'#include "{ROOT / "hw/femu/fdm_kv_aggregate.h"}"\n'
+                'long long fdm_kv_aggregate(struct cemu_args *args) { return -1; }\n'
+                'int fdm_kv_aggregate_service_v1(const FDMKV_ServiceRuntime *runtime) {\n'
+                f'    return {status};\n}}\n')
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(Path(directory) / "aggregate.so")], check=True)
+            store.open()
+            self.assertTrue(store.registered)
+            deadline = time.monotonic() + 5
+            while not store.statistics()["failed"]:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            self.assertEqual(store.statistics()["accepted_stream0"], 0)
+            self.assertIn(f"service terminated unexpectedly: status={status}", self.device.read_log())
+            with self.assertRaises((AssertionError, RuntimeError)):
+                store.drain()
+            store.close()
+
+    def test_fdm_poll_requires_async_aggregate(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-poll-sync-") as directory, ExitStack() as stack:
+            with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="0",
+                            CEMU_FDM_AGGREGATE_PROFILE="0"):
+                self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
+            with self.assertRaisesRegex(AssertionError, r"opcode=0x21 ns=3 status=0x[1-9a-f]"):
+                store.open()
+            self.assertFalse(store.registered)
+            self.assertIsNone(store._client)
+            self.assertIn("CEMU_FDM_ASYNC_AGGREGATE=1", self.device.read_log())
+
+    def test_fdm_poll_rejects_legacy_aggregate_without_service(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-poll-legacy-") as directory, ExitStack() as stack:
+            with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1",
+                            CEMU_FDM_AGGREGATE_PROFILE="0"):
+                self.start_device(directory, stack)
+            store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
+            source = Path(directory) / "fail.c"
+            source.write_text('long long fdm_kv_aggregate(void *args) { return -1; }\n')
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(Path(directory) / "aggregate.so")], check=True)
+            with self.assertRaisesRegex(AssertionError, r"opcode=0x21 ns=3 status=0x[1-9a-f]"):
+                store.open()
+            self.assertFalse(store.registered)
+            self.assertIsNone(store._client)
+            self.assertIn("service v1", self.device.read_log())
+            with self.make_store(directory, 1, 1, 1, 32, 1, np.float16) as replacement:
+                self.assertEqual(replacement.statistics()["failed"], 0)
+
+    def test_fdm_poll_idle_close_releases_binding_and_program(self):
+        with tempfile.TemporaryDirectory(prefix="fdm-poll-idle-") as directory, ExitStack() as stack:
+            with patch.dict(os.environ, CEMU_FDM_AGGREGATE_MODE="poll", CEMU_FDM_ASYNC_AGGREGATE="1"):
+                self.start_device(directory, stack)
+            for iteration in range(2):
+                with self.subTest(iteration=iteration):
+                    store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16).open()
+                    self.assertIn("aggregation mode=poll-service-v1, input_slots=1", self.device.read_log())
+                    self.assertEqual(store.statistics()["accepted_stream0"], 0)
+                    time.sleep(0.02)
+                    store.close()
+                    self.assertFalse(store.registered)
+                    self.assertIsNone(store._client)
+                    self.assertEqual(struct.unpack_from("<I", self.memory(2, 4 * 1024**2, 512), 176)[0], 0)
+
     def test_fdm_async_unrelated_memory_bypasses_aggregation_lock(self):
         with tempfile.TemporaryDirectory(prefix="fdm-lock-") as directory, ExitStack() as stack:
             entered = Path(directory) / "entered"
@@ -331,6 +531,19 @@ class FdmCsdPipelineTest(unittest.TestCase):
     def test_fdm_async_ack_read_dependency_and_input_backpressure(self):
         self.run_async_dependency_case(cancel=False)
 
+    def slot_snapshot(self):
+        meta_offset = 4 * 1024**2
+        header = self.memory(2, meta_offset, 424)
+        count, active, slots, received = struct.unpack_from("<IIQQ", header, 376)
+        width = struct.unpack_from("<Q", header, 248)[0]
+        bitmap_bytes = (width // 4 + 7) // 8
+        head_offset = (424 + 152 + bitmap_bytes + 7) // 8 * 8
+        base = struct.unpack_from("<Q", header, 200)[0] - head_offset
+        descriptors = self.memory(2, meta_offset + slots - base, count * 56)
+        states = [struct.unpack_from("<II6Q", descriptors, index * 56) for index in range(count)]
+        prefix = struct.unpack("<Q", self.memory(2, meta_offset + received - base, 8))[0]
+        return states, prefix
+
     def test_fdm_async_reset_cancels_waiting_reader_and_aggregation(self):
         self.run_async_dependency_case(cancel=True)
 
@@ -345,13 +558,18 @@ class FdmCsdPipelineTest(unittest.TestCase):
             with patch.object(store._client, "write_range") as packed:
                 store.append_batch(0, 0, keys, keys)
             packet = packed.call_args.args[1]
-            input_offset = 4 * 1024**2 + 65536
-            self.memory(5, input_offset, packet[:512])
+            input_offset = store._client.input_offset
+            multi = hasattr(self, "input_slots")
+            if multi:
+                store._client.transfer_id += 1
+            transfer = store._client.transfer_id if multi else 0
+            total = len(packet) if multi else 0
+            self.call(1, 5, (input_offset, 0, 512, transfer, 0, total), 2, packet[:512])
             self.assertEqual(store.statistics()["accepted_stream0"], 0)
             self.assertFalse(any(record["source"] == "background_aggregate"
                                  for record in map(json.loads, trace_path.read_text().splitlines())))
             device.write(DATA, packet[512:])
-            device.submit(1, 5, (input_offset + 512, 0, len(packet) - 512, 0, 0, 0),
+            device.submit(1, 5, (input_offset + 512, 0, len(packet) - 512, transfer, 0, total),
                           namespace=2, prp2=DATA + 4096)
             time.sleep(0.02)
             self.assertIsNone(device.completion(1))
@@ -368,7 +586,7 @@ class FdmCsdPipelineTest(unittest.TestCase):
             self.assertGreater(background[0]["aggregate_profile"]["successful_calls"], 0)
             store.close()
 
-    def run_async_dependency_case(self, cancel):
+    def run_async_dependency_case(self, cancel, drain_queued=False):
         from test_instattention_native_qtest import IOCQ
 
         with tempfile.TemporaryDirectory(prefix="fdm-async-") as directory, ExitStack() as stack:
@@ -402,14 +620,33 @@ class FdmCsdPipelineTest(unittest.TestCase):
             device.write(DATA, metadata)
             device.submit(1, 1, fields, namespace=3, command2=1 | (extra_rsid << 16), command4=len(metadata))
             second_execute = device.cid
-            with patch.object(store._client, "write_range") as packed:
+            two_slot = getattr(self, "input_slots", 0) == 2
+            if two_slot and not drain_queued:
                 store.append_batch(0, 16, keys[:1], keys[:1])
+                self.assertEqual(store.statistics()["accepted_stream0"], 15)
+                states, prefix = self.slot_snapshot()
+                self.assertEqual(prefix, 17)
+                self.assertEqual(len(states), 2)
+                self.assertTrue(all(state[0] in (3, 4) for state in states))
+                self.assertEqual({state[2] for state in states}, {1002, 1003})
+                self.assertEqual(abs(states[0][4] - states[1][4]), store.input_bytes)
+            with patch.object(store._client, "write_range") as packed:
+                if drain_queued:
+                    store.drain()
+                else:
+                    store.append_batch(0, 17 if two_slot else 16, keys[:1], keys[:1])
             packet = packed.call_args.args[1]
             device.write(DATA, packet)
-            device.submit(1, 5, (4 * 1024**2 + 65536, 0, len(packet), 0, 0, 0), namespace=2)
+            if two_slot:
+                store._client.transfer_id += 1
+            transfer = store._client.transfer_id if two_slot else 0
+            device.submit(1, 5, (store._client.input_offset, 0, len(packet),
+                                transfer, 0, len(packet) if two_slot else 0), namespace=2)
             next_append = device.cid
             time.sleep(0.02)
             self.assertIsNone(device.completion(1))
+            if drain_queued:
+                self.assertEqual(store.statistics()["sealed"], 0)
             if cancel:
                 device.initialize()
                 self.assertIsNone(device.completion(1))
@@ -435,13 +672,13 @@ class FdmCsdPipelineTest(unittest.TestCase):
             self.assertEqual(completed, {first_execute: 0, second_execute: 0, next_append: 0})
             store.drain()
             stats = store.statistics()
-            self.assertEqual(stats["accepted_stream0"], 17)
+            self.assertEqual(stats["accepted_stream0"], 16 if drain_queued else 18 if two_slot else 17)
             self.assertEqual(stats["failed"], 0)
             self.assertEqual(stats["sealed"], 1)
             self.assertEqual(stats["staged_pages"], 0)
             records = list(map(json.loads, trace_path.read_text().splitlines()))
             background = [record for record in records if record["source"] == "background_aggregate"]
-            self.assertEqual(len(background), 3)
+            self.assertEqual(len(background), 2 if drain_queued else 4 if two_slot else 3)
             for record in background:
                 self.assertEqual(record["status"], 0)
                 self.assertLessEqual(record["accepted_ns"], record["started_ns"])
@@ -451,16 +688,39 @@ class FdmCsdPipelineTest(unittest.TestCase):
             self.assertEqual(acknowledged["aggregate_calls"], 0)
             self.assertLess(acknowledged["virtual"]["cq_begin"], delayed["finished_ns"])
             deferred = next(record for record in records if record["source"] == "device" and record["cid"] == next_append)
-            self.assertGreater(deferred["input_slot_wait_ns"], 0)
+            if drain_queued:
+                self.assertEqual(deferred["operation"], 2)
+                self.assertGreaterEqual(deferred["virtual"]["cq_begin"], delayed["finished_ns"])
+            else:
+                self.assertGreater(deferred["input_slot_wait_ns"], 0)
             store.close()
 
     def test_fdm_async_failure_after_ack_is_sticky(self):
+        self.run_async_failure_case(mode="notify")
+
+    def run_async_failure_case(self, mode):
         with tempfile.TemporaryDirectory(prefix="fdm-async-error-") as directory, ExitStack() as stack:
-            with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1"):
+            with patch.dict(os.environ, CEMU_FDM_ASYNC_AGGREGATE="1", CEMU_FDM_AGGREGATE_MODE=mode,
+                            CEMU_FDM_AGGREGATE_PROFILE="0"):
                 self.start_device(directory, stack)
             store = self.make_store(directory, 1, 1, 1, 32, 1, np.float16)
             source = Path(directory) / "fail.c"
-            source.write_text('long long fdm_kv_aggregate(void *args) { return -1; }\n')
+            source.write_text(
+                f'#include "{ROOT / "hw/femu/fdm_kv_aggregate.h"}"\n'
+                'long long fdm_kv_aggregate(struct cemu_args *args) { return -1; }\n'
+                'static long long failed_step(void *args, FDMKV_AggregateProfile *profile,\n'
+                '                             FDMKV_ProfileClock now_ns) { return -1; }\n'
+                'int fdm_kv_aggregate_service_v1(const FDMKV_ServiceRuntime *runtime) {\n'
+                '    if (!runtime || runtime->version != CEMU_FDM_KV_SERVICE_VERSION ||\n'
+                '        runtime->bytes != sizeof(*runtime) || !runtime->step || !runtime->relax)\n'
+                '        return -1;\n'
+                '    for (;;) {\n'
+                '        FDMKV_ServiceResult result = runtime->step(runtime->opaque, failed_step);\n'
+                '        if (result == FDM_KV_SERVICE_STOP) return 0;\n'
+                '        if (result != FDM_KV_SERVICE_IDLE && result != FDM_KV_SERVICE_PROGRESS)\n'
+                '            return -1;\n'
+                '        runtime->relax(runtime->opaque, result);\n'
+                '    }\n}\n')
             subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(Path(directory) / "aggregate.so")], check=True)
             store.open()
             keys = np.ones((1, 1, 128), dtype=np.float16)
@@ -715,11 +975,13 @@ class FdmCsdPipelineTest(unittest.TestCase):
             str(ROOT / "hw/femu/fdm_kv_layout.c"), "-o", str(aggregate)], check=True)
         test = self
         offsets = []
+        slot_count = getattr(self, "input_slots", None)
 
         class Client:
             def __init__(self, *args):
                 self.active = False
                 self.rsid = None
+                self.transfer_id = 1000
 
             def create_memory_ranges(self, ranges):
                 offsets.clear()
@@ -727,6 +989,7 @@ class FdmCsdPipelineTest(unittest.TestCase):
                 for spec in ranges:
                     offsets.append(cursor)
                     cursor += spec[2] + (4096 if getattr(test, "segmented_data", False) else 0)
+                self.input_offset = offsets[1]
                 descriptor = b"".join(struct.pack("<IIQQQ", 2, spec[2], offset, 0, 0)
                                       for spec, offset in zip(ranges, offsets))
                 self.rsid = test.call(0, 0x21, (0, len(ranges), 0, 0, 0, 0), 3, descriptor)
@@ -741,10 +1004,23 @@ class FdmCsdPipelineTest(unittest.TestCase):
                 self.active = True
 
             def bind_fdm_kv_buffer(self, wire):
+                if slot_count is not None:
+                    wire = bytearray(wire)
+                    struct.pack_into("<I", wire, 4, 2)
+                    wire += struct.pack("<2I", slot_count, 1)
                 test.call(0, 0x21, (2 | (self.rsid << 16), len(wire), 2, 0, 0, 0), 3, wire)
 
             def write_range(self, index, payload, offset):
-                test.memory(5, offsets[index] + offset, payload)
+                if slot_count is not None and index == 1:
+                    test.assertEqual(offset, 0)
+                    self.transfer_id += 1
+                    for start in range(0, len(payload), 4096):
+                        fragment = payload[start:start + 4096]
+                        address = offsets[index] + start
+                        test.call(1, 5, (address & 0xffffffff, address >> 32, len(fragment),
+                            self.transfer_id & 0xffffffff, self.transfer_id >> 32, len(payload)), 2, fragment)
+                else:
+                    test.memory(5, offsets[index] + offset, payload)
 
             def read_range_bytes(self, index, size, offset):
                 return test.memory(2, offsets[index] + offset, size)
@@ -763,9 +1039,11 @@ class FdmCsdPipelineTest(unittest.TestCase):
 
         module = store_module(Client)
         if getattr(self, "segmented_data", False):
-            module.DATA_MR_BYTES = 1024 * 1024
+            module.DATA_MR_BYTES = (2 if hasattr(self, "input_slots") else 1) * 1024 * 1024
+        meta_bytes = 128 * 1024 if hasattr(self, "input_slots") else 65536
+        data_bytes = (3840 if hasattr(self, "input_slots") else 3072) * 1024
         return module.FDM_KVbuffer(SparfGroupLayout(128, 8, dtype=dtype), batches,
-            layers, heads, max_tokens, microbatch_size, directory, 65536, 3 * 1024**2,
+            layers, heads, max_tokens, microbatch_size, directory, meta_bytes, data_bytes,
             aggregate_program=str(aggregate), batch_pages=32)
 
 

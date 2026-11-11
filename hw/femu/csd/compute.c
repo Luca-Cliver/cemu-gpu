@@ -767,13 +767,15 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
     } else if (sel == CEMU_FDM_KV_BIND_SELECTOR) {
         if (rsid == 0 || rsid > MAX_RSID ||
             le32_to_cpu(cmd->cdw10) != (sel | ((uint32_t)rsid << 16)) ||
-            le32_to_cpu(cmd->cdw11) != sizeof(FDMKV_BindParams_t) ||
+            (le32_to_cpu(cmd->cdw11) != sizeof(FDMKV_BindParams_t) &&
+             le32_to_cpu(cmd->cdw11) != sizeof(FDMKV_BindSlotsParams_t)) ||
             le32_to_cpu(cmd->cdw12) > MAX_PIND || cmd->cdw13 || cmd->cdw14 || cmd->cdw15 ||
             cmd->fuse || cmd->psdt || cmd->res1 || cmd->res2 || cmd->mptr) {
             return NVME_INVALID_FIELD;
         }
-        FDMKV_BindParams_t wire;
-        if (dma_write_prp(n, (uint8_t *)&wire, sizeof(wire), prp1, prp2)) {
+        FDMKV_BindSlotsParams_t wire = {0};
+        uint32_t wire_bytes = le32_to_cpu(cmd->cdw11);
+        if (dma_write_prp(n, (uint8_t *)&wire, wire_bytes, prp1, prp2)) {
             return NVME_INVALID_FIELD | NVME_DNR;
         }
         pthread_spin_lock(&memory_range_set_slab(ns)->lock);
@@ -783,7 +785,7 @@ static uint16_t memory_range_set_management(NvmeNamespace *ns, NvmeCmd *cmd, Nvm
         if (program) {
             pthread_mutex_lock(&program->lock);
         }
-        uint16_t status = fdm_kv_bind(ns, mrs, &wire, program);
+        uint16_t status = fdm_kv_bind(ns, mrs, &wire, wire_bytes, program);
         if (program) {
             pthread_mutex_unlock(&program->lock);
         }

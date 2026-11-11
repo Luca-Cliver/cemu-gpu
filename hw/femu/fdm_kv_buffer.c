@@ -85,6 +85,9 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
     FDMKV_DataSegment_t segments[CEMU_FDM_KV_MAX_DATA_MRS] = {0};
     uint64_t available_pages = 0;
     uint64_t total_bytes = 0;
+    FDMKV_InputSlot_t slots[CEMU_FDM_KV_MAX_INPUT_SLOTS] = {0};
+    FDMKV_ReceiveState_t receives[CEMU_FDM_KV_MAX_INPUT_SLOTS] = {0};
+    uint64_t input_pool_bytes;
 
     if (!params || !result) {
         return false;
@@ -92,7 +95,8 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
 
     FDMKV_InitParams_t config = *params;
 
-    if (config.segment_count > CEMU_FDM_KV_MAX_DATA_MRS ||
+    if (config.input_slots > CEMU_FDM_KV_MAX_INPUT_SLOTS ||
+        config.segment_count > CEMU_FDM_KV_MAX_DATA_MRS ||
         (config.segment_count && !config.data_segments)) {
         return false;
     }
@@ -134,20 +138,21 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
 
     if(config.input_bytes % 512 ||
        config.input_bytes < CEMU_FDM_KV_PACKET_HEADER_BYTES + 2 * row_bytes ||
-       config.input_bytes > config.data_bytes)
+       config.input_bytes > config.data_bytes / (config.input_slots ? config.input_slots : 1))
     {
         return false;
     }
 
+    input_pool_bytes = config.input_bytes * (config.input_slots ? config.input_slots : 1);
     data_padding = (config.geometry.page_bytes -
-            config.input_bytes % config.geometry.page_bytes) %
+            input_pool_bytes % config.geometry.page_bytes) %
             config.geometry.page_bytes;
 
-    if (data_padding > config.data_bytes - config.input_bytes) {
+    if (data_padding > config.data_bytes - input_pool_bytes) {
         return false;
     }
 
-    data_offset = config.input_bytes + data_padding;
+    data_offset = input_pool_bytes + data_padding;
 
     for (uint32_t index = 0; index < config.segment_count; index++) {
         uintptr_t address = (uintptr_t)segments[index].address;
@@ -221,6 +226,29 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
     candidate.segment_count = config.segment_count;
     candidate.segments = fdm_kv_take(&arena, config.segment_count, sizeof(*candidate.segments));
 
+    if (config.input_slots) {
+        candidate.input_slots = config.input_slots;
+        candidate.slots = fdm_kv_take(&arena, config.input_slots, sizeof(*candidate.slots));
+        candidate.received_heads = fdm_kv_take(&arena, candidate.layout.head_count,
+                                             sizeof(*candidate.received_heads));
+        if (!candidate.slots || !candidate.received_heads) {
+            return false;
+        }
+        for (uint32_t index = 0; index < config.input_slots; index++) {
+            receives[index] = receive;
+            slots[index].input = (uint8_t *)config.data_addr + index * config.input_bytes;
+            slots[index].receive = index ? fdm_kv_take(&arena, 1, sizeof(receive)) : candidate.receive;
+            if (index) {
+                receives[index].received_bitmap = fdm_kv_take(&arena, receive.bitmap_bytes, 1);
+            }
+            if (!slots[index].receive || !receives[index].received_bitmap) {
+                return false;
+            }
+        }
+        candidate.next_receive_id = 1;
+        candidate.next_aggregate_id = 1;
+    }
+
     if (!buffer || !candidate.receive || !receive.received_bitmap ||
         !candidate.head_states || !candidate.staged || !candidate.blocks ||
         !candidate.page_hash || !candidate.writebacks || !candidate.segments) {
@@ -268,6 +296,12 @@ bool fdm_kv_buffer_init(const FDMKV_InitParams_t *params, FDMKV_Buffer_t **resul
     *buffer = candidate;
     *buffer->receive = receive;
     memcpy(buffer->segments, segments, config.segment_count * sizeof(*segments));
+    if (config.input_slots) {
+        memcpy(buffer->slots, slots, config.input_slots * sizeof(*slots));
+        for (uint32_t index = 0; index < config.input_slots; index++) {
+            *slots[index].receive = receives[index];
+        }
+    }
 
     for (uint32_t index = 1; index <= buffer->pool_pages; index++) {
         buffer->staged[index].next =

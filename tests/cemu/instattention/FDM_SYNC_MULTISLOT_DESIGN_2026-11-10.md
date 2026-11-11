@@ -1,8 +1,125 @@
 # FDM 同步写入、设备多 input 槽位与常驻聚合设计
 
-日期：2026-11-10。状态：设计与代码修改路线，尚未实现。
+日期：2026-11-10。状态：设备多槽接线、Guest 内核标签链路和 opt-in 客户端已实现，Guest 真实文件 pwrite 双槽 smoke 已通过；FlexGen 完整实验开关已接入，完整推理仍待验收。
 
-本文整理当前讨论，不表示代码已具备多槽位或常驻轮询功能。本次只整理文档，不修改内核、客户端、算子或设备实现。
+第一阶段新增 opt-in `CEMU_FDM_AGGREGATE_MODE=poll`，默认仍为 `notify`。poll 必须同时设置 `CEMU_FDM_ASYNC_AGGREGATE=1`，模块必须导出 `fdm_kv_aggregate_service_v1`。每次绑定只启动一次模块常驻循环，锁外轮询单槽任务的 active 状态，内部有限 step 保持原有 deadline、lease 和错误语义。READY 仍受原有 deadline 检查约束；轮询仅驱动聚合，不删除 SparF 等待所需的 cond 通知。
+
+默认 Guest 客户端仍发送 v1 绑定，继续走原单槽路径。显式 `FDM_KVbuffer(..., input_slots=2)` 使用新 pinned MRS／联合绑定接口，不支持时直接报错，不静默退回旧格式。FlexGen 完整实验入口现支持 `CEMU_FLEXGEN_FDM_INPUT_SLOTS=2`，额外槽空间计入数据预算；vLLM 入口尚未接此开关。具体启动与验收见 README 的“同步双 input 槽全流程验收”。不能把设备 qtest 和内核对象编译通过视为完整推理验收完成。
+
+后续 Guest 实测进展：用户已启动新内核完成双槽 smoke，17 个 APPEND，accepted/committed=1552，sealed=1，failed=0，清理通过。内核 trace 显示第一包拆为 12×128 KiB+512 字节的 13 条命令，携带同一 transfer_id；设备记录显示第二包在第一包后台结束前接收，第三包入口背压约 8.010 ms。该测试不包含完整 Attention 数值对照；完整 FlexGen 双槽推理仍待 Guest 验收。
+
+### 第二阶段：两槽核心
+
+`FDMKV_InitParams_t.input_slots` 为 0 时保留旧接收路径；1、2 使用新槽位布局，当前上限为 2。v1 绑定设置为 0，v2 显式指定 1 或 2；不会对现有 Guest 实验自动开启多槽。
+
+- `hw/femu/fdm_kv_buffer_abi.h`：buffer ABI 升至 v4，头部 424 字节，原有字段偏移保留。新增每槽描述符、独立接收前缀及接收／聚合序号。设备、算子 `.so` 和 Python 统计解析器需要一起更新，不支持混用旧 v3 算子。
+- `hw/femu/fdm_kv_buffer.c`：MR0 内一次性分配描述符、各槽 receive/位图及 `received_heads`；MR1 前部保留 `N × W`，暂存页从其后的页对齐地址开始。暂存页数量估算不变，容量不足直接初始化失败，不偷偷压缩页池。其他数据 MR 的寻址不变。
+- `hw/femu/fdm_kv_receive.c`：增加 `fdm_kv_slot_acquire/record/publish/begin/release/fail`。acquire 返回选中槽位内的目标地址；`memory_write()` 已直接 DMA 到该地址，不先搬到公共 input 再复制。
+- `tests/cemu/kernel/fdm_kv_aggregate.c`：校验新布局并通过已选槽位的 input/receive 进行有限步聚合。K/V 排布、页池、domain 与 NAND 写回算法不变。PROGRESS 不释放 input，也不切换到另一包。
+
+新槽位独立状态为：
+
+```text
+EMPTY → RECEIVING → RECEIVED → READY → CONSUMING → EMPTY
+                       │         │         │
+                       │         │         └─ 全包聚合完成且调用方引用退出后回收
+                       │         └─ 按 next_aggregate_id 选择，不能越过前包
+                       └─ 整包收齐，但尚不能绕过接收模型 deadline 发布 READY
+任一不可恢复接收／DMA错误 → FAILED，并设置整个 buffer 的 sticky failed
+```
+
+`received_heads` 只表示已通过包校验的连续输入前缀；`head_states.accepted` 仍只由聚合实际完成后推进；NAND committed 不变。包 B 可以在 A 聚合前收齐，但不得因此将 B 的 KV 当作暂存区已可读。
+
+**API 调用约束：**
+
+1. 新 API 是内部核心接口，调用者持同一 metadata 锁操作状态；这不是可以直接由硬件无锁读取的 release/acquire ABI。将来硬件端需要明确原子发布和内存屏障。
+2. `acquire` 到 `record` 保留一个 DMA 占用及精确片段范围；失败走 `slot_fail`，不允许覆盖仍在 DMA 的槽。两槽各自的位图、包头和分轮聚合进度独立。
+3. 同一 binding 首版只允许一个尚未接收／确认完成的输入包。另一个 transfer 在前包仍 RECEIVING/RECEIVED 时进入会被拒绝，不能把它堵在 SQ head、挡住前包剩余片段。只有两个槽均被已确认任务占用时才返回容量背压。
+4. transfer_id 由内核注册上下文单调生成；已回收的旧 ID 不得重新领取槽位。它与 payload 内 request_id 不相等也合法，后者仍验证会话内包顺序。
+5. `publish` 只是 deadline 检查及状态转换，不替调用方发送 CQE；调用方还需建立独立后台任务、切断原 NvmeRequest 的 input 引用。`release` 检查聚合状态及 DMA 占用，但不能替调用方证明 CQ/回调引用已经退出。
+6. 接收 DRAIN 后拒绝后续包，只有更早的包消费完才能选择 DRAIN。绑定层继续调用原 writer drain/seal，DRAIN 的 CQE 等待全部完成，不采用 APPEND 的提前确认语义。
+
+**已测范围：** 新 C 测试覆盖两槽同时占用、乱序片段、收包领先聚合、第三包背压、过期 transfer、重复／错误片段、包长和坐标错误、deadline、读者 lease、NO_SPACE、分轮聚合、槽位循环复用、多个 batch、分段数据 MR、容量不足不改内存以及 DRAIN 顺序。普通入口、profile 入口和常驻 service 提供的有限 step 都执行同一组核心测试，并逐页核对 K/channel-K/V 内容。
+
+**尚待验收：** 新 Guest 内核启动后，真实文件 pwrite 的拆分标签、文件区域固定、设备两槽周转与失败清理。需先运行第四阶段 smoke，再启用完整推理的多槽配置并重新核算 MR0/MR1 容量，不直接开始性能对比。
+
+第二阶段核心验收：QEMU 与聚合 `.so` 编译成功；C layout/receive/operator/service 测试 PASS，ASan/UBSan 重跑 PASS；`test_fdm_kv_binding`、`FdmCsdPipelineTest` 和 `test_sparf_group_capacity` 合计 67 项 PASS（58.918s）。首次回归发现两处旧容量断言未计入 buffer 头部新增的 48 字节，已修正后全量重跑。上述 67 项主要证明既有单槽设备路径未回归；两槽证明来自 C 核心测试，不含 Guest 文件 I/O、多槽 NVMe CQ 或多槽 SparF 并发验证。
+
+### 第三阶段：设备端多槽接线
+
+1. `csd/compute.c`、`fdm_kv_binding.c`：接受原 80 字节 v1 描述符，或 88 字节 v2 描述符。v2 在原字段后增加 `input_slots` 和 `transfer_protocol` 两个 uint32；当前协议为 1，槽数只接受 1、2，且要求 poll + async 模式。
+2. `csd/memory.c`：v2 的专用 input 写命令从 CDW13/14 读取 transfer_id 低／高 32 位，从 CDW15 读取包总字节数；sb 仍表示固定逻辑入口加包内偏移。根据 transfer 选槽后直接 PRP DMA，分别维护各槽位图与 deadline。缺失标签、越界、重复片段、过期 ID 或直接覆盖第二槽／管理区均拒绝。普通 FDM 写不使用这些标签。
+3. `fdm_kv_binding.c`：收齐 APPEND 且模型 deadline 满足后，通过原 CQ 完成路径确认；每槽预分配一个独立后台 task，复制必要请求字段和 trace，不继续持有会被 NVMe 层复用的原请求。后台常驻 service 按包序消费 READY，聚合完成后回收槽。两槽被已确认任务占用时，在原 SQ 入口背压，不覆盖数据。
+4. `fdm_kv_attention.c`：检查排队包是否覆盖请求需要的目标前缀，实际读取仍等 `accepted` 达到精确目标后取得 reader lease。拒绝会被 FIFO 前包越过的混合快照；不能拿 `received_heads` 代替暂存区可读进度。Attention 数学和 NAND 规则不变。
+5. 关闭、reset 和失败路径识别所有槽位；活动接收、后台任务、读者或写回未退出时不能正常解绑。DMA／包校验／聚合失败仍为 sticky failed；提前成功的 APPEND 不会被追溯修改，后续操作和 drain 报错。
+
+性能边界：槽位描述符与任务在绑定时分配；片段直接写目标槽，没有新增整包中转副本。仍使用原 metadata mutex 保护状态及有限聚合 step，因此不是无锁并发 DMA／聚合，也不能据此承诺性能提升。常驻算子仍运行在模拟器 CPU 线程中，只是控制流改为轮询；真实 FPGA 的共享内存原子发布协议尚未实现。
+
+本轮设备验证包括旧路径回归、两槽同时占用与循环复用、第三包背压、ACK 先于聚合、SparF 前缀等待、乱序片段与模型 deadline、非法标签、失败后清理、reset 取消、分段 MR，以及小 OPT/GQA 数值测试。测试通过直接 NVMe qtest 驱动 CPU 算子，不经过 Guest FDMFS，不代替 GPU 或完整模型性能实验。
+
+该阶段验收结果：QEMU 和聚合 `.so` 编译成功；`test_fdm_kv_binding`、`FdmCsdPipelineTest`、`test_sparf_group_capacity` 加 C layout/receive/operator/service 测试，共 79 项 PASS（67.075s），其中包含 DRAIN 等待排队 APPEND 和读者的用例。最终构建另重跑双槽背压、排队 DRAIN、Attention 数值 3 项 PASS。该阶段未修改 linux-cemu。
+
+### 第四阶段：内核同步标签与客户端注册（本次增量）
+
+#### 初始化与释放
+
+- 新增 `IOCTL_CEMU_CREATE_MRS_PINNED`（0x07，沿用 create_mrs 参数）和 `IOCTL_CEMU_BIND_FDM_KV`（0x08，16 字节参数：rsid、pind、bytes、addr）。后者携带 88 字节 v2 描述符。
+- `drivers/nvme/host/cemu-kv.c` 在当前控制器维护文件来源账本。首版每个 CSD 只允许一个 pinned KV MRS；MR 文件必须来自该 CSD 的 FDMFS、可读写、单链接、已分配且没有其他 pin。固定所有管理／数据 MR 的 file 引用和区域，拒绝负偏移、越界及超过 32 位的单 MR 长度。
+- 联合绑定只接受账本里的 MRS，不接受用户自报 sb；MR1 必须从实际文件区域起点开始，`N × W` 必须落在已登记 MR1 内。先将 input 注册为禁止写入状态，再提交设备 v2 bind；成功后才开放 tagged pwrite。绑定失败保持禁止写入，删除 MRS 确认成功后才释放固定区域。
+- 有 pin 的文件禁止 unlink、truncate、hardlink 和通过 copy_file_range 访问；不能靠关闭用户 fd 提前释放设备仍引用的内存。正常关闭通过 `IOCTL_CEMU_DELETE_MRS`，成功才撤销 input 注册并 unpin。busy／失败保留账本及区域，可以完成 drain 后重试，不伪报删除成功。
+- 进程异常退出、copyout 失败后删除失败等情况可能保留 pinned MRS；日志记录已知 rsid。不能直接 rm 文件绕过；应在正常管理路径确认设备引用退出后删除，或完整关闭／重启 Guest。首版不支持绕过账本的 raw MRS 管理或运行中 reset 后自动恢复会话；不要混用 passthrough 删除／重新绑定。设备移除时在 NVMe 队列停用后清理账本。
+
+#### 每次同步 pwrite
+
+```text
+C++ pwrite(input fd, packet, wire_bytes, 0)
+  → FDMFS：校验注册、offset=0、512 对齐、最大包长及同步模式
+  → 内核递增 transfer_id，建立栈上本次写上下文
+  → iomap_dio_rw(..., FORCE_WAIT, private=&context)
+  → submit_io：将 ID / input sector / 整包长度复制到 bio 专用字段
+  → 原 CEMU block forwarding → bio split / NVMe request
+  → pci.c：转为 MEMORY_WRITE 后填写 CDW13/14/15
+  → 设备按包选槽，直接 DMA，收齐并满足接收 deadline 后确认
+  → 全部子 I/O 结束 → pwrite 返回；后台聚合继续
+```
+
+`bio_init/reset` 清除标签，clone/split 保留标量；片段位置使用当前 sector，而不是初始 offset 的缓存副本。不占用 `bi_private`，不改通用 iomap 算法，不新增 payload 拷贝。上下文只在同步调用存活期使用，所有 bio 已持有自己的标签值。
+
+首版设置 `REQ_NOMERGE`，并在 bio/request 两类合并入口拒绝 tagged 请求合并；驱动再次检查单 bio 及范围。**这可能增加 NVMe 命令数量，必须作为实验配置记录，不能和旧路径无条件当作完全相同命令流。** 普通 Q/mean、结果读和旧单槽路径不带标签；转换普通 FDM RW 时显式清零这 12 字节，不覆盖 MEMORY_COPY 的描述符指针。
+
+同一 input 的并发写返回 EBUSY；异步 kiocb/nowait/hipri 的 input 写返回 EOPNOTSUPP。pinned 文件的异步读写也暂不开放。只接受完整一次写；短写转 EIO，错误后该 input sticky failed，禁止用户按剩余字节重试拼出另一个包。此处没有实现 io_uring 文件写模式。
+
+#### 验证与启用边界
+
+- 内核 `block/bio.o`、`block/blk-merge.o`、`fs/fdmfs/`、`drivers/nvme/host/` 对象编译通过；不是完整 bzImage 或新内核启动测试。因为 bio 布局改变，部署必须完整重建内核，不能只替换 NVMe 模块。
+- 客户端及扩展编译通过；`client_profile`、`fdm_slot_client` 两项 CTest 通过，io_transport 因本机 io_uring 条件不足跳过。覆盖 pinned create、联合绑定、move、失败回滚、busy 删除重试以及旧内核禁止 fallback。
+- Python／设备／容量／C 核心回归 82 项通过；ioctl ABI 与精细计时分析回归 42 项通过。NVMe trace 增加 `transfer_id`、`packet_bytes`，旧计时解析仍兼容。
+- 新增 `python/fdm_multislot_guest_smoke.py`，**尚未在 Guest 运行**：需要至少 17 MiB 空闲 FDM、4 KiB NAND 页、更新后的客户端／内核／设备及 poll + async 聚合。测试固定 2 个 2 MiB input 槽，发送约 1.5 MiB Prefill 包及 16 个 Decode 包；检查文件保护、错误 offset、最终 accepted/committed、seal 和回收。是否真的发生多条 NVMe 命令取决于 Guest 队列限制，需结合 trace 验证。
+
+新内核正确安装并重启后，在 Guest 的 `tests/cemu` 目录、原 Python 环境和客户端 PYTHONPATH 下运行：
+
+```bash
+python3 instattention/python/fdm_multislot_guest_smoke.py \
+  --fdm-directory /mnt/fdm0 \
+  --aggregate-program ./build/fdm_kv_aggregate.so
+```
+
+该 smoke 不替代 Attention 数值和完整推理测试。旧完整实验入口仍默认 legacy，待 smoke 通过再明确开启两槽和增加对应容量预算。
+
+### 第一阶段审查补充（当时状态）
+
+- bind 同步检查 service symbol，不做启动握手；service 拒绝 runtime 或在 stop 前提前返回（包括返回 0），均异步设置 sticky failed。ABI 要求同步、单线程使用 runtime，不保留 runtime 或回调供入口返回后使用；stop 只能在有限 step 返回后处理。
+- 空闲轮询采用 10 us sleep，有进展时 yield；10 us 是退避参数，不是响应或停止延迟上限。
+- 多槽 SparF 不能直接复用当前 `aggregate_active` 加单包 header 的依赖检查；必须跟踪排队包覆盖的目标前缀，实际可读进度和 lease 仍由聚合发布。
+- 接收前缀必须独立于聚合 accepted 和 NAND committed；不能继续用单槽 release 才推进的包序号或 accepted 检查拒绝合法后继包。这些独立状态尚未实现。
+- CQ 完成后原 NvmeRequest 可被回收复用；后台必须使用独立任务和 trace 快照。CQ 堵塞、完成路径和 DMA 引用退出前不得仅凭聚合结束复用槽位。
+- 后续内核注册必须联合 bind 与文件来源账本验证，不能只信用户提供的 sb；还需固定文件及底层区域的寿命，防止 unlink 后回收或重分配仍被设备引用的范围。来源账本、unlink 固定及注册协议均待实现。
+
+### 第一阶段验收（2026-11-10）
+
+完整 `FdmCsdPipelineTest` 25 项全部 PASS（21.052s），capacity 测试 14 项 PASS，C layout/service ABI 测试 PASS。FDM 回归包含 poll fragments/modeltime、ACK/dependency/backpressure、reset、attention 数值、ACK 后失败、旧模块拒绝、空闲关闭和 service 异常退出。失败 fake 通过 `runtime->step(opaque, failed_step)` 注入返回 -1 的有限 step，再遵循 relax/stop 循环；不以缺少 service symbol 的旧 fake 冒充 poll 聚合失败测试。
+
+完整 Python suite 需同时包含 `tests/cemu/instattention/python` 与 `tests/cemu/instattention` 的 PYTHONPATH。上述设备测试使用 CPU 算子和 qtest，不代替 Guest 实际文件 pwrite、GPU 或完整模型性能测试。
 
 ## 1. 当前阶段的决定
 
@@ -113,7 +230,7 @@ CEMU 块设备／NVMe 驱动：拆分并保留身份，构造带标记的 MEMORY
 
 为了支持包头后到，推荐第一版草案为：CDW13～14 保存 64 位 transfer_id，CDW15 保存 32 位整包长度；sb 仍表示逻辑入口基址加包内偏移，wl 为片段长度。整包长度受 W 和 UINT32_MAX 双重限制，长度计算先用 64 位检查溢出。字段使用明确的小端编码，不能通过非对齐 uint64_t 指针直接存取 CDW13。
 
-这与之前口头提出的“64 位编号 + 32 位版本”不同：此草案把整包长度带到每个片段，模式／版本放在初始化绑定协商中。最终 ABI 需在实现前冻结；当前仅是推荐，不是已实现接口。
+这与之前口头提出的“64 位编号 + 32 位版本”不同：整包长度带到每个片段，模式／版本放在初始化绑定协商中。第四阶段实现采用此布局，transfer_protocol=1。
 
 绑定必须显式声明 tagged-input 模式，仅对该注册区域的 MEMORY_WRITE 解释扩展字段；绑定不支持该版本则初始化失败，不允许静默退回旧格式。旧格式在 legacy 绑定上继续工作。普通 Q/mean 写、普通 FDM 读和 MEMORY_COPY 不解释这些字段。
 
@@ -128,11 +245,11 @@ CEMU 块设备／NVMe 驱动：拆分并保留身份，构造带标记的 MEMORY
 
 ### 6.1 FDMFS 注册与写入口
 
-拟增加专用 input 注册接口：关联 file/inode 的 FDM 区域、控制器、设备绑定代数、逻辑入口、最大包长 W 和协议版本。它不包含设备槽位空闲表，也不在每包时申请设备空间。
+已采用第四阶段的 pinned MRS + 联合 bind 接口：关联 file/inode 的 FDM 区域、控制器、设备绑定描述符、逻辑入口、最大包长 W 和协议版本。它不包含设备槽位空闲表，也不在每包时申请设备空间。
 
-现有设备 bind 使用客户端构造的 passthrough 命令，不会自动把“这是 KV input 文件”的信息同步给 FDMFS。需要新增文件注册步骤或一个可核验的联合绑定接口；这是必须补上的初始化链路。
+旧设备 bind 使用客户端构造的 passthrough 命令，不会自动把“这是 KV input 文件”的信息同步给 FDMFS。因此新 v2 客户端只走内核联合绑定，旧 v1 继续保留 passthrough。
 
-推荐初始化事务：创建文件/MRS → 设备成功建立 tagged 多槽绑定 → 内核验证该绑定并注册 input 文件 → 才允许写入。失败按逆序回滚；禁止用户只提供一个任意 sb 就冒充已注册绑定。详细 ioctl 编号和授权检查待 ABI 定稿。
+当前事务：创建并固定文件/MRS → 核验来源账本并注册为禁止写入 → 设备成功建立 tagged 多槽绑定 → 才允许写入。失败须确认设备删除成功后才释放固定区域；禁止用户只提供一个任意 sb 就冒充已注册绑定。ioctl 编号与 CAP_SYS_ADMIN 检查见第四阶段。
 
 在 `fdmfs_rw_iter()` 对注册 input 的写入进行专项检查：offset=0、完整包长度非零且不超过 W、满足当前 512 字节提交对齐、绑定有效。普通文件和普通 Q/mean 走原路径。
 
@@ -329,13 +446,10 @@ Attention 仍读取实际聚合进度和 lease，不读取“包已经收到”�
 
 验收重点是确认下一包 DMA 与当前包聚合确实可以重叠，且 payload、生成结果与模型时间语义不变。pwrite 变短不代表聚合工作消失；模拟器忙轮询的 CPU 成本不能直接等同 FPGA 成本。
 
-## 13. 开始实现前仍需冻结的细节
+## 13. 已冻结接口与后续工作
 
-1. 注册 ioctl／联合绑定接口，以及如何验证内核文件与设备绑定的对应关系。
-2. 12 字节字段最终分配、绑定协商方式、会话 reset 与 transfer_id 退休／重复策略。
-3. bio 标签具体存储方式、所有 clone/reset/merge 路径的实现范围。
-4. 首版只允许单同步提交者的执行约束；后续有界等待队列与请求额度方案。
-5. 常驻模块入口加 runtime 接口，还是先采用设备运行时常驻的过渡实现；轮询退避参数。
-6. N/W 的初始值、第一 MR 容量约束、扩 input 后的暂存区预算。
+已冻结：v2 绑定／transfer_protocol=1、CDW13/14 ID + CDW15 包长、pinned MRS + 联合 bind、bio 标量标签及 NOMERGE、单同步提交者、service v1 常驻入口、首版槽数上限 2。
 
-这些未定项不改变本阶段核心决定：同步写在接收完成时返回，槽位由设备管理，内核只携带传输身份，聚合消费在后台持续推进。
+后续仍需完成：新 Guest 内核实际 pwrite 验收；运行中 reset 的会话自动失效／恢复与异常进程资源回收；完整推理入口的 N/W 开关和容量预算；io_uring 的异步上下文、请求额度和乱序规则。首版不以静默重建或回退掩盖这些尚未支持的场景。
+
+核心决定不变：同步写在接收完成时返回，槽位由设备管理，内核只携带传输身份，聚合消费在后台持续推进。

@@ -18,6 +18,7 @@ typedef struct FDMKV_InitParams
     uint32_t segment_count;
 
     uint64_t input_bytes;
+    uint32_t input_slots;
 
     uint32_t nand_channels;
     uint32_t block_pages;

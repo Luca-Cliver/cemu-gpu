@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define CEMU_FDM_KV_BUFFER_VERSION 3U
+#define CEMU_FDM_KV_BUFFER_VERSION 4U
+#define CEMU_FDM_KV_MAX_INPUT_SLOTS 2U
 #define CEMU_FDM_KV_MAX_DATA_MRS 126U
 #define CEMU_FDM_KV_KIND_COUNT 3U
 #define CEMU_FDM_KV_INVALID_INDEX 0U
@@ -14,6 +15,8 @@
 
 #define CEMU_FDM_KV_BIND_MAGIC 0x31424B46U
 #define CEMU_FDM_KV_BIND_VERSION 1U
+#define CEMU_FDM_KV_BIND_SLOTS_VERSION 2U
+#define CEMU_FDM_KV_TRANSFER_PROTOCOL 1U
 #define CEMU_FDM_KV_BIND_SELECTOR 2U
 
 #define CEMU_FDM_KV_PACKET_MAGIC 0x31564B46U
@@ -75,6 +78,12 @@ typedef struct FDMKV_BindParams {
     uint64_t input_bytes;
     FDMKV_Geometry_t geometry;
 } FDMKV_BindParams_t;
+
+typedef struct FDMKV_BindSlotsParams {
+    FDMKV_BindParams_t base;
+    uint32_t input_slots;
+    uint32_t transfer_protocol;
+} FDMKV_BindSlotsParams_t;
 
 typedef struct FDMKV_Layout
 {
@@ -211,6 +220,26 @@ typedef struct FDMKV_DataSegment {
     uint32_t page_count;
 } FDMKV_DataSegment_t;
 
+enum FDMKVInputSlotStatus {
+    FDM_KV_SLOT_EMPTY,
+    FDM_KV_SLOT_RECEIVING,
+    FDM_KV_SLOT_RECEIVED,
+    FDM_KV_SLOT_READY,
+    FDM_KV_SLOT_CONSUMING,
+    FDM_KV_SLOT_FAILED,
+};
+
+typedef struct FDMKV_InputSlot {
+    uint32_t state;
+    uint32_t dma_active;
+    uint64_t transfer_id;
+    uint64_t wire_bytes;
+    uint8_t *input;
+    FDMKV_ReceiveState_t *receive;
+    uint64_t dma_offset;
+    uint64_t dma_bytes;
+} FDMKV_InputSlot_t;
+
 typedef struct FDMKVBuffer
 {
     uint32_t version;
@@ -260,6 +289,13 @@ typedef struct FDMKVBuffer
     uint32_t segment_count;
     uint32_t segment_reserved;
     FDMKV_DataSegment_t *segments;
+    uint32_t input_slots;
+    uint32_t active_slot;
+    FDMKV_InputSlot_t *slots;
+    uint64_t *received_heads;
+    uint64_t next_receive_id;
+    uint64_t next_aggregate_id;
+    uint64_t last_transfer_id;
 }FDMKV_Buffer_t;
 
 static inline uint8_t *fdm_kv_page_data(const FDMKV_Buffer_t *buffer, uint32_t index)
@@ -271,7 +307,8 @@ static inline uint8_t *fdm_kv_page_data(const FDMKV_Buffer_t *buffer, uint32_t i
         const FDMKV_DataSegment_t *range = &buffer->segments[segment];
         if (index >= range->first_page && index - range->first_page < range->page_count) {
             uint64_t offset = segment ? 0 :
-                (buffer->input_bytes + buffer->layout.geometry.page_bytes - 1) /
+                (buffer->input_bytes * (buffer->input_slots ? buffer->input_slots : 1) +
+                 buffer->layout.geometry.page_bytes - 1) /
                 buffer->layout.geometry.page_bytes * buffer->layout.geometry.page_bytes;
             return range->address + offset +
                 (uint64_t)(index - range->first_page) * buffer->layout.geometry.page_bytes;
@@ -297,6 +334,8 @@ FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Geometry_t) == 40,
                      "FDMKVGeometry ABI");
 FDM_KV_STATIC_ASSERT(sizeof(FDMKV_BindParams_t) == 80,
                      "FDMKVBindParams ABI");
+FDM_KV_STATIC_ASSERT(sizeof(FDMKV_BindSlotsParams_t) == 88,
+                     "FDMKVBindSlotsParams ABI");
 FDM_KV_STATIC_ASSERT(offsetof(FDMKV_BindParams_t, geometry) == 40,
                      "FDMKVBindParams geometry offset");
 FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Layout_t) == 80,
@@ -315,8 +354,10 @@ FDM_KV_STATIC_ASSERT(sizeof(FDMKV_BufferStats_t) == 88,
                      "FDMKVBufferStats ABI");
 FDM_KV_STATIC_ASSERT(sizeof(FDMKV_DataSegment_t) == 24,
                      "FDMKVDataSegment ABI");
-FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Buffer_t) == 376,
+FDM_KV_STATIC_ASSERT(sizeof(FDMKV_Buffer_t) == 424,
                      "FDMKVBuffer ABI");
+FDM_KV_STATIC_ASSERT(sizeof(FDMKV_InputSlot_t) == 56,
+                     "FDMKVInputSlot ABI");
 
 FDM_KV_STATIC_ASSERT(sizeof(FDMKV_AppendHeader_t) == 88,
                      "FDMKVAppendHeader ABI");
@@ -341,6 +382,8 @@ FDM_KV_STATIC_ASSERT(offsetof(FDMKV_Buffer_t, stats) == 264,
 
 FDM_KV_STATIC_ASSERT(offsetof(FDMKV_Buffer_t, receive) == 352,
                      "FDMKVBuffer receive offset");
+FDM_KV_STATIC_ASSERT(offsetof(FDMKV_Buffer_t, input_slots) == 376,
+                     "FDMKVBuffer input_slots offset");
 
 #undef FDM_KV_STATIC_ASSERT
 
